@@ -1,0 +1,42 @@
+# Lens table for the Motorola Moto G60s (lisbon, MediaTek MT6785) running
+# mainline Linux, in the same format as data/cheetah.toml, which explains
+# every field. Chosen when the device tree says motorola,lisbon.
+#
+# Two cameras have drivers so far, one per side: the OmniVision OV64B40 at
+# the back, with a focus motor, and the OmniVision OV16A1Q at the front. So
+# the back has one lens and zoom is digital: a crop of the main camera's
+# frames.
+#
+# preview/still: the sensor modes libcamera offers. OV64B40: 2304x1728 and
+#   4624x3472, OV16A1Q: 2304x1728 alone. Each shows the sensor's whole
+#   field of view, hence coverage [1, 1]. libcamera may adjust the sizes
+#   (the software ISP leaves a few columns at the edge); the app uses what
+#   it gets.
+# rotation: left out, libcamera's Rotation property comes from the device
+#   tree.
+# f_number, focal lengths, base_iso: left out until measured.
+# max_zoom: 4, where a crop of the 4624x3472 mode still keeps 1156x868.
+
+device = "lisbon"
+max_zoom = 4.0
+
+[[lens]]
+role = "main"
+name = "Main"
+id = "/base/soc/i2c@11009000/camera@22" # OmniVision OV64B40
+zoom = 1.0
+preview = [2304, 1728]
+still = [4624, 3472]
+coverage = [1.0, 1.0]
+autofocus = true
+
+[[lens]]
+role = "front"
+name = "Front"
+id = "/base/soc/i2c@11011000/camera@10" # OmniVision OV16A1Q
+zoom = 1.0
+preview = [2304, 1728]
+still = [2304, 1728]
+coverage = [1.0, 1.0]
+autofocus = false
+mirror = true

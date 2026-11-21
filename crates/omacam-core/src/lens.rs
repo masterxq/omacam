@@ -185,6 +185,8 @@ pub struct TableSpec {
 pub const CHEETAH: &str = include_str!("../../../data/cheetah.toml");
 /// The built-in table for the Pixel 9a.
 pub const TEGU: &str = include_str!("../../../data/tegu.toml");
+/// The built-in table for the Moto G60s.
+pub const LISBON: &str = include_str!("../../../data/lisbon.toml");
 
 /// Highest zoom when the table doesn't say.
 pub const DEFAULT_MAX_ZOOM: f64 = 8.0;
@@ -253,11 +255,17 @@ impl TableSpec {
         TableSpec::parse(TEGU).expect("built-in lens table parses")
     }
 
+    pub fn lisbon() -> TableSpec {
+        TableSpec::parse(LISBON).expect("built-in lens table parses")
+    }
+
     /// The built-in table for the device whose device-tree `compatible`
     /// strings are given (the Pixel 7 Pro's when none matches).
     pub fn builtin(compatible: &[&str]) -> TableSpec {
         if compatible.contains(&"google,zumapro-tegu") {
             TableSpec::tegu()
+        } else if compatible.contains(&"motorola,lisbon") {
+            TableSpec::lisbon()
         } else {
             TableSpec::cheetah()
         }
@@ -463,6 +471,32 @@ mod tests {
         for role in [Role::Main, Role::Ultrawide, Role::Front] {
             assert!(t.by_role(role).is_some(), "{role:?}");
         }
+    }
+
+    #[test]
+    fn lisbon_table_matches_its_two_cameras() {
+        let cam = |id: &str, location, rotation| CameraInfo {
+            id: id.into(),
+            location,
+            rotation,
+            model: "sensor".into(),
+            autofocus: true,
+            ..CameraInfo::default()
+        };
+        let cams = vec![
+            cam("/base/soc/i2c@11009000/camera@22", Location::Back, 90),
+            cam("/base/soc/i2c@11011000/camera@10", Location::Front, 270),
+        ];
+        let t = TableSpec::builtin(&["motorola,lisbon", "mediatek,mt6785"]).resolve(&cams);
+        assert_eq!(t.lenses().len(), 2);
+        let main = t.get(t.by_role(Role::Main).expect("main"));
+        assert_eq!(main.still, Some(Size::new(4624, 3472)));
+        assert_eq!(main.rotation, 90);
+        assert!(main.autofocus);
+        assert_eq!(main.shown_coverage(), (1.0, 1.0));
+        let front = t.get(t.by_role(Role::Front).expect("front"));
+        assert!(front.mirror && !front.autofocus);
+        assert_eq!(t.max_zoom(Facing::Back), 4.0);
     }
 
     #[test]
