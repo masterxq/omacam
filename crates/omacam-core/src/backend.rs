@@ -316,6 +316,9 @@ pub struct StreamRequest {
     pub still: Option<Size>,
     /// Buffers for that still stream.
     pub still_buffers: u32,
+    /// The preview feeds a video: ask for the camera's video stream (at
+    /// `size`) rather than its viewfinder one.
+    pub video: bool,
     /// Set explicitly: libcamera's default of four full-size buffers once
     /// failed to allocate from CMA.
     pub buffers: u32,

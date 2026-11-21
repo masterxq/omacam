@@ -27,6 +27,9 @@ pub struct Target {
     /// A preview that asks for a still stream beside it
     /// ([`crate::backend::StreamRequest::still`]).
     pub still_beside: bool,
+    /// A preview from the camera's video stream
+    /// ([`crate::backend::StreamRequest::video`]).
+    pub video: bool,
     /// Start values (exposure hints, autofocus mode). Not part of identity.
     pub controls: Controls,
 }
@@ -38,6 +41,7 @@ impl Target {
             camera: format!("lens{lens}"),
             purpose,
             still_beside: false,
+            video: false,
             controls: Controls::default(),
         }
     }
@@ -46,6 +50,7 @@ impl Target {
         self.camera == other.camera
             && self.purpose == other.purpose
             && self.still_beside == other.still_beside
+            && self.video == other.video
     }
 }
 

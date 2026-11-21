@@ -100,6 +100,10 @@ skips frames instead of queueing 9 MB copies.
   range), drawn by GTK as YUV memory textures (GTK 4.20), recorded as YUY2
   or NV12, and turned into RGB only for photos, merges, metering and the
   histogram (`omacam_core::pixels`).
+- **A video stream**, where the lens table names one (`video`, the Moto
+  G60s's 1920x1080 from the full sensor width): video mode streams the
+  camera's video role at that size instead of the preview, and the
+  viewfinder and the recording take its frames.
 
 ## Zoom and lens switching (§3.4)
 

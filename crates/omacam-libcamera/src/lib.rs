@@ -251,7 +251,7 @@ enum Plan {
     Beside,
     /// The processed stream and a raw one of the same size.
     Raw,
-    /// One processed stream: the viewfinder.
+    /// One processed stream: the viewfinder, or the video role.
     Single,
 }
 
@@ -616,7 +616,11 @@ impl Worker {
             plans.push(Plan::Raw);
         }
         plans.push(Plan::Single);
-        let main_role = StreamRole::ViewFinder;
+        let main_role = if req.video {
+            StreamRole::VideoRecording
+        } else {
+            StreamRole::ViewFinder
+        };
         let mut chosen = None;
         for plan in plans {
             let roles: &[StreamRole] = match plan {
@@ -635,7 +639,13 @@ impl Worker {
             };
             {
                 let mut sc = cfgs.get_mut(0).expect("one stream");
-                sc.set_pixel_format(XRGB8888);
+                // XRGB8888 unless the role's own format is one omacam
+                // takes as it is (the video role's YUYV): the safe GPU
+                // import format, and what the software ISP gives.
+                let own = layout_of(sc.get_pixel_format(), None).is_some_and(|l| l.yuv().is_some());
+                if !(req.video && own) {
+                    sc.set_pixel_format(XRGB8888);
+                }
                 if let Some(s) = size_wanted {
                     sc.set_size(LcSize::new(s.width, s.height));
                 }
@@ -669,6 +679,7 @@ impl Worker {
                 camera,
                 purpose = ?req.purpose,
                 ?plan,
+                video = req.video,
                 asked = %size_wanted.map(|s| s.to_string()).unwrap_or_else(|| "default".into()),
                 buffers,
                 status = ?status,

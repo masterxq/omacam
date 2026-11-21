@@ -43,6 +43,10 @@ pub struct Lens {
     pub focal_length_mm: Option<f64>,
     pub preview: Option<Size>,
     pub still: Option<Size>,
+    /// The size of the camera's own video stream, which video mode asks
+    /// for instead of the preview (the frames feed the viewfinder and the
+    /// recording alike). None: video records the preview's frames.
+    pub video: Option<Size>,
     /// Table says it focuses, and the camera has autofocus.
     pub autofocus: bool,
     pub af_windows: bool,
@@ -147,6 +151,7 @@ struct LensEntry {
     base_iso: Option<f64>,
     preview: Option<[u32; 2]>,
     still: Option<[u32; 2]>,
+    video: Option<[u32; 2]>,
     #[serde(default)]
     autofocus: bool,
     #[serde(default)]
@@ -294,6 +299,7 @@ impl TableSpec {
                     focal_length_mm: e.focal_length_mm,
                     preview: e.preview.map(|[w, h]| Size::new(w, h)),
                     still: e.still.map(|[w, h]| Size::new(w, h)),
+                    video: e.video.map(|[w, h]| Size::new(w, h)),
                     autofocus: e.autofocus && cam.autofocus,
                     af_windows: cam.af_windows,
                     crop_maximum: cam.crop_maximum,
@@ -334,6 +340,7 @@ impl TableSpec {
                 focal_length_mm: None,
                 preview: None,
                 still: None,
+                video: None,
                 autofocus: cam.autofocus,
                 af_windows: cam.af_windows,
                 crop_maximum: cam.crop_maximum,

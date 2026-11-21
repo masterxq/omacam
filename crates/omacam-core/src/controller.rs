@@ -490,6 +490,7 @@ impl Controller {
         let mut target = Target::new(lens_idx, purpose);
         target.camera = lens.id.clone();
         if purpose == Purpose::Preview {
+            target.video = self.mode == Mode::Video && lens.video.is_some();
             // A photo from the running preview, where the camera can run
             // the still mode's stream beside it: no stop and start.
             let larger = match (lens.still, lens.preview) {
@@ -535,9 +536,14 @@ impl Controller {
                 let stream = match target.purpose {
                     Purpose::Preview => StreamRequest {
                         purpose: Purpose::Preview,
-                        size: lens.preview,
+                        size: if target.video {
+                            lens.video
+                        } else {
+                            lens.preview
+                        },
                         still: lens.still.filter(|_| target.still_beside),
                         still_buffers: self.opts.still_buffers,
+                        video: target.video,
                         buffers: self.opts.preview_buffers,
                         fallbacks: Vec::new(),
                         raw: false,
@@ -549,6 +555,7 @@ impl Controller {
                             size,
                             still: None,
                             still_buffers: 0,
+                            video: false,
                             buffers: self.opts.still_buffers,
                             // The preview mode always fits: it just ran.
                             fallbacks: lens
@@ -657,8 +664,8 @@ impl Controller {
 
     /// Photo or video. Ignored while recording or taking a photo. Video
     /// mode may run the camera faster (60 fps), and restarts the camera
-    /// where the two modes stream differently (a still stream beside the
-    /// photo preview).
+    /// where the two modes stream differently (a video stream from the
+    /// lens table, a still stream beside the photo preview).
     pub fn set_mode(&mut self, mode: Mode, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         if !self.recording && !self.capture.is_busy() && self.mode != mode {
@@ -2163,6 +2170,7 @@ axis = [0.56, 0.48]
                 generation, stream, ..
             }] => {
                 assert_eq!(stream.still, Some(Size::new(4080, 3072)));
+                assert!(!stream.video);
                 *generation
             }
             other => panic!("{other:?}"),
@@ -2207,6 +2215,36 @@ axis = [0.56, 0.48]
             start_of(&c.shutter(now)),
             (g + 1, "main".to_string(), Purpose::Still)
         );
+    }
+
+    #[test]
+    fn video_mode_starts_the_lens_tables_video_stream() {
+        let now = Instant::now();
+        let spec = TableSpec::parse(
+            r#"
+[[lens]]
+role = "main"
+id = "main"
+zoom = 1.0
+preview = [2304, 1728]
+still = [4624, 3472]
+video = [1920, 1080]
+"#,
+        )
+        .unwrap();
+        let mut c = Controller::new(&spec, &cameras()[..1], Options::default());
+        let g = open(&mut c, now);
+        match commands(&c.set_mode(Mode::Video, now)).as_slice() {
+            [Command::Start {
+                generation, stream, ..
+            }] => {
+                assert_eq!(*generation, g + 1);
+                assert!(stream.video);
+                assert_eq!(stream.size, Some(Size::new(1920, 1080)));
+                assert_eq!(stream.still, None);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

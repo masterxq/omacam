@@ -7,7 +7,13 @@
 #   ultrawide 125.8°, telephoto 20.6°). Derived, not yet calibrated on our
 #   own frames.
 # preview/still: the processed stream sizes asked of libcamera's software
-#   ISP. libcamera may adjust them; the app uses what it gets.
+#   ISP. libcamera may adjust them; the app uses what it gets. Where the
+#   camera runs a still stream beside the preview in one configuration,
+#   photos come from it without a restart; otherwise a photo restarts the
+#   camera in the still mode.
+# video: optional, the size of the camera's own video stream (its video
+#   role), which video mode then streams instead of the preview. Left out,
+#   as here, videos record the preview's frames.
 # rotation: leave out to use libcamera's Rotation property.
 # base_iso: ISO at analog gain 1, to show and record gain as ISO
 #   (ISO = gain x base_iso). 50 for each sensor, an estimate: no published
