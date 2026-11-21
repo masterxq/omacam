@@ -83,21 +83,26 @@ pub fn crop_window_and_rotate(
     } else {
         (cw, ch)
     };
+    use rayon::prelude::*;
     let mut out = vec![0u8; ow as usize * oh as usize * 4];
-    for oy in 0..oh {
-        let row = &mut out[(oy * ow * 4) as usize..((oy + 1) * ow * 4) as usize];
-        for ox in 0..ow {
-            // The source pixel that lands at (ox, oy) after turning
-            // clockwise by `rotation`.
-            let (sx, sy) = match rotation {
-                90 => (oy, ch - 1 - ox),
-                180 => (cw - 1 - ox, ch - 1 - oy),
-                270 => (cw - 1 - oy, ox),
-                _ => (ox, oy),
-            };
-            row[ox as usize * 4..ox as usize * 4 + 4].copy_from_slice(&px.bgrx(cx + sx, cy + sy));
-        }
-    }
+    // Row by row on all cores: a full-size still takes a good part of a
+    // second on one.
+    out.par_chunks_mut(ow as usize * 4)
+        .zip(0..oh)
+        .for_each(|(row, oy)| {
+            for ox in 0..ow {
+                // The source pixel that lands at (ox, oy) after turning
+                // clockwise by `rotation`.
+                let (sx, sy) = match rotation {
+                    90 => (oy, ch - 1 - ox),
+                    180 => (cw - 1 - ox, ch - 1 - oy),
+                    270 => (cw - 1 - oy, ox),
+                    _ => (ox, oy),
+                };
+                row[ox as usize * 4..ox as usize * 4 + 4]
+                    .copy_from_slice(&px.bgrx(cx + sx, cy + sy));
+            }
+        });
     Ok(Bgrx {
         width: ow,
         height: oh,
