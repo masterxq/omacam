@@ -230,6 +230,12 @@ pub struct Controller {
     /// The highest frame rate each camera's current mode allows (from the
     /// stream's start), by camera id.
     max_fps: std::collections::HashMap<String, f64>,
+    /// The running stream's generation when it has a still stream beside
+    /// its preview, and that stream's size.
+    beside: Option<(u64, crate::backend::Size)>,
+    /// Cameras that started without the still stream asked beside their
+    /// preview: they aren't asked again.
+    no_beside: std::collections::HashSet<String>,
 }
 
 impl Controller {
@@ -261,6 +267,8 @@ impl Controller {
             low_light: LowLight::default(),
             pro: false,
             max_fps: std::collections::HashMap::new(),
+            beside: None,
+            no_beside: std::collections::HashSet::new(),
         }
     }
 
@@ -481,6 +489,17 @@ impl Controller {
         let lens = self.table.get(lens_idx);
         let mut target = Target::new(lens_idx, purpose);
         target.camera = lens.id.clone();
+        if purpose == Purpose::Preview {
+            // A photo from the running preview, where the camera can run
+            // the still mode's stream beside it: no stop and start.
+            let larger = match (lens.still, lens.preview) {
+                (Some(s), Some(p)) => s.pixels() > p.pixels(),
+                (Some(_), None) => true,
+                _ => false,
+            };
+            target.still_beside =
+                self.mode == Mode::Photo && larger && !self.no_beside.contains(&lens.id);
+        }
         let settings = self.exposure.effective(&lens.caps);
         target.controls.af_continuous = lens.autofocus && settings.lens.is_auto();
         target.controls.settings = Some(settings);
@@ -517,6 +536,8 @@ impl Controller {
                     Purpose::Preview => StreamRequest {
                         purpose: Purpose::Preview,
                         size: lens.preview,
+                        still: lens.still.filter(|_| target.still_beside),
+                        still_buffers: self.opts.still_buffers,
                         buffers: self.opts.preview_buffers,
                         fallbacks: Vec::new(),
                         raw: false,
@@ -526,6 +547,8 @@ impl Controller {
                         StreamRequest {
                             purpose: Purpose::Still,
                             size,
+                            still: None,
+                            still_buffers: 0,
                             buffers: self.opts.still_buffers,
                             // The preview mode always fits: it just ran.
                             fallbacks: lens
@@ -633,11 +656,14 @@ impl Controller {
     }
 
     /// Photo or video. Ignored while recording or taking a photo. Video
-    /// mode may run the camera faster (60 fps).
-    pub fn set_mode(&mut self, mode: Mode) -> Vec<Output> {
+    /// mode may run the camera faster (60 fps), and restarts the camera
+    /// where the two modes stream differently (a still stream beside the
+    /// photo preview).
+    pub fn set_mode(&mut self, mode: Mode, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         if !self.recording && !self.capture.is_busy() && self.mode != mode {
             self.mode = mode;
+            self.request_preview(now, &mut out);
             self.push_frame_rate(&mut out);
         }
         out
@@ -999,8 +1025,14 @@ impl Controller {
         // A still mode no bigger than the preview's gains nothing from a
         // stop and a start: take the next preview frame.
         let same_mode = l.still.is_none() || l.still == l.preview;
+        let beside = self
+            .switch
+            .streaming()
+            .is_some_and(|(g, _)| self.beside.is_some_and(|(b, _)| b == g));
         let mode = if same_mode {
             capture::Mode::Quick
+        } else if beside && self.opts.capture_mode == capture::Mode::Full {
+            capture::Mode::Beside
         } else {
             self.opts.capture_mode
         };
@@ -1022,6 +1054,11 @@ impl Controller {
                     target.controls.lens_position = controls.lens_position;
                     target.controls.af_continuous = false;
                     self.request(Some(target), now, out);
+                }
+            }
+            Step::Capture => {
+                if let Some((generation, _)) = self.switch.streaming() {
+                    out.push(Output::Backend(Command::Capture { generation }));
                 }
             }
             Step::Fail(msg) => {
@@ -1180,6 +1217,7 @@ impl Controller {
                 generation,
                 ref camera,
                 max_fps,
+                still,
                 ..
             } => {
                 match max_fps {
@@ -1192,6 +1230,19 @@ impl Controller {
                 }
                 self.focus.reset();
                 let actions = self.switch.on_started(generation);
+                self.beside = still.map(|s| (generation, s));
+                let refused = still.is_none()
+                    && self
+                        .switch
+                        .streaming()
+                        .is_some_and(|(g, t)| g == generation && t.still_beside);
+                if refused {
+                    // Don't ask this camera again, and don't restart it
+                    // for having said no.
+                    tracing::info!(camera, "no still stream beside the preview");
+                    self.no_beside.insert(camera.clone());
+                    self.switch.amend(generation, |t| t.still_beside = false);
+                }
                 self.run(actions, &mut out);
             }
             Event::Stopped { generation } => {
@@ -1225,6 +1276,26 @@ impl Controller {
         let (lens_idx, purpose) = (target.lens, target.purpose);
         if lens_idx >= self.table.lenses().len() {
             return; // its camera is gone
+        }
+        if frame.still {
+            // From the still stream beside the preview.
+            if self.capture.on_beside_frame(&frame.meta, now) == Step::Keep {
+                if let Some(r) = self.capture.last_still() {
+                    let m = &r.meta;
+                    tracing::info!(
+                        "still from {} beside the preview: {} ms after asking, exposure {} us, \
+                         analog gain {}, AE {}, lens {}",
+                        self.table.get(lens_idx).name,
+                        r.elapsed.as_millis(),
+                        opt(m.exposure_us),
+                        opt(m.analog_gain.map(|g| format!("{g:.2}"))),
+                        opt(m.ae_state.map(|s| format!("{s:?}"))),
+                        opt(m.lens_position.map(|p| format!("{p:.3}"))),
+                    );
+                }
+                out.push(self.picture(frame, lens_idx, Purpose::Still));
+            }
+            return;
         }
         match purpose {
             Purpose::Preview => {
@@ -1377,6 +1448,7 @@ mirror = true
                 ..FrameMeta::default()
             },
             raw: None,
+            still: false,
         })
     }
 
@@ -1388,6 +1460,7 @@ mirror = true
             stride: 16,
             layout: PixelLayout::Xrgb8888,
             max_fps: None,
+            still: None,
         }
     }
 
@@ -1663,10 +1736,10 @@ mirror = true
         assert_eq!(c.recording_source().as_deref(), Some("main"));
         c.set_recording(true);
         assert!(!c.view().recording, "only in video mode");
-        c.set_mode(Mode::Video);
+        c.set_mode(Mode::Video, now);
         c.set_recording(true);
         assert!(c.view().recording);
-        c.set_mode(Mode::Photo);
+        c.set_mode(Mode::Photo, now);
         assert_eq!(c.view().mode, Mode::Video, "no mode change mid-recording");
         // The zoom picks lenses as ever: the recorder follows the camera.
         let (g, cam, _) = start_of(&c.set_zoom(6.0, ZoomSource::Preset, now));
@@ -1800,8 +1873,8 @@ mirror = true
         c.on_event(started(g, "main"), now);
         c.on_event(frame(g, "main", 10_000), now);
         assert!(!c.view().can_60fps);
-        assert!(commands(&c.set_mode(Mode::Video)).is_empty());
-        c.set_mode(Mode::Photo);
+        assert!(commands(&c.set_mode(Mode::Video, now)).is_empty());
+        c.set_mode(Mode::Photo, now);
         // A mode that reaches 60 fps.
         let (g, _, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, now));
         let mut e = started(g, "uw");
@@ -1815,10 +1888,10 @@ mirror = true
             [Command::SetControls { controls, .. }] => controls.frame_duration_us,
             other => panic!("{other:?}"),
         };
-        assert_eq!(duration(&c.set_mode(Mode::Video)), Some(16_667));
+        assert_eq!(duration(&c.set_mode(Mode::Video, now)), Some(16_667));
         assert_eq!(duration(&c.set_video_fps(30)), Some(33_333));
         assert_eq!(duration(&c.set_video_fps(60)), Some(16_667));
-        assert_eq!(duration(&c.set_mode(Mode::Photo)), Some(33_333));
+        assert_eq!(duration(&c.set_mode(Mode::Photo, now)), Some(33_333));
     }
 
     #[test]
@@ -1836,7 +1909,7 @@ mirror = true
         }
         let mut c = Controller::new(&spec(), &cams, Options::default());
         open(&mut c, now);
-        c.set_mode(Mode::Video);
+        c.set_mode(Mode::Video, now);
         match commands(&c.tap(0.5, 0.5, None, now)).as_slice() {
             [Command::SetControls { controls, .. }] => {
                 assert!(controls.af_continuous);
@@ -2078,6 +2151,62 @@ axis = [0.56, 0.48]
         let out = c.on_event(frame(gp, "main", 10_000), now);
         assert!(matches!(out[0], Output::Show(_)));
         assert!(!c.view().capturing);
+    }
+
+    #[test]
+    fn a_still_stream_beside_the_preview_takes_photos_without_a_restart() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        let out = c.resume(now);
+        let g = match commands(&out).as_slice() {
+            [Command::Start {
+                generation, stream, ..
+            }] => {
+                assert_eq!(stream.still, Some(Size::new(4080, 3072)));
+                *generation
+            }
+            other => panic!("{other:?}"),
+        };
+        let mut e = started(g, "main");
+        if let Event::Started { still, .. } = &mut e {
+            *still = Some(Size::new(4080, 3072));
+        }
+        c.on_event(e, now);
+        c.on_event(frame(g, "main", 10_000), now);
+        let out = c.shutter(now);
+        assert!(
+            matches!(commands(&out).as_slice(), [Command::Capture { generation }] if *generation == g),
+            "{out:?}"
+        );
+        // Preview frames keep showing; the still frame is the photo.
+        let out = c.on_event(frame(g, "main", 10_000), now);
+        assert!(matches!(out.as_slice(), [Output::Show(_)]));
+        let mut still = frame(g, "main", 10_000);
+        if let Event::Frame(f) = &mut still {
+            f.still = true;
+        }
+        let out = c.on_event(still, now + Duration::from_millis(150));
+        match out.as_slice() {
+            [Output::Picture(p)] => assert!(p.frame.still),
+            other => panic!("{other:?}"),
+        }
+        assert!(!c.view().capturing);
+    }
+
+    #[test]
+    fn a_camera_without_the_still_stream_is_not_asked_again_or_restarted() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        let g = open(&mut c, now);
+        // `open` started it with no still stream: the next photo
+        // reconfigures as before, and nothing restarts the camera for it.
+        assert!(commands(&c.set_zoom(1.5, ZoomSource::Preset, now)).is_empty());
+        assert!(commands(&c.set_mode(Mode::Video, now)).is_empty());
+        assert!(commands(&c.set_mode(Mode::Photo, now)).is_empty());
+        assert_eq!(
+            start_of(&c.shutter(now)),
+            (g + 1, "main".to_string(), Purpose::Still)
+        );
     }
 
     #[test]

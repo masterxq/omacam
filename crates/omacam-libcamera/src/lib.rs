@@ -18,9 +18,16 @@
 //! hardware ISP with YUV output, such as the MediaTek DIP) has its frames
 //! copied out as they are, in either display mode: the viewfinder and the
 //! recorder take YUV, and photos turn it into RGB off this thread.
+//!
+//! A preview that may take stills asks for a still stream beside it (the
+//! viewfinder and still roles in one configuration). Where the camera
+//! validates the pair, a still is one buffer of that stream added to the
+//! next request: the preview runs on, at its settled exposure and focus.
+//! Where it doesn't, the preview starts alone, as before.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::ptr::NonNull;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -144,6 +151,38 @@ impl Drop for LibcameraBackend {
 
 type MappedBuffer = MemoryMappedFrameBuffer<FrameBuffer>;
 
+/// A buffer as a request holds it: a pointer to one of [`Active`]'s
+/// mapped buffers, and its index there. Requests hold these rather than
+/// the buffers themselves so that a request that carried a still can let
+/// go of the still's buffer (`reuse` without its buffers) and take its
+/// preview buffer back, which the buffers' owner keeps meanwhile.
+struct BufRef {
+    ptr: NonNull<libcamera_sys::libcamera_framebuffer_t>,
+    index: usize,
+}
+
+impl BufRef {
+    fn of(buffers: &[MappedBuffer], index: usize) -> BufRef {
+        BufRef {
+            // SAFETY: the buffer is a valid libcamera FrameBuffer from the
+            // allocator (MemoryMappedFrameBuffer only maps it).
+            ptr: unsafe { buffers[index].ptr() },
+            index,
+        }
+    }
+}
+
+// SAFETY: a pointer to a FrameBuffer that `Active` owns and outlives every
+// request (it drops the camera, which completes and returns them, first);
+// libcamera reads it only on the camera's thread and its own.
+unsafe impl Send for BufRef {}
+
+impl AsFrameBuffer for BufRef {
+    unsafe fn ptr(&self) -> NonNull<libcamera_sys::libcamera_framebuffer_t> {
+        self.ptr
+    }
+}
+
 /// A configured, running camera. Field order is drop order: the camera
 /// stops and releases before its buffers go.
 struct Active {
@@ -171,8 +210,15 @@ struct Active {
     /// The raw stream beside the processed one, when the start asked for it
     /// and the camera gives it at the same size.
     raw: Option<RawStream>,
+    /// The still stream beside the preview, when the start asked for one
+    /// and the camera runs both in one configuration.
+    still: Option<StillStream>,
     /// The sensor's model, for the raw frames' tuning file.
     sensor_model: Option<String>,
+    /// The processed stream's buffers; request `i` (its cookie) holds
+    /// buffer `i`, and raw buffer `i` with a raw stream.
+    buffers: Vec<MappedBuffer>,
+    raw_buffers: Vec<MappedBuffer>,
     _alloc: FrameBufferAllocator,
 }
 
@@ -181,6 +227,32 @@ struct RawStream {
     size: Size,
     stride: u32,
     first_red: (u8, u8),
+}
+
+/// A still stream configured beside the preview. Its buffers ride along
+/// with preview requests: one is added to the next request queued after a
+/// capture is asked for.
+struct StillStream {
+    stream: Stream,
+    size: Size,
+    stride: u32,
+    layout: PixelLayout,
+    buffers: Vec<MappedBuffer>,
+    /// Indices of the buffers no request holds.
+    free: Vec<usize>,
+    /// Stills asked for and not yet put on a request.
+    wanted: u32,
+}
+
+/// The streams a start asks libcamera for, in the order tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    /// The preview and a still stream beside it.
+    Beside,
+    /// The processed stream and a raw one of the same size.
+    Raw,
+    /// One processed stream: the viewfinder.
+    Single,
 }
 
 struct Worker {
@@ -377,6 +449,7 @@ impl Worker {
                             stride: a.stride,
                             layout: a.layout,
                             max_fps: a.max_fps,
+                            still: a.still.as_ref().map(|s| s.size),
                         });
                         if let Some(message) = note {
                             (self.sink)(Event::Notice { message });
@@ -416,6 +489,17 @@ impl Worker {
                     });
                 }
             }
+            Command::Capture { generation } => {
+                match self
+                    .active
+                    .as_mut()
+                    .filter(|a| a.generation == generation)
+                    .and_then(|a| a.still.as_mut())
+                {
+                    Some(st) => st.wanted = 1,
+                    None => tracing::warn!(generation, "a still asked of a stream without one"),
+                }
+            }
             Command::Release => {
                 self.stop(rx);
                 if self.manager.take().is_some() {
@@ -429,6 +513,12 @@ impl Worker {
     /// releasing the camera manager, then with one buffer, then at each
     /// fallback size. A still stream also falls back on other start
     /// errors. Returns a note for the user when it had to settle for less.
+    /// Start `req`, trying again when memory runs short: once more after
+    /// releasing the camera manager, then with one buffer, then at each
+    /// fallback size. A still stream also falls back on other start
+    /// errors, and a preview that failed with a still stream beside it
+    /// tries again without one. Returns a note for the user when it had to
+    /// settle for less.
     fn start_with_fallbacks(
         &mut self,
         generation: u64,
@@ -445,6 +535,7 @@ impl Worker {
             attempts.push((Some(f), req.buffers.min(2)));
         }
         let mut last = None;
+        let mut beside = req.still.is_some();
         for (i, &(size, buffers)) in attempts.iter().enumerate() {
             let fallback = i > 0;
             if fallback {
@@ -453,10 +544,11 @@ impl Worker {
                     camera,
                     size = %size.map(|s| s.to_string()).unwrap_or_else(|| "default".into()),
                     buffers,
+                    beside,
                     "retrying the start"
                 );
             }
-            match self.start(generation, camera, size, buffers, req, controls) {
+            match self.start(generation, camera, size, buffers, req, controls, beside) {
                 Ok(()) => {
                     let got = self.active.as_ref().map(|a| a.size);
                     let note = match (size == req.size, got) {
@@ -477,7 +569,9 @@ impl Worker {
                         attempt = i + 1,
                         "start failed"
                     );
-                    let retry = e.is_out_of_memory() || req.purpose == Purpose::Still;
+                    // The pair may be what failed: the preview alone next.
+                    let retry = e.is_out_of_memory() || req.purpose == Purpose::Still || beside;
+                    beside = false;
                     if i == 0 && e.is_out_of_memory() {
                         // Let go of everything libcamera holds, then retry.
                         self.manager = None;
@@ -492,6 +586,7 @@ impl Worker {
         Err(last.expect("at least one attempt"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
         generation: u64,
@@ -500,6 +595,7 @@ impl Worker {
         buffers: u32,
         req: &StreamRequest,
         controls: &Controls,
+        beside: bool,
     ) -> Result<(), StartError> {
         let at = |step: &'static str| move |error: io::Error| StartError { step, error };
         self.open_manager().map_err(at("camera manager"))?;
@@ -509,24 +605,33 @@ impl Worker {
         })?;
         let mut cam: ActiveCamera<'static> = cam.acquire().map_err(at("acquire"))?;
 
-        // A raw stream beside the processed one, where the camera gives one
-        // at the processed frame's size in a format the raw merge reads;
-        // otherwise the processed stream alone.
-        let mut want_raw = req.raw;
-        let (mut cfgs, status, raw_layout) = loop {
-            let roles: &[StreamRole] = if want_raw {
-                &[StreamRole::ViewFinder, StreamRole::Raw]
-            } else {
-                &[StreamRole::ViewFinder]
+        // What to try, best first: the preview with a still stream beside
+        // it, or with a raw stream at its size, where asked for and the
+        // camera gives them; the one processed stream in any case.
+        let mut plans = Vec::new();
+        if beside && req.purpose == Purpose::Preview && !req.raw {
+            plans.push(Plan::Beside);
+        }
+        if req.raw {
+            plans.push(Plan::Raw);
+        }
+        plans.push(Plan::Single);
+        let main_role = StreamRole::ViewFinder;
+        let mut chosen = None;
+        for plan in plans {
+            let roles: &[StreamRole] = match plan {
+                Plan::Beside => &[StreamRole::ViewFinder, StreamRole::StillCapture],
+                Plan::Raw => &[main_role, StreamRole::Raw],
+                Plan::Single => &[main_role],
             };
             let Some(mut cfgs) = cam.generate_configuration(roles) else {
-                if want_raw {
-                    want_raw = false;
-                    continue;
-                }
-                return Err(at("generate configuration")(io::Error::other(
-                    "no configuration",
-                )));
+                tracing::info!(
+                    generation,
+                    camera,
+                    ?plan,
+                    "no configuration for these roles"
+                );
+                continue;
             };
             {
                 let mut sc = cfgs.get_mut(0).expect("one stream");
@@ -536,43 +641,75 @@ impl Worker {
                 }
                 sc.set_buffer_count(buffers.max(1));
             }
-            if want_raw {
-                let mut rc = cfgs.get_mut(1).expect("a raw stream");
-                if let Some(s) = size_wanted {
-                    rc.set_size(LcSize::new(s.width, s.height));
+            if let Some(mut other) = cfgs.get_mut(1) {
+                match plan {
+                    Plan::Raw => {
+                        if let Some(s) = size_wanted {
+                            other.set_size(LcSize::new(s.width, s.height));
+                        }
+                        other.set_buffer_count(buffers.max(1));
+                    }
+                    Plan::Beside => {
+                        // The still in the camera's own format where
+                        // omacam reads it, else XRGB8888.
+                        if layout_of(other.get_pixel_format(), None).is_none() {
+                            other.set_pixel_format(XRGB8888);
+                        }
+                        if let Some(s) = req.still {
+                            other.set_size(LcSize::new(s.width, s.height));
+                        }
+                        other.set_buffer_count(req.still_buffers.max(1));
+                    }
+                    Plan::Single => {}
                 }
-                rc.set_buffer_count(buffers.max(1));
             }
             let status = cfgs.validate();
             tracing::info!(
                 generation,
                 camera,
                 purpose = ?req.purpose,
+                ?plan,
                 asked = %size_wanted.map(|s| s.to_string()).unwrap_or_else(|| "default".into()),
                 buffers,
-                raw = want_raw,
                 status = ?status,
                 config = %cfgs.to_string_repr(),
                 "configuration validated"
             );
-            if !want_raw {
-                break (cfgs, status, None);
-            }
-            let layout = (!status.is_invalid()).then(|| raw_layout(&cfgs)).flatten();
-            if layout.is_none() {
-                tracing::warn!(
-                    generation,
-                    camera,
-                    "no raw stream to match the processed one: bursts merge the processed frames"
-                );
-                want_raw = false;
+            if status.is_invalid() {
+                if plan == Plan::Single {
+                    return Err(at("validate")(io::Error::from_raw_os_error(EINVAL)));
+                }
                 continue;
             }
-            break (cfgs, status, layout);
-        };
-        if status.is_invalid() {
-            return Err(at("validate")(io::Error::from_raw_os_error(EINVAL)));
+            let usable = match plan {
+                Plan::Single => true,
+                Plan::Raw => raw_layout(&cfgs).is_some(),
+                Plan::Beside => beside_usable(&cfgs),
+            };
+            if !usable {
+                tracing::info!(
+                    generation,
+                    camera,
+                    ?plan,
+                    "the camera adjusted the streams past use: trying fewer"
+                );
+                if plan == Plan::Raw {
+                    tracing::warn!(
+                        generation,
+                        camera,
+                        "no raw stream to match the processed one: bursts merge the processed frames"
+                    );
+                }
+                continue;
+            }
+            chosen = Some((cfgs, plan));
+            break;
         }
+        let Some((mut cfgs, plan)) = chosen else {
+            return Err(at("generate configuration")(io::Error::other(
+                "no configuration",
+            )));
+        };
         let (layout, size, stride, frame_size, count) = {
             let sc = cfgs.get(0).expect("one stream");
             let fmt = sc.get_pixel_format();
@@ -591,6 +728,19 @@ impl Worker {
                 sc.get_buffer_count(),
             )
         };
+        let raw_shape = match plan {
+            Plan::Raw => raw_layout(&cfgs),
+            _ => None,
+        };
+        let still_shape = match plan {
+            Plan::Beside => {
+                let sc = cfgs.get(1).expect("a still stream");
+                let s = sc.get_size();
+                layout_of(sc.get_pixel_format(), sc.get_color_space())
+                    .map(|l| (Size::new(s.width, s.height), sc.get_stride(), l))
+            }
+            _ => None,
+        };
         cam.configure(&mut cfgs).map_err(at("configure"))?;
         // The configured mode's frame durations, where the pipeline
         // reports them: its shortest says how fast it can run.
@@ -606,59 +756,99 @@ impl Worker {
             .get(0)
             .and_then(|sc| sc.stream())
             .ok_or_else(|| at("stream")(io::Error::other("no stream after configure")))?;
-        let raw = match raw_layout {
+        let second = || {
+            cfgs.get(1)
+                .and_then(|sc| sc.stream())
+                .ok_or_else(|| at("second stream")(io::Error::other("no second stream")))
+        };
+        let raw = match raw_shape {
             Some((size, stride, first_red)) => Some(RawStream {
-                stream: cfgs.get(1).and_then(|sc| sc.stream()).ok_or_else(|| {
-                    at("raw stream")(io::Error::other("no raw stream after configure"))
-                })?,
+                stream: second()?,
                 size,
                 stride,
                 first_red,
             }),
             None => None,
         };
+        let still_stream = match still_shape {
+            Some(shape) => Some((second()?, shape)),
+            None => None,
+        };
 
+        let map = |fb| {
+            MappedBuffer::new(fb)
+                .map_err(|e| at("map buffer")(io::Error::other(format!("mapping a buffer: {e:?}"))))
+        };
         let mut alloc = FrameBufferAllocator::new(&cam);
-        let fbs = alloc.alloc(&stream).map_err(at("allocate buffers"))?;
-        let mut raw_fbs = match &raw {
+        let buffers = alloc
+            .alloc(&stream)
+            .map_err(at("allocate buffers"))?
+            .into_iter()
+            .map(map)
+            .collect::<Result<Vec<_>, _>>()?;
+        let raw_buffers = match &raw {
             Some(r) => alloc
                 .alloc(&r.stream)
                 .map_err(at("allocate raw buffers"))?
                 .into_iter()
-                .map(Some)
-                .collect(),
+                .map(map)
+                .collect::<Result<Vec<_>, _>>()?,
             None => Vec::new(),
+        };
+        let still = match still_stream {
+            Some((stream, (size, stride, layout))) => {
+                let buffers = alloc
+                    .alloc(&stream)
+                    .map_err(at("allocate still buffers"))?
+                    .into_iter()
+                    .map(map)
+                    .collect::<Result<Vec<_>, _>>()?;
+                tracing::info!(
+                    generation,
+                    %size,
+                    stride,
+                    ?layout,
+                    count = buffers.len(),
+                    "still stream beside the preview"
+                );
+                Some(StillStream {
+                    stream,
+                    size,
+                    stride,
+                    layout,
+                    free: (0..buffers.len()).rev().collect(),
+                    buffers,
+                    wanted: 0,
+                })
+            }
+            None => None,
         };
         tracing::info!(
             generation,
-            count = fbs.len(),
+            count = buffers.len(),
             asked = count,
             frame_bytes = frame_size,
             ?layout,
             total_mib = format!(
                 "{:.1}",
-                fbs.len() as f64 * frame_size as f64 / (1024.0 * 1024.0)
+                buffers.len() as f64 * frame_size as f64 / (1024.0 * 1024.0)
             ),
             "buffers allocated"
         );
         // With a raw stream, each request carries one buffer of each.
         let n = match &raw {
-            Some(_) => fbs.len().min(raw_fbs.len()),
-            None => fbs.len(),
+            Some(_) => buffers.len().min(raw_buffers.len()),
+            None => buffers.len(),
         };
         let mut requests = Vec::with_capacity(n);
-        for (i, fb) in fbs.into_iter().take(n).enumerate() {
-            let map = |fb| {
-                MappedBuffer::new(fb).map_err(|e| {
-                    at("map buffer")(io::Error::other(format!("mapping a buffer: {e:?}")))
-                })
-            };
+        for i in 0..n {
             let mut r = cam
                 .create_request(Some(i as u64))
                 .ok_or_else(|| at("create request")(io::Error::other("create_request failed")))?;
-            r.add_buffer(&stream, map(fb)?).map_err(at("add buffer"))?;
-            if let (Some(rs), Some(rfb)) = (&raw, raw_fbs.get_mut(i).and_then(Option::take)) {
-                r.add_buffer(&rs.stream, map(rfb)?)
+            r.add_buffer(&stream, BufRef::of(&buffers, i))
+                .map_err(at("add buffer"))?;
+            if let Some(rs) = &raw {
+                r.add_buffer(&rs.stream, BufRef::of(&raw_buffers, i))
                     .map_err(at("add raw buffer"))?;
             }
             requests.push(r);
@@ -704,7 +894,10 @@ impl Worker {
             pending_controls: None,
             max_fps,
             raw,
+            still,
             sensor_model,
+            buffers,
+            raw_buffers,
             _alloc: alloc,
         };
         for r in requests {
@@ -727,7 +920,42 @@ impl Worker {
         let Some(a) = self.active.as_mut() else {
             return;
         };
-        req.reuse(ReuseFlag::REUSE_BUFFERS);
+        let carried_still = a
+            .still
+            .as_ref()
+            .is_some_and(|s| req.find_buffer(&s.stream).is_some());
+        if carried_still {
+            // Let go of the still's buffer (the completion handler took
+            // it back) and put the request's own buffers back on.
+            req.reuse(ReuseFlag::empty());
+            let i = req.cookie() as usize;
+            if let Err(e) = req.add_buffer(&a.stream, BufRef::of(&a.buffers, i)) {
+                tracing::warn!(error = %e, "a preview buffer didn't go back on its request");
+                return;
+            }
+            if let Some(r) = &a.raw {
+                if let Err(e) = req.add_buffer(&r.stream, BufRef::of(&a.raw_buffers, i)) {
+                    tracing::warn!(error = %e, "a raw buffer didn't go back on its request");
+                    return;
+                }
+            }
+        } else {
+            req.reuse(ReuseFlag::REUSE_BUFFERS);
+        }
+        if let Some(st) = a.still.as_mut().filter(|s| s.wanted > 0) {
+            if let Some(i) = st.free.pop() {
+                match req.add_buffer(&st.stream, BufRef::of(&st.buffers, i)) {
+                    Ok(()) => {
+                        st.wanted -= 1;
+                        tracing::debug!(sequence = req.sequence(), "still asked for");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "the still's buffer didn't go on a request");
+                        st.free.push(i);
+                    }
+                }
+            }
+        }
         if let Some(c) = a.pending_controls.take() {
             set_controls(req.controls_mut(), &c, hints, a.awb_modes);
         }
@@ -744,83 +972,127 @@ impl Worker {
         if req.status() != RequestStatus::Complete {
             return; // canceled by a stop
         }
-        let Some(fb) = req.buffer::<MappedBuffer>(&a.stream) else {
+        let meta = frame_meta(&req);
+        // A still's buffer: copied out after the preview went on.
+        let still = a
+            .still
+            .as_ref()
+            .and_then(|s| req.buffer::<BufRef>(&s.stream))
+            .map(|b| b.index);
+        let (generation, size, stride, layout) = (a.generation, a.size, a.stride, a.layout);
+        let camera = a.camera_id.clone();
+        let preview = req.buffer::<BufRef>(&a.stream).map(|b| b.index);
+        let ok = preview.is_some_and(|i| {
+            a.buffers[i]
+                .metadata()
+                .is_some_and(|m| m.status() == FrameMetadataStatus::Success)
+        });
+        match preview.filter(|_| ok) {
+            None => self.requeue(req),
+            Some(i) => {
+                let raw = a.raw.as_ref().and_then(|r| {
+                    let fb = &a.raw_buffers[req.buffer::<BufRef>(&r.stream)?.index];
+                    let ok = fb
+                        .metadata()
+                        .is_some_and(|m| m.status() == FrameMetadataStatus::Success);
+                    if !ok {
+                        return None;
+                    }
+                    let planes = fb.data();
+                    let plane = planes.first()?;
+                    let len = (r.stride as usize * r.size.height as usize).min(plane.len());
+                    Some(Box::new(RawFrame {
+                        size: r.size,
+                        stride: r.stride,
+                        first_red: r.first_red,
+                        data: plane[..len].to_vec(),
+                        isp: isp_meta(&req, a.sensor_model.clone()),
+                    }))
+                });
+                let data = if a.copy {
+                    let copy = copy_frame(&a.buffers[i].data(), layout, stride, size.height);
+                    self.requeue(req);
+                    copy.map(FrameData::Memory)
+                } else {
+                    let plane = {
+                        let planes = a.buffers[i].planes();
+                        planes
+                            .get(0)
+                            .map(|p| (p.fd(), p.offset().unwrap_or(0) as u32))
+                    };
+                    match plane {
+                        Some((fd, offset)) => {
+                            let cookie = req.cookie();
+                            let me = self.me.clone();
+                            let release = ReleaseToken::new(move || {
+                                let _ = me.send(Msg::Release { generation, cookie });
+                            });
+                            a.lent.insert(cookie, req);
+                            Some(FrameData::Dmabuf {
+                                fd,
+                                offset,
+                                release,
+                            })
+                        }
+                        None => {
+                            self.requeue(req);
+                            None
+                        }
+                    }
+                };
+                if let Some(data) = data {
+                    (self.sink)(Event::Frame(Frame {
+                        generation,
+                        camera: camera.clone(),
+                        size,
+                        stride,
+                        layout,
+                        data,
+                        meta: meta.clone(),
+                        raw,
+                        still: false,
+                    }));
+                }
+            }
+        }
+        if let Some(i) = still {
+            self.still_completed(i, generation, camera, meta);
+        }
+    }
+
+    /// The still stream's buffer `i` came back: send its frame and free it.
+    fn still_completed(&mut self, i: usize, generation: u64, camera: String, meta: FrameMeta) {
+        let Some(st) = self.active.as_mut().and_then(|a| a.still.as_mut()) else {
             return;
         };
+        let fb = &st.buffers[i];
         let ok = fb
             .metadata()
             .is_some_and(|m| m.status() == FrameMetadataStatus::Success);
-        if !ok {
-            self.requeue(req);
-            return;
+        let copy = ok
+            .then(|| copy_frame(&fb.data(), st.layout, st.stride, st.size.height))
+            .flatten();
+        st.free.push(i);
+        let (size, stride, layout) = (st.size, st.stride, st.layout);
+        match copy {
+            Some(data) => (self.sink)(Event::Frame(Frame {
+                generation,
+                camera,
+                size,
+                stride,
+                layout,
+                data: FrameData::Memory(data),
+                meta,
+                raw: None,
+                still: true,
+            })),
+            None => tracing::warn!(
+                generation,
+                ok,
+                "a still frame came back without its picture"
+            ),
         }
-        let meta = frame_meta(&req);
-        let raw = a.raw.as_ref().and_then(|r| {
-            let fb = req.buffer::<MappedBuffer>(&r.stream)?;
-            let ok = fb
-                .metadata()
-                .is_some_and(|m| m.status() == FrameMetadataStatus::Success);
-            if !ok {
-                return None;
-            }
-            let planes = fb.data();
-            let plane = planes.first()?;
-            let len = (r.stride as usize * r.size.height as usize).min(plane.len());
-            Some(Box::new(RawFrame {
-                size: r.size,
-                stride: r.stride,
-                first_red: r.first_red,
-                data: plane[..len].to_vec(),
-                isp: isp_meta(&req, a.sensor_model.clone()),
-            }))
-        });
-        let (generation, size, stride, layout) = (a.generation, a.size, a.stride, a.layout);
-        let camera = a.camera_id.clone();
-        let data = match a.copy {
-            true => {
-                let copy = copy_frame(&fb.data(), layout, stride, size.height);
-                self.requeue(req);
-                match copy {
-                    Some(c) => FrameData::Memory(c),
-                    None => return,
-                }
-            }
-            false => {
-                let plane = {
-                    let planes = fb.planes();
-                    planes
-                        .get(0)
-                        .map(|p| (p.fd(), p.offset().unwrap_or(0) as u32))
-                };
-                let Some((fd, offset)) = plane else {
-                    self.requeue(req);
-                    return;
-                };
-                let cookie = req.cookie();
-                let me = self.me.clone();
-                let release = ReleaseToken::new(move || {
-                    let _ = me.send(Msg::Release { generation, cookie });
-                });
-                a.lent.insert(cookie, req);
-                FrameData::Dmabuf {
-                    fd,
-                    offset,
-                    release,
-                }
-            }
-        };
-        (self.sink)(Event::Frame(Frame {
-            generation,
-            camera,
-            size,
-            stride,
-            layout,
-            data,
-            meta,
-            raw,
-        }));
     }
-
     fn release(&mut self, generation: u64, cookie: u64) {
         let Some(a) = self.active.as_mut().filter(|a| a.generation == generation) else {
             return;
@@ -887,6 +1159,22 @@ fn layout_of(fmt: PixelFormat, cs: Option<ColorSpace>) -> Option<PixelLayout> {
     } else {
         PixelLayout::from_fourcc(fmt.fourcc())
     }
+}
+
+/// A validated preview + still pair omacam can use: both streams kept, in
+/// formats it reads, and the still larger than the preview (else a photo
+/// gains nothing from it).
+fn beside_usable(cfgs: &libcamera::camera::CameraConfiguration) -> bool {
+    if cfgs.len() != 2 {
+        return false;
+    }
+    let (Some(p), Some(s)) = (cfgs.get(0), cfgs.get(1)) else {
+        return false;
+    };
+    let pixels = |z: LcSize| z.width as u64 * z.height as u64;
+    layout_of(p.get_pixel_format(), None).is_some()
+        && layout_of(s.get_pixel_format(), None).is_some()
+        && pixels(s.get_size()) > pixels(p.get_size())
 }
 
 /// One frame copied out of its buffer's planes into one piece: the plane

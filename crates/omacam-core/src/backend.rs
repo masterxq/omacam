@@ -293,7 +293,9 @@ impl PixelLayout {
 }
 
 /// What a stream is for. The software ISP gives one processed stream, so a
-/// full-resolution still is a separate configuration of the same camera.
+/// full-resolution still is a separate configuration of the same camera;
+/// a camera that runs a still stream beside the preview
+/// ([`StreamRequest::still`]) takes it from the running preview instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Preview,
@@ -306,6 +308,14 @@ pub struct StreamRequest {
     pub purpose: Purpose,
     /// None lets the library choose.
     pub size: Option<Size>,
+    /// A preview that may take stills: also configure a still stream of
+    /// this size beside it, where the camera runs both at once. The
+    /// backend says in [`Event::Started`] whether it did; then
+    /// [`Command::Capture`] takes a still without stopping the preview.
+    /// A camera that refuses the pair starts the preview alone.
+    pub still: Option<Size>,
+    /// Buffers for that still stream.
+    pub still_buffers: u32,
     /// Set explicitly: libcamera's default of four full-size buffers once
     /// failed to allocate from CMA.
     pub buffers: u32,
@@ -494,6 +504,9 @@ pub struct Frame {
     /// The raw picture the frame was processed from, when the stream asked
     /// for it ([`StreamRequest::raw`]).
     pub raw: Option<Box<RawFrame>>,
+    /// A frame of the still stream beside the preview, taken for a
+    /// [`Command::Capture`]; always in memory.
+    pub still: bool,
 }
 
 /// A raw Bayer frame: MIPI CSI-2 packed 10-bit samples, at the processed
@@ -539,6 +552,10 @@ pub enum Command {
     Stop { generation: u64 },
     /// Apply controls to the running stream's next requests.
     SetControls { generation: u64, controls: Controls },
+    /// Take one frame of the still stream configured beside the preview
+    /// (with the next request the camera gets); it arrives as a
+    /// [`Frame`] with `still` set.
+    Capture { generation: u64 },
     /// Release every camera and the camera library, until the next Start.
     Release,
 }
@@ -558,6 +575,9 @@ pub enum Event {
         /// FrameDurationLimits minimum; None when the camera doesn't
         /// report frame durations (it runs at its own rate, 30 fps).
         max_fps: Option<f64>,
+        /// The size of the still stream beside the preview, when the
+        /// start asked for one and the camera runs it.
+        still: Option<Size>,
     },
     Frame(Frame),
     /// Something the user should know that isn't a failure (a still taken

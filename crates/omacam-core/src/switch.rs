@@ -24,6 +24,9 @@ pub struct Target {
     /// lens table's indices change when cameras come and go.
     pub camera: String,
     pub purpose: Purpose,
+    /// A preview that asks for a still stream beside it
+    /// ([`crate::backend::StreamRequest::still`]).
+    pub still_beside: bool,
     /// Start values (exposure hints, autofocus mode). Not part of identity.
     pub controls: Controls,
 }
@@ -34,12 +37,15 @@ impl Target {
             lens,
             camera: format!("lens{lens}"),
             purpose,
+            still_beside: false,
             controls: Controls::default(),
         }
     }
 
     fn same_stream(&self, other: &Target) -> bool {
-        self.camera == other.camera && self.purpose == other.purpose
+        self.camera == other.camera
+            && self.purpose == other.purpose
+            && self.still_beside == other.still_beside
     }
 }
 
@@ -156,6 +162,32 @@ impl SwitchController {
         if let Some(w) = self.wanted.as_mut() {
             fix(w);
         }
+    }
+
+    /// Change the stream `generation`'s target, and the wanted one when it
+    /// is the same stream, without a restart: the camera started it other
+    /// than asked (no still stream beside the preview), and the caller
+    /// stops asking for what it can't have.
+    pub fn amend(&mut self, generation: u64, change: impl Fn(&mut Target)) {
+        let (State::Starting {
+            generation: g,
+            target,
+        }
+        | State::Streaming {
+            generation: g,
+            target,
+            ..
+        }) = &mut self.state
+        else {
+            return;
+        };
+        if *g != generation {
+            return;
+        }
+        if let Some(w) = self.wanted.as_mut().filter(|w| w.same_stream(target)) {
+            change(w);
+        }
+        change(target);
     }
 
     /// Ask for `target` (None: stop streaming).

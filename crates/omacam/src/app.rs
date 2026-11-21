@@ -184,6 +184,9 @@ struct App {
     /// Mean brightness (0-255) and the AE values of the last shown frame,
     /// for the state log.
     shown_luma: Cell<Option<f64>>,
+    /// When the viewfinder last took a frame (`--debug`: long gaps are
+    /// logged, such as a photo's).
+    shown_at: Cell<Option<Instant>>,
     shown_ae: Cell<(Option<i32>, Option<f32>)>,
     fps: RefCell<Fps>,
     pinch_base: Cell<f64>,
@@ -685,6 +688,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         shown_camera: RefCell::new(None),
         shown_size: Cell::new((0, 0)),
         shown_luma: Cell::new(None),
+        shown_at: Cell::new(None),
         shown_ae: Cell::new((None, None)),
         fps: RefCell::new(Fps {
             window_start: Instant::now(),
@@ -1116,6 +1120,12 @@ impl App {
         let slot = self.frame_slot.clone();
         let rec_tap = self.rec_tap.clone();
         let sink = Box::new(move |e: Event| match e {
+            // A still from the stream beside the preview: to the
+            // controller in order, never replaced by a newer preview
+            // frame in the slot, never recorded.
+            Event::Frame(f) if f.still => {
+                let _ = tx.send_blocking(Msg::Event(Event::Frame(f)));
+            }
             Event::Frame(mut f) => {
                 // While recording, every frame of the recorded camera goes
                 // to the encoder here, on the camera's thread, whatever
@@ -1326,6 +1336,12 @@ impl App {
         let size = (frame.size.width, frame.size.height);
         if self.cli.debug || self.cli.script.is_some() {
             self.shown_luma.set(mean_luma(&frame));
+            let now = Instant::now();
+            if let Some(gap) = self.shown_at.replace(Some(now)).map(|t| now - t) {
+                if gap >= Duration::from_millis(150) {
+                    tracing::info!(ms = gap.as_millis() as u64, "viewfinder waited for a frame");
+                }
+            }
             self.shown_ae
                 .set((frame.meta.exposure_us, frame.meta.analog_gain));
         }
@@ -1973,7 +1989,7 @@ impl App {
             } else {
                 omacam_core::controller::Mode::Photo
             };
-            if let Some(out) = a.with_controller(|c| c.set_mode(mode)) {
+            if let Some(out) = a.with_controller(|c| c.set_mode(mode, Instant::now())) {
                 a.apply(out);
             }
             a.refresh();

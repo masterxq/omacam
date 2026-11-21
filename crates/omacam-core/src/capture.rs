@@ -23,6 +23,13 @@
 //!
 //! Quick mode keeps the next preview frame instead, with no reconfiguring.
 //!
+//! Beside mode is for a camera that runs a still stream beside the preview
+//! (two processed streams in one configuration): nothing stops. If the
+//! autofocus is scanning or the auto-exposure still searching, it waits for
+//! them (at most [`FOCUS_WAIT`], on the preview's metadata), then asks for
+//! one frame of the still stream with the next request. The exposure is the
+//! preview's, already settled, so the first still frame is kept.
+//!
 //! Burst mode (Night and HDR, merged by omacam-merge) settles the same way,
 //! then locks one exposure for the whole burst: the settled one, the mode's
 //! stops under it, with the shutter capped for a handheld phone and the
@@ -56,6 +63,9 @@ pub const SETTLE_MAX: Duration = Duration::from_secs(3);
 pub const FIXED_DISCARD: u32 = 8;
 /// Longest wait for the still frame before giving up.
 pub const STILL_TIMEOUT: Duration = Duration::from_secs(6);
+/// Longest wait for a still from the stream beside the preview: it comes
+/// with one of the next few requests.
+pub const BESIDE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How close each color gain must be to the preview's.
 pub const GAINS_WITHIN: f64 = 0.10;
 /// Without the preview's gains to compare: how little they may change
@@ -112,6 +122,9 @@ pub enum Mode {
     Full,
     /// Several frames from the still mode at one locked exposure.
     Burst(BurstSpec),
+    /// A frame of the still stream that runs beside the preview, at full
+    /// resolution, with no reconfiguring.
+    Beside,
 }
 
 /// What the controller should do next.
@@ -120,6 +133,8 @@ pub enum Step {
     Nothing,
     /// Switch the current lens to its still mode with these hints.
     StartStill(Controls),
+    /// Ask the running stream for a frame of its still stream.
+    Capture,
     /// Keep the frame just given as the picture.
     Keep,
     /// Hold this exposure and color on the still stream (a burst's lock).
@@ -145,6 +160,16 @@ enum State {
     QuickWait,
     WaitFocus {
         deadline: Instant,
+    },
+    /// Beside mode: waiting for autofocus and exposure on the preview.
+    BesideWait {
+        deadline: Instant,
+        autofocus: bool,
+    },
+    /// Beside mode: the still frame is asked for.
+    BesideStill {
+        deadline: Instant,
+        asked: Instant,
     },
     Still {
         seen: u32,
@@ -272,6 +297,17 @@ impl CaptureController {
                 self.state = State::QuickWait;
                 Step::Nothing
             }
+            Mode::Beside => {
+                if beside_ready(autofocus, last) {
+                    self.capture_beside(last, now)
+                } else {
+                    self.state = State::BesideWait {
+                        deadline: now + FOCUS_WAIT,
+                        autofocus,
+                    };
+                    Step::Nothing
+                }
+            }
             Mode::Full | Mode::Burst(_) => {
                 let scanning = last.and_then(|m| m.af_state) == Some(AfState::Scanning);
                 if autofocus && scanning {
@@ -284,6 +320,35 @@ impl CaptureController {
                 }
             }
         }
+    }
+
+    fn capture_beside(&mut self, last: Option<&FrameMeta>, now: Instant) -> Step {
+        self.locked = lock_from(last);
+        self.state = State::BesideStill {
+            deadline: now + BESIDE_TIMEOUT,
+            asked: now,
+        };
+        Step::Capture
+    }
+
+    /// A frame of the still stream beside the preview.
+    pub fn on_beside_frame(&mut self, meta: &FrameMeta, now: Instant) -> Step {
+        let State::BesideStill { asked, .. } = self.state else {
+            return Step::Discard;
+        };
+        self.last_still = Some(StillReport {
+            frames: 1,
+            elapsed: now.saturating_duration_since(asked),
+            settled: meta.ae_state.is_none_or(|s| s == AeState::Converged),
+            meta: meta.clone(),
+        });
+        self.state = State::Idle;
+        Step::Keep
+    }
+
+    /// True while waiting for a still from the stream beside the preview.
+    pub fn wants_beside_frame(&self) -> bool {
+        matches!(self.state, State::BesideStill { .. })
     }
 
     fn go_still(&mut self, last: Option<&FrameMeta>, now: Instant) -> Step {
@@ -308,6 +373,16 @@ impl CaptureController {
                 let done = matches!(meta.af_state, Some(AfState::Focused | AfState::Failed));
                 if done || now >= deadline {
                     self.go_still(Some(meta), now)
+                } else {
+                    Step::Nothing
+                }
+            }
+            State::BesideWait {
+                deadline,
+                autofocus,
+            } => {
+                if beside_ready(autofocus, Some(meta)) || now >= deadline {
+                    self.capture_beside(Some(meta), now)
                 } else {
                     Step::Nothing
                 }
@@ -492,6 +567,12 @@ impl CaptureController {
     pub fn tick(&mut self, last: Option<&FrameMeta>, now: Instant) -> Step {
         match self.state {
             State::WaitFocus { deadline } if now >= deadline => self.go_still(last, now),
+            State::BesideWait { deadline, .. } if now >= deadline => self.capture_beside(last, now),
+            State::BesideStill { deadline, .. } if now >= deadline => {
+                // The preview runs on: nothing to restore.
+                self.state = State::Idle;
+                Step::Fail("the still frame didn't arrive".into())
+            }
             State::Still { deadline, .. } if now >= deadline => {
                 self.state = State::Restoring;
                 Step::Fail("the still frame didn't arrive".into())
@@ -510,6 +591,15 @@ impl CaptureController {
     pub fn abort(&mut self) {
         self.state = State::Idle;
     }
+}
+
+/// Beside mode can take the still now: autofocus isn't scanning (on a lens
+/// that focuses) and the exposure isn't searching, as far as the last
+/// preview frame says.
+fn beside_ready(autofocus: bool, last: Option<&FrameMeta>) -> bool {
+    let scanning = autofocus && last.and_then(|m| m.af_state) == Some(AfState::Scanning);
+    let searching = last.and_then(|m| m.ae_state) == Some(AeState::Searching);
+    !scanning && !searching
 }
 
 #[cfg(test)]
@@ -875,6 +965,62 @@ mod tests {
             }
         }
         assert!(matches!(step, Step::Fail(_)), "{step:?}");
+    }
+
+    #[test]
+    fn beside_mode_asks_for_the_still_at_once_and_keeps_the_first() {
+        let now = Instant::now();
+        let mut c = CaptureController::new();
+        let last = settled(20_000, 2.0);
+        assert_eq!(c.begin(Mode::Beside, true, Some(&last), now), Step::Capture);
+        assert!(c.wants_beside_frame());
+        assert!(!c.wants_still_stream(), "the preview runs on");
+        // Preview frames go on showing.
+        assert_eq!(c.on_preview_frame(&last, now), Step::Nothing);
+        let later = now + Duration::from_millis(160);
+        assert_eq!(c.on_beside_frame(&last, later), Step::Keep);
+        assert!(!c.is_busy());
+        let r = c.last_still().unwrap();
+        assert_eq!((r.frames, r.elapsed), (1, Duration::from_millis(160)));
+        assert!(r.settled);
+    }
+
+    #[test]
+    fn beside_mode_waits_for_focus_and_exposure_but_not_forever() {
+        let now = Instant::now();
+        let mut c = CaptureController::new();
+        let scanning = meta(10_000, 1.0, Some(AfState::Scanning));
+        assert_eq!(
+            c.begin(Mode::Beside, true, Some(&scanning), now),
+            Step::Nothing
+        );
+        let searching = FrameMeta {
+            ae_state: Some(AeState::Searching),
+            ..meta(10_000, 1.0, Some(AfState::Focused))
+        };
+        assert_eq!(c.on_preview_frame(&searching, now), Step::Nothing);
+        assert_eq!(
+            c.on_preview_frame(&settled(10_000, 1.0), now),
+            Step::Capture
+        );
+        // A lens without autofocus ignores the scan but not the exposure.
+        let mut c = CaptureController::new();
+        assert_eq!(
+            c.begin(Mode::Beside, false, Some(&scanning), now),
+            Step::Capture
+        );
+        let mut c = CaptureController::new();
+        assert_eq!(
+            c.begin(Mode::Beside, false, Some(&searching), now),
+            Step::Nothing
+        );
+        assert_eq!(c.tick(Some(&searching), now + FOCUS_WAIT), Step::Capture);
+        // The still that never comes gives up without a restore.
+        assert!(matches!(
+            c.tick(None, now + FOCUS_WAIT + BESIDE_TIMEOUT),
+            Step::Fail(_)
+        ));
+        assert!(!c.is_busy());
     }
 
     #[test]

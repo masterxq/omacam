@@ -12,4 +12,5 @@ workspace = true
 [dependencies]
 omacam-core.workspace = true
 libcamera.workspace = true
+libcamera-sys.workspace = true
 tracing.workspace = true

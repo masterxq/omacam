@@ -413,6 +413,9 @@ fn handle(
                 s.controls = controls;
             }
         }
+        // The fake camera runs no still stream beside its preview (its
+        // starts say so), so it is never asked for one.
+        Command::Capture { .. } => {}
         Command::Release => stop(stream, sink),
     }
 }
@@ -430,6 +433,7 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
                 stride: s.size.width * 4,
                 layout: PixelLayout::Xrgb8888,
                 max_fps: opts.max_fps,
+                still: None,
             });
             if let Some(message) = s.notice.take() {
                 sink(Event::Notice { message });
@@ -477,6 +481,7 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
                 },
             })
         }),
+        still: false,
     }));
     s.sequence += 1;
     s.next_frame += opts.frame_interval;

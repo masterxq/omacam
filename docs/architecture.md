@@ -14,7 +14,8 @@ omacam-core        no UI, no camera library; unit-tested
   lens             the lens table (TOML) matched to the cameras present
   zoom             the lens ladder, thresholds, hysteresis, slider maths
   switch           the stream state machine (stop one camera, start the next)
-  capture          the still sequence (lock, reconfigure, discard, keep, restore)
+  capture          the still sequence (lock, reconfigure, discard, keep, restore;
+                   or one frame of a still stream beside the preview)
   pixels           reading RGB, YUYV and NV12 frames as RGB
   exposure         carrying exposure across a lens switch by aperture
   exposure_control the Pro panel's settings, metering, AE/AF lock
@@ -71,6 +72,21 @@ skips frames instead of queueing 9 MB copies.
   still mode is 4072x3072 at about 9 fps, the ultrawide's 4032x3016. A
   still whose mode is the preview's (on a camera whose table gives no
   larger one) is the next preview frame, with no stop and start.
+- **A still stream beside the preview**, where the camera has one. A photo
+  preview asks libcamera for the viewfinder and still roles in one
+  configuration (the still at the lens table's still size). Where it
+  validates the pair (two processed streams, the still larger than the
+  preview, formats omacam reads), the backend says so in `Started`, and a
+  photo is one still buffer added to the next request (`Command::Capture`):
+  no stop and start, the preview runs on, and the exposure and focus are
+  the preview's, settled. The shutter waits only while autofocus scans or
+  the exposure is still searching (at most 500 ms). The still frame
+  reaches the controller past the viewfinder's one-frame slot. A camera
+  that refuses the pair (libcamera's simple pipeline gives one processed
+  stream) starts the preview alone and isn't asked again; its photos
+  reconfigure as above. Bursts (Night, HDR) always reconfigure.
+  On the Moto G60s (mtkisp50, the MediaTek DIP's two outputs) a photo is
+  in its buffer 150-165 ms after the shutter instead of about 2 s.
 - **Camera memory.** Every start frees the previous stream's buffers
   first, and a still asks for two buffers. A start that fails for lack of
   memory is retried once after releasing the camera manager, then with one

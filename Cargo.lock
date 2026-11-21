@@ -1045,6 +1045,7 @@ name = "omacam-libcamera"
 version = "0.3.3"
 dependencies = [
  "libcamera",
+ "libcamera-sys",
  "omacam-core",
  "tracing",
 ]
