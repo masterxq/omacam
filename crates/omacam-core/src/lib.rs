@@ -9,6 +9,7 @@
 //! - [`switch`]: the stream state machine that stops one camera and starts
 //!   the next.
 //! - [`capture`]: the still-capture sequence.
+//! - [`pixels`]: reading frames of any layout (RGB, YUYV, NV12) as RGB.
 //! - [`lowlight`]: the low-light fallback from the telephoto to the main.
 //! - [`exposure`]: carrying exposure from one camera to the next.
 //! - [`stabilize`]: video stabilization from the gyroscope.
@@ -25,6 +26,7 @@ pub mod framing;
 pub mod lens;
 pub mod lowlight;
 pub mod orientation;
+pub mod pixels;
 pub mod stabilize;
 pub mod switch;
 pub mod zoom;

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use omacam_core::backend::PixelLayout;
+use omacam_core::pixels::Pixels;
 
 /// Side of the square thumbnail (twice the button, for scale 2).
 pub const THUMB: u32 = 112;
@@ -35,14 +36,12 @@ pub fn crop_rect(width: u32, height: u32, crop: f64) -> (u32, u32, u32, u32) {
     (((width - w) / 2) & !1, ((height - h) / 2) & !1, w, h)
 }
 
-fn pixel(raw: &Raw<'_>, x: u32, y: u32) -> [u8; 4] {
-    let bpp = raw.layout.bytes_per_pixel() as usize;
-    let i = y as usize * raw.stride as usize + x as usize * bpp;
-    let p = &raw.data[i..i + bpp];
-    // Out: B, G, R, X.
-    match raw.layout {
-        PixelLayout::Xrgb8888 | PixelLayout::Rgb888 => [p[0], p[1], p[2], 255],
-        PixelLayout::Xbgr8888 | PixelLayout::Bgr888 => [p[2], p[1], p[0], 255],
+impl Raw<'_> {
+    /// The pixels, readable as RGB whatever their layout (YUV is converted
+    /// as it is read); an error when the data is shorter than the frame.
+    fn pixels(&self) -> Result<Pixels<'_>> {
+        Pixels::new(self.data, self.width, self.height, self.stride, self.layout)
+            .context("frame data is shorter than its size says")
     }
 }
 
@@ -73,13 +72,7 @@ pub fn crop_window_and_rotate(
     rect: (u32, u32, u32, u32),
     rotation: u32,
 ) -> Result<Bgrx> {
-    let bpp = raw.layout.bytes_per_pixel();
-    if raw.stride < raw.width * bpp
-        || (raw.data.len() as u64)
-            < raw.stride as u64 * (raw.height as u64 - 1) + (raw.width * bpp) as u64
-    {
-        bail!("frame data is shorter than its size says");
-    }
+    let px = raw.pixels()?;
     let (cx, cy, cw, ch) = rect;
     if cw == 0 || ch == 0 || cx + cw > raw.width || cy + ch > raw.height {
         bail!("crop outside the frame");
@@ -102,8 +95,7 @@ pub fn crop_window_and_rotate(
                 270 => (cw - 1 - oy, ox),
                 _ => (ox, oy),
             };
-            let px = pixel(raw, cx + sx, cy + sy);
-            row[ox as usize * 4..ox as usize * 4 + 4].copy_from_slice(&px);
+            row[ox as usize * 4..ox as usize * 4 + 4].copy_from_slice(&px.bgrx(cx + sx, cy + sy));
         }
     }
     Ok(Bgrx {
@@ -233,19 +225,20 @@ pub fn write_atomically(path: &Path, jpeg: &[u8]) -> Result<()> {
 }
 
 /// A frame's pixels as omacam-merge's RGB picture.
-pub fn to_rgb(raw: &Raw<'_>) -> omacam_merge::RgbImage {
+pub fn to_rgb(raw: &Raw<'_>) -> Result<omacam_merge::RgbImage> {
     use rayon::prelude::*;
+    let px = raw.pixels()?;
     let mut img = omacam_merge::RgbImage::new(raw.width as usize, raw.height as usize);
     img.data
         .par_chunks_mut(raw.width as usize * 3)
         .enumerate()
         .for_each(|(y, row)| {
             for (x, o) in row.chunks_exact_mut(3).enumerate() {
-                let [b, g, r, _] = pixel(raw, x as u32, y as u32);
+                let [b, g, r, _] = px.bgrx(x as u32, y as u32);
                 o.copy_from_slice(&[r, g, b]);
             }
         });
-    img
+    Ok(img)
 }
 
 /// The merge's threads: one core left free and a lower priority, so the
@@ -398,13 +391,13 @@ fn merge_burst_in_pool(
                 .data
                 .bytes()
                 .context("a burst frame wasn't copied to memory")?;
-            Ok(to_rgb(&Raw {
+            to_rgb(&Raw {
                 data,
                 width: p.frame.size.width,
                 height: p.frame.size.height,
                 stride: p.frame.stride,
                 layout: p.frame.layout,
-            }))
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     let converted = started.elapsed();

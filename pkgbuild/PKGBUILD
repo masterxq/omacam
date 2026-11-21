@@ -17,7 +17,7 @@ depends=(
   gst-plugins-good
   gst-plugins-ugly
   gstreamer
-  'gtk4>=4.14'
+  'gtk4>=4.20'
   'hicolor-icon-theme'
   'libadwaita>=1.5'
   'libcamera>=0.7'

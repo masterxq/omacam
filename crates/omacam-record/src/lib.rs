@@ -52,6 +52,19 @@ pub enum InputFormat {
     Bgr,
     /// DRM BGR888.
     Rgb,
+    /// Packed 4:2:2, Y0 Cb Y1 Cr (DRM YUYV).
+    Yuy2(Yuv),
+    /// 4:2:0, the Y lines then the CbCr lines, both `stride` bytes long.
+    Nv12(Yuv),
+}
+
+/// How YUV frames map to RGB: the matrix and the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Yuv {
+    /// BT.709 coefficients (else BT.601).
+    pub bt709: bool,
+    /// Limited range (else full range, as JPEG).
+    pub limited: bool,
 }
 
 impl InputFormat {
@@ -61,6 +74,23 @@ impl InputFormat {
             InputFormat::Rgbx => "RGBx",
             InputFormat::Bgr => "BGR",
             InputFormat::Rgb => "RGB",
+            InputFormat::Yuy2(_) => "YUY2",
+            InputFormat::Nv12(_) => "NV12",
+        }
+    }
+
+    /// GStreamer's colorimetry for YUV input (range:matrix:transfer:
+    /// primaries): BT.709 primaries and the sRGB transfer, the frames' own
+    /// matrix and range.
+    fn colorimetry(self) -> Option<String> {
+        match self {
+            InputFormat::Yuy2(c) | InputFormat::Nv12(c) => Some(format!(
+                "{}:{}:{}:1",
+                if c.limited { 2 } else { 1 },
+                if c.bt709 { 3 } else { 4 },
+                if c.bt709 { 5 } else { 7 },
+            )),
+            _ => None,
         }
     }
 }
@@ -188,17 +218,25 @@ impl Input {
     }
 
     fn bytes_needed(&self) -> usize {
-        self.stride as usize * (self.height as usize).saturating_sub(1)
+        // NV12's CbCr lines follow its Y lines.
+        let lines = match self.format {
+            InputFormat::Nv12(_) => self.height as usize + (self.height as usize).div_ceil(2),
+            _ => self.height as usize,
+        };
+        self.stride as usize * lines.saturating_sub(1)
             + self.width as usize * bytes_per_pixel(self.format)
     }
 
     fn caps(&self) -> gst::Caps {
-        gst::Caps::builder("video/x-raw")
+        let mut caps = gst::Caps::builder("video/x-raw")
             .field("format", self.format.caps_name())
             .field("width", self.padded_width() as i32)
             .field("height", self.height as i32)
-            .field("framerate", gst::Fraction::new(0, 1))
-            .build()
+            .field("framerate", gst::Fraction::new(0, 1));
+        if let Some(c) = self.format.colorimetry() {
+            caps = caps.field("colorimetry", c);
+        }
+        caps.build()
     }
 }
 
@@ -932,6 +970,9 @@ fn bytes_per_pixel(f: InputFormat) -> usize {
     match f {
         InputFormat::Bgrx | InputFormat::Rgbx => 4,
         InputFormat::Bgr | InputFormat::Rgb => 3,
+        InputFormat::Yuy2(_) => 2,
+        // Of the Y plane.
+        InputFormat::Nv12(_) => 1,
     }
 }
 
@@ -978,6 +1019,41 @@ mod tests {
             scale,
             ..View::default()
         }
+    }
+
+    #[test]
+    fn yuv_inputs_name_their_size_and_colors() {
+        gst::init().unwrap();
+        let yuv = |format, stride| Input {
+            format,
+            width: 1920,
+            height: 1080,
+            stride,
+            coverage: (1.0, 1.0),
+            flip: false,
+        };
+        let full = Yuv::default();
+        let yuy2 = yuv(InputFormat::Yuy2(full), 3840);
+        assert_eq!(yuy2.bytes_needed(), 3840 * 1080);
+        let caps = yuy2.caps();
+        let st = caps.structure(0).unwrap();
+        assert_eq!(st.get::<&str>("format").unwrap(), "YUY2");
+        assert_eq!(st.get::<i32>("width").unwrap(), 1920);
+        assert_eq!(st.get::<&str>("colorimetry").unwrap(), "1:4:7:1");
+        // Padded NV12: both planes' lines, the width from the stride.
+        let nv12 = yuv(
+            InputFormat::Nv12(Yuv {
+                bt709: true,
+                limited: true,
+            }),
+            1984,
+        );
+        assert_eq!(nv12.bytes_needed(), 1984 * (1080 + 539) + 1920);
+        let caps = nv12.caps();
+        let st = caps.structure(0).unwrap();
+        assert_eq!(st.get::<i32>("width").unwrap(), 1984);
+        assert_eq!(st.get::<&str>("colorimetry").unwrap(), "2:3:5:1");
+        assert!(caps.is_fixed());
     }
 
     #[test]

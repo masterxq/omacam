@@ -15,6 +15,7 @@ omacam-core        no UI, no camera library; unit-tested
   zoom             the lens ladder, thresholds, hysteresis, slider maths
   switch           the stream state machine (stop one camera, start the next)
   capture          the still sequence (lock, reconfigure, discard, keep, restore)
+  pixels           reading RGB, YUYV and NV12 frames as RGB
   exposure         carrying exposure across a lens switch by aperture
   exposure_control the Pro panel's settings, metering, AE/AF lock
   focus            tap to focus: picture point to sensor window, the scan
@@ -78,7 +79,11 @@ skips frames instead of queueing 9 MB copies.
   configure, allocate buffers, start, ...).
 - **Formats.** omacam asks for XRGB8888 (32-bit linear, the safe GPU import
   format); libcamera adjusts the sizes slightly (2016x1136 becomes
-  2008x1136).
+  2008x1136). A hardware ISP with YUV output adjusts the format instead:
+  YUYV and NV12 frames are taken as they are (with the stream's matrix and
+  range), drawn by GTK as YUV memory textures (GTK 4.20), recorded as YUY2
+  or NV12, and turned into RGB only for photos, merges, metering and the
+  histogram (`omacam_core::pixels`).
 
 ## Zoom and lens switching (§3.4)
 

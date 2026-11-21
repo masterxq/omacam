@@ -16,6 +16,7 @@ use omacam_core::controller::{Options, Output, Picture};
 use omacam_core::focus::Status as FocusStatus;
 use omacam_core::lens::Role;
 use omacam_core::orientation::{self, DeviceOrientation};
+use omacam_core::pixels::Pixels;
 use omacam_core::zoom::ZoomSource;
 use omacam_core::{capture, Controller};
 
@@ -218,7 +219,7 @@ struct App {
     ev_shown_until: Cell<Option<Instant>>,
     histogram: Cell<bool>,
     /// The last frame on screen, for metering a tap and the histogram.
-    last_pixels: RefCell<Option<(omacam_core::backend::SharedPixels, u32, u32, u32)>>,
+    last_pixels: RefCell<Option<ShownPixels>>,
     settings: RefCell<Settings>,
     settings_path: PathBuf,
     /// The self-timer: its tick source and the seconds left.
@@ -383,11 +384,17 @@ fn rec_view(t: &omacam_core::framing::Transform, margin: f64) -> omacam_record::
 }
 
 fn input_format(layout: PixelLayout) -> omacam_record::InputFormat {
+    let yuv = |c: omacam_core::backend::YuvColor| omacam_record::Yuv {
+        bt709: c.bt709,
+        limited: c.limited,
+    };
     match layout {
         PixelLayout::Xrgb8888 => omacam_record::InputFormat::Bgrx,
         PixelLayout::Xbgr8888 => omacam_record::InputFormat::Rgbx,
         PixelLayout::Rgb888 => omacam_record::InputFormat::Bgr,
         PixelLayout::Bgr888 => omacam_record::InputFormat::Rgb,
+        PixelLayout::Yuyv(c) => omacam_record::InputFormat::Yuy2(yuv(c)),
+        PixelLayout::Nv12(c) => omacam_record::InputFormat::Nv12(yuv(c)),
     }
 }
 
@@ -934,13 +941,58 @@ fn unsafe_keep(window: &adw::ApplicationWindow, monitor: gio::FileMonitor) {
     });
 }
 
+/// The last shown frame's pixels: data, width, height, stride, layout.
+type ShownPixels = (
+    omacam_core::backend::SharedPixels,
+    u32,
+    u32,
+    u32,
+    PixelLayout,
+);
+
 fn memory_format(layout: PixelLayout) -> gdk::MemoryFormat {
     match layout {
         PixelLayout::Xrgb8888 => gdk::MemoryFormat::B8g8r8x8,
         PixelLayout::Xbgr8888 => gdk::MemoryFormat::R8g8b8x8,
         PixelLayout::Rgb888 => gdk::MemoryFormat::B8g8r8,
         PixelLayout::Bgr888 => gdk::MemoryFormat::R8g8b8,
+        PixelLayout::Yuyv(_) => gdk::MemoryFormat::G8b8g8r8422,
+        PixelLayout::Nv12(_) => gdk::MemoryFormat::G8B8r8420,
     }
+}
+
+/// The color state GTK turns a YUV frame into RGB with: the frame's matrix
+/// and range, sRGB primaries and transfer (sYCC for BT.601 full range).
+/// Built once per kind of frame.
+fn yuv_color_state(c: omacam_core::backend::YuvColor) -> Option<gdk::ColorState> {
+    thread_local! {
+        static CACHE: RefCell<Vec<(omacam_core::backend::YuvColor, gdk::ColorState)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    CACHE.with_borrow_mut(|cache| {
+        if let Some((_, cs)) = cache.iter().find(|(k, _)| *k == c) {
+            return Some(cs.clone());
+        }
+        let p = gdk::CicpParams::new();
+        p.set_color_primaries(1);
+        p.set_transfer_function(13);
+        p.set_matrix_coefficients(if c.bt709 { 1 } else { 6 });
+        p.set_range(if c.limited {
+            gdk::CicpRange::Narrow
+        } else {
+            gdk::CicpRange::Full
+        });
+        match p.build_color_state() {
+            Ok(cs) => {
+                cache.push((c, cs.clone()));
+                Some(cs)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no color state for YUV frames");
+                None
+            }
+        }
+    })
 }
 
 /// A texture for the viewfinder, and for a memory frame its pixels as
@@ -954,14 +1006,35 @@ fn texture(display: &gdk::Display, frame: Frame) -> Option<(gdk::Texture, Option
                 FrameData::Shared(s) => glib::Bytes::from_owned(s),
                 FrameData::Dmabuf { .. } => unreachable!(),
             };
-            let tex = gdk::MemoryTexture::new(
-                w,
-                h,
-                memory_format(frame.layout),
-                &bytes,
-                frame.stride as usize,
-            )
-            .upcast();
+            let tex = match frame.layout.yuv() {
+                // YUV as it came from the camera: GTK turns it into RGB
+                // on the GPU.
+                Some(color) => {
+                    let mut b = gdk::MemoryTextureBuilder::new()
+                        .set_bytes(Some(&bytes))
+                        .set_width(w)
+                        .set_height(h)
+                        .set_format(memory_format(frame.layout))
+                        .set_stride(frame.stride as usize);
+                    if let PixelLayout::Nv12(_) = frame.layout {
+                        b = b
+                            .set_stride_for_plane(1, frame.stride as usize)
+                            .set_offset(1, frame.stride as usize * h as usize);
+                    }
+                    if let Some(cs) = yuv_color_state(color) {
+                        b = b.set_color_state(&cs);
+                    }
+                    b.build()
+                }
+                None => gdk::MemoryTexture::new(
+                    w,
+                    h,
+                    memory_format(frame.layout),
+                    &bytes,
+                    frame.stride as usize,
+                )
+                .upcast(),
+            };
             Some((tex, Some(bytes)))
         }
         FrameData::Dmabuf {
@@ -998,18 +1071,17 @@ fn texture(display: &gdk::Display, frame: Frame) -> Option<(gdk::Texture, Option
 
 /// Mean brightness (0-255) of a memory frame, from a sparse sample.
 fn mean_luma(frame: &Frame) -> Option<f64> {
-    let data = frame.data.bytes()?;
-    let bpp = frame.layout.bytes_per_pixel() as usize;
-    let (w, h) = (frame.size.width as usize, frame.size.height as usize);
+    let px = Pixels::new(
+        frame.data.bytes()?,
+        frame.size.width,
+        frame.size.height,
+        frame.stride,
+        frame.layout,
+    )?;
     let (mut sum, mut n) = (0.0, 0u32);
-    for y in (0..h).step_by(16) {
-        for x in (0..w).step_by(16) {
-            let i = y * frame.stride as usize + x * bpp;
-            let Some(p) = data.get(i..i + 3) else {
-                continue;
-            };
-            // B, G, R for the XRGB/RGB layouts; close enough for the others.
-            sum += 0.114 * p[0] as f64 + 0.587 * p[1] as f64 + 0.299 * p[2] as f64;
+    for y in (0..px.height).step_by(16) {
+        for x in (0..px.width).step_by(16) {
+            sum += px.luma(x, y);
             n += 1;
         }
     }
@@ -1257,12 +1329,13 @@ impl App {
             self.shown_ae
                 .set((frame.meta.exposure_us, frame.meta.analog_gain));
         }
-        if let (FrameData::Shared(px), 4) = (&frame.data, frame.layout.bytes_per_pixel()) {
+        if let FrameData::Shared(px) = &frame.data {
             *self.last_pixels.borrow_mut() = Some((
                 px.clone(),
                 frame.size.width,
                 frame.size.height,
                 frame.stride,
+                frame.layout,
             ));
         }
         let format = (
@@ -1599,7 +1672,10 @@ impl App {
             self.last_pixels
                 .borrow()
                 .as_ref()
-                .map(|(px, w, h, stride)| luma_histogram(px.as_ref(), *w, *h, *stride, 32))
+                .and_then(|(px, w, h, stride, layout)| {
+                    Pixels::new(px.as_ref(), *w, *h, *stride, *layout)
+                })
+                .map(|px| luma_histogram(&px, 32))
         } else {
             None
         };
@@ -2474,8 +2550,9 @@ impl App {
         let t = self.controller.borrow().as_ref()?.transform(&camera)?;
         let (x, y) = omacam_core::focus::picture_to_frame(u, v, &t);
         let pixels = self.last_pixels.borrow();
-        let (px, w, h, stride) = pixels.as_ref()?;
-        Some(region_luma(px.as_ref(), *w, *h, *stride, x, y, 0.04))
+        let (px, w, h, stride, layout) = pixels.as_ref()?;
+        let px = Pixels::new(px.as_ref(), *w, *h, *stride, *layout)?;
+        Some(region_luma(&px, x, y, 0.04))
     }
 
     /// Save the Pro values, when the setting keeps them.
@@ -2887,7 +2964,8 @@ fn start_control_socket(tx: async_channel::Sender<Msg>) {
 /// The mean luma (0-255) of the square around frame point (x, y), 0..1,
 /// `size` of the shorter side across, in 4-byte BGRX/RGBX pixels (the
 /// green channel and the two others weigh the same in both orders).
-fn region_luma(px: &[u8], w: u32, h: u32, stride: u32, x: f64, y: f64, size: f64) -> f64 {
+fn region_luma(px: &Pixels<'_>, x: f64, y: f64, size: f64) -> f64 {
+    let (w, h) = (px.width, px.height);
     let half = ((w.min(h) as f64 * size) / 2.0).max(1.0);
     let (cx, cy) = (x * w as f64, y * h as f64);
     let x0 = (cx - half).max(0.0) as u32;
@@ -2898,11 +2976,8 @@ fn region_luma(px: &[u8], w: u32, h: u32, stride: u32, x: f64, y: f64, size: f64
     let step = ((x1 - x0) / 32).max(1);
     for yy in (y0..=y1).step_by(step as usize) {
         for xx in (x0..=x1).step_by(step as usize) {
-            let i = (yy * stride + xx * 4) as usize;
-            if let Some(p) = px.get(i..i + 3) {
-                sum += 0.114 * p[0] as f64 + 0.587 * p[1] as f64 + 0.299 * p[2] as f64;
-                n += 1;
-            }
+            sum += px.luma(xx, yy);
+            n += 1;
         }
     }
     if n == 0 {
@@ -2916,15 +2991,12 @@ const MID_LUMA: f64 = 118.0;
 
 /// A luma histogram of a 4-byte-per-pixel frame, `bins` bins scaled so the
 /// fullest is 1, from a sparse sample.
-fn luma_histogram(px: &[u8], w: u32, h: u32, stride: u32, bins: usize) -> Vec<f32> {
+fn luma_histogram(px: &Pixels<'_>, bins: usize) -> Vec<f32> {
     let mut counts = vec![0u32; bins];
-    for y in (0..h).step_by(8) {
-        for x in (0..w).step_by(8) {
-            let i = (y * stride + x * 4) as usize;
-            if let Some(p) = px.get(i..i + 3) {
-                let l = 0.114 * p[0] as f32 + 0.587 * p[1] as f32 + 0.299 * p[2] as f32;
-                counts[((l / 256.0) * bins as f32) as usize % bins] += 1;
-            }
+    for y in (0..px.height).step_by(8) {
+        for x in (0..px.width).step_by(8) {
+            let l = px.luma(x, y) as f32;
+            counts[((l / 256.0) * bins as f32) as usize % bins] += 1;
         }
     }
     let max = counts.iter().copied().max().unwrap_or(1).max(1) as f32;

@@ -213,21 +213,56 @@ impl AwbPreset {
     }
 }
 
-/// Byte layout of a single-plane RGB frame, named by DRM fourcc as
-/// libcamera names them (so `Xrgb8888` is B, G, R, X in memory).
+/// Byte layout of a frame, named by DRM fourcc as libcamera names them (so
+/// `Xrgb8888` is B, G, R, X in memory). The RGB layouts are one plane; the
+/// YUV ones carry how their YCbCr turns into RGB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelLayout {
     Xrgb8888,
     Xbgr8888,
     Rgb888,
     Bgr888,
+    /// Packed 4:2:2, Y0 Cb Y1 Cr: one plane, two bytes a pixel.
+    Yuyv(YuvColor),
+    /// 4:2:0, a Y plane and a CbCr plane, both `stride` bytes a line; the
+    /// CbCr lines follow the Y lines at `stride * height`.
+    Nv12(YuvColor),
+}
+
+/// How a YUV frame's values map to RGB: the matrix and the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct YuvColor {
+    /// BT.709 coefficients (else BT.601).
+    pub bt709: bool,
+    /// Limited range, Y 16-235 (else full range, as JPEG).
+    pub limited: bool,
 }
 
 impl PixelLayout {
+    /// Bytes per pixel of the first plane.
     pub fn bytes_per_pixel(self) -> u32 {
         match self {
             PixelLayout::Xrgb8888 | PixelLayout::Xbgr8888 => 4,
             PixelLayout::Rgb888 | PixelLayout::Bgr888 => 3,
+            PixelLayout::Yuyv(_) => 2,
+            PixelLayout::Nv12(_) => 1,
+        }
+    }
+
+    /// The YUV layouts' color, None for RGB.
+    pub fn yuv(self) -> Option<YuvColor> {
+        match self {
+            PixelLayout::Yuyv(c) | PixelLayout::Nv12(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Bytes a frame of `height` lines of `stride` bytes takes, all planes.
+    pub fn frame_len(self, stride: u32, height: u32) -> usize {
+        let plane = stride as usize * height as usize;
+        match self {
+            PixelLayout::Nv12(_) => plane + stride as usize * height.div_ceil(2) as usize,
+            _ => plane,
         }
     }
 
@@ -238,10 +273,13 @@ impl PixelLayout {
             PixelLayout::Xbgr8888 => b"XB24",
             PixelLayout::Rgb888 => b"RG24",
             PixelLayout::Bgr888 => b"BG24",
+            PixelLayout::Yuyv(_) => b"YUYV",
+            PixelLayout::Nv12(_) => b"NV12",
         };
         u32::from_le_bytes(*code)
     }
 
+    /// The RGB layout of a fourcc (the YUV ones need their color too).
     pub fn from_fourcc(fourcc: u32) -> Option<Self> {
         [
             PixelLayout::Xrgb8888,

@@ -14,10 +14,10 @@
 //!   requeues the request only when the UI drops the frame's
 //!   [`ReleaseToken`].
 //!
-//! A camera that gives NV12 instead of the XRGB8888 asked for (a hardware
-//! ISP with YUV output, such as the MediaTek DIP behind libcamera's simple
-//! pipeline) has its frames converted to XRGB8888 on the CPU as they are
-//! copied out, in either display mode.
+//! A camera that gives YUYV or NV12 instead of the XRGB8888 asked for (a
+//! hardware ISP with YUV output, such as the MediaTek DIP) has its frames
+//! copied out as they are, in either display mode: the viewfinder and the
+//! recorder take YUV, and photos turn it into RGB off this thread.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -42,7 +42,7 @@ use libcamera::{controls, properties};
 use omacam_core::backend::{
     AeState, AfState, Awb, AwbPreset, Backend, CameraInfo, Caps, Command, Controls, Event,
     EventSink, ExposureSettings, Frame, FrameData, FrameMeta, IspMeta, Location, PixelLayout,
-    Purpose, RawFrame, Rect, ReleaseToken, Setting, Size, StreamRequest,
+    Purpose, RawFrame, Rect, ReleaseToken, Setting, Size, StreamRequest, YuvColor,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -154,11 +154,9 @@ struct Active {
     size: Size,
     stride: u32,
     layout: PixelLayout,
-    /// Copy frames out (memory display, and always for stills, which the
-    /// encoder reads on the CPU, and for NV12, which is converted).
+    /// Copy frames out (memory display, stills, which the encoder reads on
+    /// the CPU, and YUV frames, which the viewfinder takes from memory).
     copy: bool,
-    /// The camera gives NV12: frames are converted to XRGB8888.
-    nv12: Option<Nv12>,
     /// The camera takes AwbMode (the simple pipeline doesn't, and logs an
     /// error for each request that sets it).
     awb_modes: bool,
@@ -176,53 +174,6 @@ struct Active {
     /// The sensor's model, for the raw frames' tuning file.
     sensor_model: Option<String>,
     _alloc: FrameBufferAllocator,
-}
-
-/// NV12 frames from the camera, and how to turn them into XRGB8888.
-#[derive(Debug, Clone, Copy)]
-struct Nv12 {
-    /// Line length of the Y and of the CbCr plane, bytes.
-    stride: u32,
-    /// YCbCr to RGB in 16.16 fixed point: Y scale, Cr to R, Cb and Cr to G,
-    /// Cb to B.
-    y_scale: i32,
-    rv: i32,
-    gu: i32,
-    gv: i32,
-    bu: i32,
-    /// Black level of Y: 16 in limited range, 0 in full range.
-    y_offset: i32,
-}
-
-impl Nv12 {
-    /// BT.709 or BT.601 coefficients, limited or full range, from the
-    /// stream's color space; BT.601 full range (as JPEG) where the
-    /// pipeline names none.
-    fn new(stride: u32, cs: Option<ColorSpace>) -> Nv12 {
-        let rec709 = cs.is_some_and(|c| c.ycbcr_encoding == YcbcrEncoding::Rec709);
-        let limited = cs.is_some_and(|c| c.range == Range::Limited);
-        let (kr, kb) = if rec709 {
-            (0.2126, 0.0722)
-        } else {
-            (0.299, 0.114)
-        };
-        let kg = 1.0 - kr - kb;
-        let (ys, cs) = if limited {
-            (255.0 / 219.0, 255.0 / 224.0)
-        } else {
-            (1.0, 1.0)
-        };
-        let fixed = |v: f64| (v * 65536.0).round() as i32;
-        Nv12 {
-            stride,
-            y_scale: fixed(ys),
-            rv: fixed(2.0 * (1.0 - kr) * cs),
-            gu: fixed(2.0 * (1.0 - kb) * kb / kg * cs),
-            gv: fixed(2.0 * (1.0 - kr) * kr / kg * cs),
-            bu: fixed(2.0 * (1.0 - kb) * cs),
-            y_offset: if limited { 16 } else { 0 },
-        }
-    }
 }
 
 struct RawStream {
@@ -622,46 +573,24 @@ impl Worker {
         if status.is_invalid() {
             return Err(at("validate")(io::Error::from_raw_os_error(EINVAL)));
         }
-        let (layout, size, stride, frame_size, count, nv12) = {
+        let (layout, size, stride, frame_size, count) = {
             let sc = cfgs.get(0).expect("one stream");
             let fmt = sc.get_pixel_format();
             let s = sc.get_size();
-            // NV12 where the camera has no RGB output: converted to
-            // XRGB8888 as each frame is copied out.
-            let nv12 = (fmt == libcamera::formats::NV12)
-                .then(|| Nv12::new(sc.get_stride(), sc.get_color_space()));
-            let layout = match nv12 {
-                Some(_) => PixelLayout::Xrgb8888,
-                None => PixelLayout::from_fourcc(fmt.fourcc())
-                    .filter(|_| fmt.modifier() == 0)
-                    .ok_or_else(|| {
-                        at("format")(io::Error::other(format!(
-                            "unsupported pixel format {:#x}",
-                            fmt.fourcc()
-                        )))
-                    })?,
-            };
-            let stride = match nv12 {
-                Some(_) => s.width * layout.bytes_per_pixel(),
-                None => sc.get_stride(),
-            };
+            let layout = layout_of(fmt, sc.get_color_space()).ok_or_else(|| {
+                at("format")(io::Error::other(format!(
+                    "unsupported pixel format {:#x}",
+                    fmt.fourcc()
+                )))
+            })?;
             (
                 layout,
                 Size::new(s.width, s.height),
-                stride,
+                sc.get_stride(),
                 sc.get_frame_size(),
                 sc.get_buffer_count(),
-                nv12,
             )
         };
-        if let Some(n) = &nv12 {
-            tracing::info!(
-                generation,
-                camera,
-                nv12_stride = n.stride,
-                "NV12 frames, converted to XRGB8888 on the CPU"
-            );
-        }
         cam.configure(&mut cfgs).map_err(at("configure"))?;
         // The configured mode's frame durations, where the pipeline
         // reports them: its shortest says how fast it can run.
@@ -705,6 +634,7 @@ impl Worker {
             count = fbs.len(),
             asked = count,
             frame_bytes = frame_size,
+            ?layout,
             total_mib = format!(
                 "{:.1}",
                 fbs.len() as f64 * frame_size as f64 / (1024.0 * 1024.0)
@@ -767,8 +697,7 @@ impl Worker {
             layout,
             copy: self.opts.display == DisplayMode::Memory
                 || req.purpose == Purpose::Still
-                || nv12.is_some(),
-            nv12,
+                || layout.yuv().is_some(),
             awb_modes,
             lent: HashMap::new(),
             idle: Vec::new(),
@@ -845,21 +774,11 @@ impl Worker {
                 isp: isp_meta(&req, a.sensor_model.clone()),
             }))
         });
-        let (generation, size, stride, layout, nv12) =
-            (a.generation, a.size, a.stride, a.layout, a.nv12);
+        let (generation, size, stride, layout) = (a.generation, a.size, a.stride, a.layout);
         let camera = a.camera_id.clone();
         let data = match a.copy {
             true => {
-                let copy = {
-                    let planes = fb.data();
-                    match &nv12 {
-                        Some(n) => nv12_to_xrgb(&planes, size, n),
-                        None => planes.first().map(|plane| {
-                            let len = (stride as usize * size.height as usize).min(plane.len());
-                            plane[..len].to_vec()
-                        }),
-                    }
-                };
+                let copy = copy_frame(&fb.data(), layout, stride, size.height);
                 self.requeue(req);
                 match copy {
                     Some(c) => FrameData::Memory(c),
@@ -949,76 +868,48 @@ impl Worker {
     }
 }
 
-/// An NV12 frame as XRGB8888 (B, G, R, X in memory), `size.width * 4`
-/// bytes a line. The planes are copied out first in one go each (the
-/// camera's buffers may be mapped uncached), then converted on a few
-/// threads. None when the planes are shorter than the frame needs.
-fn nv12_to_xrgb(planes: &[&[u8]], size: Size, n: &Nv12) -> Option<Vec<u8>> {
-    let (width, height, stride) = (size.width as usize, size.height as usize, n.stride as usize);
-    let chroma_width = width.div_ceil(2) * 2;
-    if width == 0 || height == 0 || stride < chroma_width {
+/// The layout of a stream format omacam reads: the RGB formats, YUYV and
+/// NV12 (a hardware ISP with YUV output, such as the MediaTek DIP), the YUV
+/// ones with their color space's matrix and range; BT.601 full range (as
+/// JPEG) where the pipeline names none.
+fn layout_of(fmt: PixelFormat, cs: Option<ColorSpace>) -> Option<PixelLayout> {
+    if fmt.modifier() != 0 {
         return None;
     }
-    let chroma_rows = height.div_ceil(2);
-    let y_len = stride * (height - 1) + width;
-    let uv_len = stride * (chroma_rows - 1) + chroma_width;
-    // Two planes, or one with the CbCr lines after the Y lines.
-    let (y, uv) = match planes {
-        [y, uv, ..] => (y.get(..y_len)?.to_vec(), uv.get(..uv_len)?.to_vec()),
-        [one] => {
-            let uv_start = stride * height;
-            (
-                one.get(..y_len)?.to_vec(),
-                one.get(uv_start..uv_start + uv_len)?.to_vec(),
-            )
-        }
-        [] => return None,
+    let yuv = || YuvColor {
+        bt709: cs.is_some_and(|c| c.ycbcr_encoding == YcbcrEncoding::Rec709),
+        limited: cs.is_some_and(|c| c.range == Range::Limited),
     };
-    let line = width * 4;
-    let mut out = vec![0u8; line * height];
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |t| t.get())
-        .clamp(1, 4);
-    // Whole pairs of lines per thread: each pair shares one CbCr line.
-    let rows = height.div_ceil(threads).div_ceil(2) * 2;
-    std::thread::scope(|scope| {
-        for (i, chunk) in out.chunks_mut(rows * line).enumerate() {
-            let (y, uv) = (&y, &uv);
-            scope.spawn(move || nv12_rows(y, uv, chunk, width, stride, i * rows, n));
-        }
-    });
-    Some(out)
-}
-
-/// Convert the lines of `out` (from line `first` of the frame on).
-fn nv12_rows(
-    y: &[u8],
-    uv: &[u8],
-    out: &mut [u8],
-    width: usize,
-    stride: usize,
-    first: usize,
-    n: &Nv12,
-) {
-    const HALF: i32 = 1 << 15;
-    let clamp = |v: i32| (v >> 16).clamp(0, 255) as u8;
-    for (r, dst) in out.chunks_exact_mut(width * 4).enumerate() {
-        let row = first + r;
-        let luma = &y[row * stride..row * stride + width];
-        let chroma = &uv[(row / 2) * stride..];
-        for (x, px) in dst.chunks_exact_mut(4).enumerate() {
-            let l = (luma[x] as i32 - n.y_offset) * n.y_scale + HALF;
-            let c = x & !1;
-            let u = chroma[c] as i32 - 128;
-            let v = chroma[c + 1] as i32 - 128;
-            px[0] = clamp(l + n.bu * u);
-            px[1] = clamp(l - n.gu * u - n.gv * v);
-            px[2] = clamp(l + n.rv * v);
-            px[3] = 255;
-        }
+    if fmt == libcamera::formats::YUYV {
+        Some(PixelLayout::Yuyv(yuv()))
+    } else if fmt == libcamera::formats::NV12 {
+        Some(PixelLayout::Nv12(yuv()))
+    } else {
+        PixelLayout::from_fourcc(fmt.fourcc())
     }
 }
 
+/// One frame copied out of its buffer's planes into one piece: the plane
+/// for the one-plane layouts, the Y lines then the CbCr lines for NV12
+/// (from two planes, or one with both). The camera's buffers may be mapped
+/// uncached, so each plane is read once, in one go. None when the planes
+/// are shorter than the frame needs.
+fn copy_frame(planes: &[&[u8]], layout: PixelLayout, stride: u32, height: u32) -> Option<Vec<u8>> {
+    let len = layout.frame_len(stride, height);
+    match (layout, planes) {
+        (PixelLayout::Nv12(_), [y, uv, ..]) => {
+            let y_len = stride as usize * height as usize;
+            let mut out = Vec::with_capacity(len);
+            out.extend_from_slice(y.get(..y_len)?);
+            out.extend_from_slice(uv.get(..len - y_len)?);
+            Some(out)
+        }
+        (PixelLayout::Nv12(_), [one]) => one.get(..len).map(<[u8]>::to_vec),
+        // The last line may end without its padding.
+        (_, [one, ..]) => Some(one[..len.min(one.len())].to_vec()),
+        (_, []) => None,
+    }
+}
 /// ColourGains is an array control: its range is per element.
 fn color_gains_range(map: &ControlInfoMap) -> Option<(f32, f32)> {
     let info = map.find(<controls::ColourGains as ControlEntry>::ID).ok()?;
@@ -1274,54 +1165,60 @@ fn frame_meta(req: &Request) -> FrameMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omacam_core::backend::YuvColor;
 
-    fn full_range() -> Nv12 {
-        Nv12::new(8, None)
+    #[test]
+    fn nv12_planes_are_copied_into_one_piece() {
+        let nv12 = PixelLayout::Nv12(YuvColor::default());
+        let y = vec![1u8; 8 * 4];
+        let uv = vec![2u8; 8 * 2];
+        let out = copy_frame(&[&y, &uv], nv12, 8, 4).expect("copied");
+        assert_eq!(out.len(), 48);
+        assert!(out[..32].iter().all(|&v| v == 1) && out[32..].iter().all(|&v| v == 2));
+        // One plane with both, as long as the frame.
+        let one: Vec<u8> = y.iter().chain(&uv).copied().collect();
+        assert_eq!(copy_frame(&[&one], nv12, 8, 4), Some(out));
+        // Short planes.
+        assert!(copy_frame(&[&y[..30], &uv], nv12, 8, 4).is_none());
+        assert!(copy_frame(&[&one[..40]], nv12, 8, 4).is_none());
+        assert!(copy_frame(&[], nv12, 8, 4).is_none());
     }
 
     #[test]
-    fn nv12_gray_stays_gray_and_colors_land_in_their_channel() {
-        // 4x2 frame, stride 8: Y lines, then one CbCr line.
-        let mut frame = vec![0u8; 8 * 3];
-        frame[..4].copy_from_slice(&[0, 128, 255, 128]);
-        frame[8..12].copy_from_slice(&[128, 128, 128, 128]);
-        // Pixels 0-1 gray (Cb = Cr = 128), pixels 2-3 red (Cr high).
-        frame[16..20].copy_from_slice(&[128, 128, 128, 255]);
-        let out = nv12_to_xrgb(&[&frame], Size::new(4, 2), &full_range()).expect("converted");
-        assert_eq!(out.len(), 4 * 4 * 2);
-        assert_eq!(&out[0..4], &[0, 0, 0, 255]);
-        assert_eq!(&out[4..8], &[128, 128, 128, 255]);
-        // Y 255 with Cr 255: red saturates, blue stays at Y.
-        assert_eq!(out[8 + 2], 255);
-        assert_eq!(out[8], 255);
-        // Y 128 with Cr 255: more red than green and blue.
-        assert!(out[12 + 2] > 200 && out[12 + 1] < 128 && out[12] == 128);
-    }
-
-    #[test]
-    fn nv12_two_planes_and_short_planes() {
-        let y = vec![200u8; 8 * 4];
-        let uv = vec![128u8; 8 * 2];
-        let out = nv12_to_xrgb(&[&y, &uv], Size::new(6, 4), &full_range()).expect("converted");
-        assert!(out.chunks_exact(4).all(|p| p == [200, 200, 200, 255]));
-        assert!(nv12_to_xrgb(&[&y[..10], &uv], Size::new(6, 4), &full_range()).is_none());
-        assert!(nv12_to_xrgb(&[], Size::new(6, 4), &full_range()).is_none());
-    }
-
-    #[test]
-    fn nv12_limited_range_stretches_to_full() {
-        let n = Nv12::new(
-            2,
-            Some(ColorSpace::new(
-                libcamera::color_space::Primaries::Rec709,
-                libcamera::color_space::TransferFunction::Rec709,
-                YcbcrEncoding::Rec709,
-                Range::Limited,
-            )),
+    fn one_plane_frames_take_their_lines() {
+        let yuyv = PixelLayout::Yuyv(YuvColor::default());
+        let plane = vec![7u8; 100];
+        assert_eq!(
+            copy_frame(&[&plane], yuyv, 16, 4).map(|v| v.len()),
+            Some(64)
         );
-        let frame = [16u8, 235, 16, 235, 128, 128];
-        let out = nv12_to_xrgb(&[&frame], Size::new(2, 2), &n).expect("converted");
-        assert_eq!(&out[0..4], &[0, 0, 0, 255]);
-        assert_eq!(&out[4..8], &[255, 255, 255, 255]);
+        // A last line without its padding is kept as it is.
+        assert_eq!(
+            copy_frame(&[&plane[..60]], PixelLayout::Xrgb8888, 16, 4).map(|v| v.len()),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn yuv_formats_carry_their_color_space() {
+        let rec709 = ColorSpace::new(
+            libcamera::color_space::Primaries::Rec709,
+            libcamera::color_space::TransferFunction::Rec709,
+            YcbcrEncoding::Rec709,
+            Range::Limited,
+        );
+        assert_eq!(
+            layout_of(libcamera::formats::NV12, Some(rec709)),
+            Some(PixelLayout::Nv12(YuvColor {
+                bt709: true,
+                limited: true
+            }))
+        );
+        assert_eq!(
+            layout_of(libcamera::formats::YUYV, None),
+            Some(PixelLayout::Yuyv(YuvColor::default()))
+        );
+        assert_eq!(layout_of(XRGB8888, None), Some(PixelLayout::Xrgb8888));
+        assert_eq!(layout_of(libcamera::formats::SRGGB10_CSI2P, None), None);
     }
 }
