@@ -362,9 +362,11 @@ pub struct Controls {
     /// Continuous autofocus on this window (AfMode Continuous, AfMetering
     /// Windows, AfWindows): a tap while recording video.
     pub af_window: Option<Rect>,
-    /// FrameDurationLimits, both ends: a fixed frame rate (16 667 us is
-    /// 60 fps). None leaves the camera's.
-    pub frame_duration_us: Option<i64>,
+    /// FrameDurationLimits, shortest and longest frame, microseconds:
+    /// equal ends fix the frame rate (16 667 us is 60 fps), a span lets
+    /// the exposure lengthen frames up to the longest. None leaves the
+    /// camera's.
+    pub frame_duration_us: Option<(u32, u32)>,
 }
 
 impl Controls {
@@ -578,6 +580,10 @@ pub enum Event {
         /// FrameDurationLimits minimum; None when the camera doesn't
         /// report frame durations (it runs at its own rate, 30 fps).
         max_fps: Option<f64>,
+        /// The lowest frame rate the mode allows, from its
+        /// FrameDurationLimits maximum: how far the exposure may lengthen
+        /// a frame. None when the camera doesn't report it.
+        min_fps: Option<f64>,
         /// The size of the still stream beside the preview, when the
         /// start asked for one and the camera runs it.
         still: Option<Size>,

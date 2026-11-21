@@ -433,6 +433,7 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
                 stride: s.size.width * 4,
                 layout: PixelLayout::Xrgb8888,
                 max_fps: opts.max_fps,
+                min_fps: None,
                 still: None,
             });
             if let Some(message) = s.notice.take() {

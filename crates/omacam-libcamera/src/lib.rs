@@ -205,8 +205,10 @@ struct Active {
     idle: Vec<Request>,
     /// Controls to put on the next queued request.
     pending_controls: Option<Controls>,
-    /// The configured mode's highest frame rate (FrameDurationLimits).
+    /// The configured mode's highest and lowest frame rates
+    /// (FrameDurationLimits).
     max_fps: Option<f64>,
+    min_fps: Option<f64>,
     /// The raw stream beside the processed one, when the start asked for it
     /// and the camera gives it at the same size.
     raw: Option<RawStream>,
@@ -449,6 +451,7 @@ impl Worker {
                             stride: a.stride,
                             layout: a.layout,
                             max_fps: a.max_fps,
+                            min_fps: a.min_fps,
                             still: a.still.as_ref().map(|s| s.size),
                         });
                         if let Some(message) = note {
@@ -754,15 +757,16 @@ impl Worker {
         };
         cam.configure(&mut cfgs).map_err(at("configure"))?;
         // The configured mode's frame durations, where the pipeline
-        // reports them: its shortest says how fast it can run.
-        let max_fps = range(
+        // reports them: its shortest says how fast it can run, its longest
+        // how far the exposure may stretch a frame.
+        let durations = range(
             cam.controls(),
             <controls::FrameDurationLimits as ControlEntry>::ID,
-        )
-        .map(|(min_us, _)| min_us)
-        .filter(|&us| us > 0.0)
-        .map(|us| 1e6 / us);
-        tracing::info!(generation, camera, ?max_fps, "frame rate");
+        );
+        let fps = |us: f64| (us > 0.0).then(|| 1e6 / us);
+        let max_fps = durations.and_then(|(min_us, _)| fps(min_us));
+        let min_fps = durations.and_then(|(_, max_us)| fps(max_us));
+        tracing::info!(generation, camera, ?max_fps, ?min_fps, "frame rate");
         let stream = cfgs
             .get(0)
             .and_then(|sc| sc.stream())
@@ -904,6 +908,7 @@ impl Worker {
             idle: Vec::new(),
             pending_controls: None,
             max_fps,
+            min_fps,
             raw,
             still,
             sensor_model,
@@ -1372,8 +1377,11 @@ fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool, awb_
         let _ = list.set(controls::AfMode::Continuous);
         set_window(list, w);
     }
-    if let Some(d) = c.frame_duration_us {
-        let _ = list.set(controls::FrameDurationLimits([d, d]));
+    if let Some((shortest, longest)) = c.frame_duration_us {
+        let _ = list.set(controls::FrameDurationLimits([
+            i64::from(shortest),
+            i64::from(longest),
+        ]));
     }
     if let Some(focus) = c.focus {
         // One scan: auto mode, the tapped window when the camera takes

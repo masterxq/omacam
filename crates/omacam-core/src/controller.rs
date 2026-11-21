@@ -227,9 +227,9 @@ pub struct Controller {
     /// The Pro panel is open: the lens is the one the zoom picks, never a
     /// low-light stand-in.
     pro: bool,
-    /// The highest frame rate each camera's current mode allows (from the
-    /// stream's start), by camera id.
-    max_fps: std::collections::HashMap<String, f64>,
+    /// The highest frame rate each camera's current mode allows and its
+    /// lowest where reported (from the stream's start), by camera id.
+    frame_rates: std::collections::HashMap<String, (f64, Option<f64>)>,
     /// The running stream's generation when it has a still stream beside
     /// its preview, and that stream's size.
     beside: Option<(u64, crate::backend::Size)>,
@@ -266,7 +266,7 @@ impl Controller {
             recording: false,
             low_light: LowLight::default(),
             pro: false,
-            max_fps: std::collections::HashMap::new(),
+            frame_rates: std::collections::HashMap::new(),
             beside: None,
             no_beside: std::collections::HashSet::new(),
         }
@@ -393,22 +393,32 @@ impl Controller {
     fn can_60fps(&self) -> bool {
         self.switch
             .streaming()
-            .and_then(|(_, t)| self.max_fps.get(&t.camera))
-            .is_some_and(|&f| f >= 59.0)
+            .and_then(|(_, t)| self.frame_rates.get(&t.camera))
+            .is_some_and(|&(f, _)| f >= 59.0)
     }
 
-    /// The frame duration to ask of a stream of `camera`, microseconds:
-    /// 60 fps in video mode when asked for and its mode allows it, else
-    /// nothing (the camera's default, 30 fps).
-    fn frame_duration_for(&self, camera: &str, purpose: Purpose) -> Option<i64> {
+    /// The frame durations to ask of a stream of `camera`, shortest and
+    /// longest, microseconds. Video holds its frame rate: 60 fps when
+    /// asked for and the mode allows it, else 30. Photos run at up to
+    /// 30 fps and let the exposure lengthen frames as far as the mode
+    /// allows, for dim scenes. Nothing where the camera doesn't report
+    /// its frame durations (its own default, 30 fps).
+    fn frame_duration_for(&self, camera: &str, purpose: Purpose) -> Option<(u32, u32)> {
         // Only on a camera whose mode reported its frame durations (it
         // takes FrameDurationLimits); elsewhere the camera keeps its own.
-        let max = *self.max_fps.get(camera)?;
-        let fast = self.mode == Mode::Video
-            && purpose == Purpose::Preview
-            && self.opts.video_fps >= 60
-            && max >= 59.0;
-        Some(if fast { 16_667 } else { 33_333 })
+        let &(max, min) = self.frame_rates.get(camera)?;
+        if self.mode == Mode::Video {
+            let fast = purpose == Purpose::Preview && self.opts.video_fps >= 60 && max >= 59.0;
+            let d = if fast { 16_667 } else { 33_333 };
+            return Some((d, d));
+        }
+        // The longest frame the mode allows; 30 fps when it says none.
+        let longest = min
+            .filter(|&f| f > 0.0)
+            .map(|f| (1e6 / f).round() as u32)
+            .unwrap_or(33_333)
+            .max(33_333);
+        Some((33_333, longest))
     }
 
     /// Slider position (0..1) for the current zoom.
@@ -1224,15 +1234,16 @@ impl Controller {
                 generation,
                 ref camera,
                 max_fps,
+                min_fps,
                 still,
                 ..
             } => {
                 match max_fps {
                     Some(f) => {
-                        self.max_fps.insert(camera.clone(), f);
+                        self.frame_rates.insert(camera.clone(), (f, min_fps));
                     }
                     None => {
-                        self.max_fps.remove(camera);
+                        self.frame_rates.remove(camera);
                     }
                 }
                 self.focus.reset();
@@ -1467,6 +1478,7 @@ mirror = true
             stride: 16,
             layout: PixelLayout::Xrgb8888,
             max_fps: None,
+            min_fps: None,
             still: None,
         }
     }
@@ -1885,8 +1897,12 @@ mirror = true
         // A mode that reaches 60 fps.
         let (g, _, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, now));
         let mut e = started(g, "uw");
-        if let Event::Started { max_fps, .. } = &mut e {
+        if let Event::Started {
+            max_fps, min_fps, ..
+        } = &mut e
+        {
             *max_fps = Some(60.0);
+            *min_fps = Some(5.0);
         }
         c.on_event(e, now);
         c.on_event(frame(g, "uw", 10_000), now);
@@ -1895,10 +1911,71 @@ mirror = true
             [Command::SetControls { controls, .. }] => controls.frame_duration_us,
             other => panic!("{other:?}"),
         };
-        assert_eq!(duration(&c.set_mode(Mode::Video, now)), Some(16_667));
-        assert_eq!(duration(&c.set_video_fps(30)), Some(33_333));
-        assert_eq!(duration(&c.set_video_fps(60)), Some(16_667));
-        assert_eq!(duration(&c.set_mode(Mode::Photo, now)), Some(33_333));
+        assert_eq!(
+            duration(&c.set_mode(Mode::Video, now)),
+            Some((16_667, 16_667))
+        );
+        assert_eq!(duration(&c.set_video_fps(30)), Some((33_333, 33_333)));
+        assert_eq!(duration(&c.set_video_fps(60)), Some((16_667, 16_667)));
+        // Back to photos: the 60 fps limit lifts, and dim scenes may
+        // lengthen frames to the mode's longest (5 fps here).
+        assert_eq!(
+            duration(&c.set_mode(Mode::Photo, now)),
+            Some((33_333, 200_000))
+        );
+    }
+
+    #[test]
+    fn photos_let_the_exposure_lengthen_frames() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        let reported = |g: u64, camera: &str| {
+            let mut e = started(g, camera);
+            if let Event::Started {
+                max_fps, min_fps, ..
+            } = &mut e
+            {
+                *max_fps = Some(30.0);
+                *min_fps = Some(7.5);
+            }
+            e
+        };
+        // What the last command asks of the frame durations.
+        let durations = |out: &[Output]| {
+            commands(out)
+                .iter()
+                .rev()
+                .find_map(|cmd| match cmd {
+                    Command::Start { controls, .. } | Command::SetControls { controls, .. } => {
+                        Some(controls.frame_duration_us)
+                    }
+                    _ => None,
+                })
+                .flatten()
+        };
+        let (g, _, _) = start_of(&c.resume(now));
+        c.on_event(reported(g, "main"), now);
+        c.on_event(frame(g, "main", 10_000), now);
+        // Away and back: the start asks for 30 fps at most, frames up to
+        // the mode's longest (7.5 fps).
+        let (g, _, _) = start_of(&c.set_zoom(0.5, ZoomSource::Preset, now));
+        c.on_event(started(g, "uw"), now);
+        c.on_event(frame(g, "uw", 10_000), now);
+        let out = c.set_zoom(1.0, ZoomSource::Preset, now);
+        let (g, cam, _) = start_of(&out);
+        assert_eq!(cam, "main");
+        assert_eq!(durations(&out), Some((33_333, 133_333)));
+        c.on_event(reported(g, "main"), now);
+        c.on_event(frame(g, "main", 10_000), now);
+        // Video holds its frame rate, photos lengthen again.
+        assert_eq!(
+            durations(&c.set_mode(Mode::Video, now)),
+            Some((33_333, 33_333))
+        );
+        assert_eq!(
+            durations(&c.set_mode(Mode::Photo, now)),
+            Some((33_333, 133_333))
+        );
     }
 
     #[test]

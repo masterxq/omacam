@@ -276,9 +276,12 @@ Two paths, `--display`:
   main and telephoto cameras later need a driver change. omacam reads the
   configured mode's `FrameDurationLimits` at each start and offers 60
   only where its minimum is 16.7 ms or less: then video mode asks for
-  `FrameDurationLimits` [16667, 16667] (photo mode for 30), a "60 FPS"
-  toggle shows beside the gear, and recording runs at 60 only if the
-  camera really delivers 50 fps or more, else at 30 with a note.
+  `FrameDurationLimits` [16667, 16667] (video at 30: [33333, 33333]), a
+  "60 FPS" toggle shows beside the gear, and recording runs at 60 only if
+  the camera really delivers 50 fps or more, else at 30 with a note.
+  Photo mode asks for [33333, the mode's longest frame]: at most 30 fps,
+  and in a dim scene the exposure may lengthen frames rather than stop at
+  33 ms with the gain at its limit.
 - **Orientation.** The encoded frames are landscape; the camera's upright
   rotation goes into the file as its `image-orientation` tag, which mp4mux
   writes as the track's display matrix, so players show it upright.
