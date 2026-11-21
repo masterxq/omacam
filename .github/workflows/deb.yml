@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# The Debian package for arm64, built by debian/build.sh on every push to
+# the lisbon branch and on request (Actions, "Run workflow").
+name: deb
+
+on:
+  push:
+    branches: [lisbon]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - id: build
+        run: |
+          debian/build.sh "$RUNNER_TEMP/deb"
+          cat "$RUNNER_TEMP/deb/VERSION" >> "$GITHUB_OUTPUT"
+          { echo '```'; cat "$RUNNER_TEMP/deb/SHA256SUMS"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: omacam_${{ steps.build.outputs.version }}_arm64
+          path: ${{ runner.temp }}/deb/
+          if-no-files-found: error

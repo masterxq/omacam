@@ -1,0 +1,6 @@
+omacam (0.3.3) UNRELEASED; urgency=medium
+
+  * Debian packaging for the lisbon branch. debian/build.sh puts the
+    version of each build on top of this entry.
+
+ -- masterxq <masterxq@users.noreply.github.com>  Sat, 21 Nov 2026 01:54:27 +0100

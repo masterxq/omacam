@@ -1,0 +1,11 @@
+`debian/build.sh [OUT]` builds the package of the committed HEAD for the
+machine's own architecture in a Docker container (on a PC an amd64 test
+build; ARCH=arm64 there would emulate arm64 and take very long), into
+../omacam-deb. The arm64 package for the phone comes from GitHub Actions
+(.github/workflows/deb.yml), which runs the same script on an arm64
+machine on every push to the lisbon branch and on request.
+
+The packaging (debian/ and .github/workflows/deb.yml) is one commit of its
+own at the bottom of the lisbon branch, and no app commit touches these
+files. A pull request to derekross/omacam takes app commits only: branch
+off upstream's main and cherry-pick them, never open one from lisbon.
