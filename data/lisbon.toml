@@ -12,6 +12,12 @@
 #   field of view, hence coverage [1, 1]. libcamera may adjust the sizes
 #   (the software ISP leaves a few columns at the edge); the app uses what
 #   it gets.
+# video: the back camera's video stream, 16:9 of the 4624x3472 mode's whole
+#   width scaled to 1920x1080 by the ISP: video mode streams it instead of
+#   the preview, so videos keep the full width and the CPU neither crops nor
+#   scales. With the still mode's stream beside the 2304x1728 preview,
+#   photos come from the running preview (no lens table entry: the app asks
+#   libcamera, and falls back when the camera can't).
 # rotation: left out, libcamera's Rotation property comes from the device
 #   tree.
 # f_number, focal lengths, base_iso: left out until measured.
@@ -27,6 +33,7 @@ id = "/base/soc/i2c@11009000/camera@22" # OmniVision OV64B40
 zoom = 1.0
 preview = [2304, 1728]
 still = [4624, 3472]
+video = [1920, 1080]
 coverage = [1.0, 1.0]
 autofocus = true
 
