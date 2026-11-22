@@ -13,8 +13,13 @@
 //! When the frames start coming from another camera (a lens switch, a
 //! flip), the last frame of the old one fades out over the new one
 //! ([`FADE`]), instead of the picture cutting from one to the other.
+//!
+//! With `--debug` it also measures its own drawing ([`PaintStats`]): how
+//! many frames reach the screen each second, and how long a frame takes
+//! from arriving to the screen showing it.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
@@ -119,6 +124,89 @@ fn visible_source(frame: (f32, f32), scale: f64) -> (f32, f32, f32, f32) {
     ((frame.0 - w) / 2.0, (frame.1 - h) / 2.0, w, h)
 }
 
+/// How the viewfinder's frames reached the screen over the last second.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PaintStats {
+    /// Frames drawn per second (each new frame counts once).
+    pub fps: f64,
+    /// From a frame arriving to the compositor showing it, in ms: the
+    /// mean and the longest; None where the compositor doesn't say when
+    /// it showed a frame.
+    pub latency_ms: Option<(f64, f64)>,
+}
+
+/// The measurement behind [`PaintStats`].
+#[derive(Default)]
+pub struct Meter {
+    /// When the current frame arrived (monotonic µs), and whether it has
+    /// been drawn.
+    arrived: i64,
+    drawn: bool,
+    /// Drawn frames whose presentation is still to come: the frame clock's
+    /// counter of the paint that drew each, and when each arrived.
+    pending: VecDeque<(i64, i64)>,
+    window_start: i64,
+    frames: u32,
+    latencies: Vec<i64>,
+    stats: Option<PaintStats>,
+}
+
+impl Meter {
+    fn arrive(&mut self) {
+        self.arrived = glib::monotonic_time();
+        self.drawn = false;
+    }
+
+    /// At a paint: the presentation times of earlier paints, and this one.
+    fn paint(&mut self, clock: &gdk::FrameClock) {
+        while let Some(&(counter, arrived)) = self.pending.front() {
+            match clock.timings(counter) {
+                Some(t) if !t.is_complete() => break,
+                Some(t) if t.presentation_time() > 0 => {
+                    self.latencies.push(t.presentation_time() - arrived);
+                }
+                _ => {}
+            }
+            self.pending.pop_front();
+        }
+        if !self.drawn {
+            self.drawn = true;
+            self.frames += 1;
+            self.pending
+                .push_back((clock.frame_counter(), self.arrived));
+        }
+        let now = glib::monotonic_time();
+        if self.window_start == 0 {
+            self.window_start = now;
+        }
+        let dt = now - self.window_start;
+        if dt >= 1_000_000 {
+            let latency_ms = (!self.latencies.is_empty()).then(|| {
+                let sum: i64 = self.latencies.iter().sum();
+                let max = self.latencies.iter().max().copied().unwrap_or(0);
+                (
+                    sum as f64 / self.latencies.len() as f64 / 1000.0,
+                    max as f64 / 1000.0,
+                )
+            });
+            let stats = PaintStats {
+                fps: self.frames as f64 * 1e6 / dt as f64,
+                latency_ms,
+            };
+            tracing::info!(
+                fps = format!("{:.1}", stats.fps),
+                latency_ms = latency_ms.map(|(m, _)| format!("{m:.1}")),
+                max_ms = latency_ms.map(|(_, x)| format!("{x:.1}")),
+                "viewfinder on screen"
+            );
+            self.stats = Some(stats);
+            self.window_start = now;
+            self.frames = 0;
+            self.latencies.clear();
+        }
+    }
+}
+
 /// The old camera's last frame, fading out over the new one's.
 #[derive(Clone)]
 pub struct Fading {
@@ -138,6 +226,7 @@ mod imp {
         pub fading: RefCell<Option<Fading>>,
         pub fade_tick: RefCell<Option<gtk::TickCallbackId>>,
         pub insets: Cell<Insets>,
+        pub meter: RefCell<Option<Meter>>,
     }
 
     #[glib::object_subclass]
@@ -156,6 +245,13 @@ mod imp {
     impl WidgetImpl for Viewfinder {
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
             let widget = self.obj();
+            if let (Some(meter), Some(clock)) =
+                (self.meter.borrow_mut().as_mut(), widget.frame_clock())
+            {
+                if self.texture.borrow().is_some() {
+                    meter.paint(&clock);
+                }
+            }
             let fading = self.fading.borrow().clone().and_then(|f| {
                 let t = f.since.elapsed().as_secs_f32() / FADE.as_secs_f32();
                 (t < 1.0).then_some((f, 1.0 - t))
@@ -423,8 +519,28 @@ impl Viewfinder {
         ))
     }
 
+    /// Measure how frames reach the screen ([`Viewfinder::paint_stats`]).
+    pub fn set_measure(&self, on: bool) {
+        let mut meter = self.imp().meter.borrow_mut();
+        if on != meter.is_some() {
+            *meter = on.then(Meter::default);
+        }
+    }
+
+    /// How frames reached the screen over the last second, when measuring.
+    pub fn paint_stats(&self) -> Option<PaintStats> {
+        self.imp().meter.borrow().as_ref().and_then(|m| m.stats)
+    }
+
+    fn arrive(&self) {
+        if let Some(meter) = self.imp().meter.borrow_mut().as_mut() {
+            meter.arrive();
+        }
+    }
+
     /// Show a new frame.
     pub fn set_frame(&self, texture: gdk::Texture, placement: Placement) {
+        self.arrive();
         self.imp().texture.replace(Some(texture));
         self.imp().placement.set(placement);
         self.queue_draw();
@@ -433,6 +549,7 @@ impl Viewfinder {
     /// Show the first frame of another camera: the current frame fades
     /// out over it.
     pub fn switch_to(&self, texture: gdk::Texture, placement: Placement) {
+        self.arrive();
         let old = self.imp().texture.replace(Some(texture));
         let old_placement = self.imp().placement.replace(placement);
         if let Some(old) = old {

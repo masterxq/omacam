@@ -1976,22 +1976,35 @@ impl App {
             torch.set_active(lit);
         }
         self.debug.set_visible(self.debug_enabled());
+        self.viewfinder.set_measure(self.debug_enabled());
         if self.debug_enabled() {
             let fps = self.fps.borrow().value;
+            // What reaches the screen: frames drawn, and the time from a
+            // frame arriving to the compositor showing it.
+            let screen = match self.viewfinder.paint_stats() {
+                Some(p) => match p.latency_ms {
+                    Some((mean, max)) => {
+                        format!("\nscreen {:.1} fps  {mean:.0} ms (max {max:.0})", p.fps)
+                    }
+                    None => format!("\nscreen {:.1} fps", p.fps),
+                },
+                None => String::new(),
+            };
             let (w, h) = self.shown_size.get();
             let switch = view
                 .last_switch
                 .map(|d| format!("{} ms", d.as_millis()))
                 .unwrap_or_else(|| "-".into());
             self.debug.set_label(&format!(
-                "{} {}x{}  {:.1} fps\nzoom {:.2}  switch {}{}",
+                "{} {}x{}  {:.1} fps\nzoom {:.2}  switch {}{}{}",
                 view.lens_name,
                 w,
                 h,
                 fps,
                 view.zoom,
                 switch,
-                if view.switching { "  (switching)" } else { "" }
+                if view.switching { "  (switching)" } else { "" },
+                screen
             ));
         }
     }
