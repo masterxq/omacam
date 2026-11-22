@@ -214,6 +214,8 @@ struct App {
     cli: Cli,
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
+    /// The layout, turned back when the shell turns the screen.
+    turned: crate::turned::Turned,
     viewfinder: Viewfinder,
     /// The quick settings over the top, and the flash's choices under it.
     top_bar: gtk::Box,
@@ -830,7 +832,9 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
 
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&overlay));
-    window.set_content(Some(&toasts));
+    // Upright to the phone, whichever way the shell turns the screen.
+    let turned = crate::turned::Turned::new(&toasts);
+    window.set_content(Some(&turned));
 
     let (tx, rx) = async_channel::unbounded::<Msg>();
     let held = Rc::new(Cell::new(match cli.hold {
@@ -845,6 +849,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         cli,
         window: window.clone(),
         toasts,
+        turned,
         viewfinder,
         top_bar,
         flash_button,
@@ -2659,6 +2664,7 @@ impl App {
     /// AE/AF lock, low light) move to the edge that is up, along it.
     fn turn_controls(&self) {
         let turn = self.held.get().degrees();
+        self.turned.set_held(turn);
         let old = self.controls_turn.replace(turn);
         if old != 0 {
             self.window.remove_css_class(&format!("turn-{old}"));

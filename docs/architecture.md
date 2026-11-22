@@ -212,15 +212,22 @@ turned the same way before encoding.
 
 ### Turning the controls
 
-Held sideways, the layout stays portrait and the controls turn in place,
-as Android cameras do: the quick settings, the lens buttons, the gallery
-and flip buttons, the manual chips, the zoom readout and the toasts turn
-a quarter (CSS `transform` with a 250 ms transition, from the
+Held sideways, the layout stays where it is on the phone and the controls
+turn in place, as Android cameras do. Where the shell turns the whole
+screen (Phosh: phoc turns the output and the window becomes landscape),
+the window's content is turned back (`turned.rs`): laid out in the
+portrait shape and turned a quarter, so the shutter stays at the same
+edge of the phone and the picture fills its width there; GTK draws and
+picks input through the turn. Which quarter follows how the phone is
+held (the accelerometer, the shell's own cue). Phosh can't keep one
+window out of its turn. The quick settings, the lens buttons, the
+gallery and flip buttons, the manual chips, the zoom readout and the
+toasts turn a quarter (CSS `transform` with a 250 ms transition, from the
 accelerometer's orientation; `--hold`, or the O key with `--fake`, on a
 laptop). The banners over the top of the picture (recording time, AE/AF
 lock, low light) move to the edge that is up and run along it. The words
 of the mode bar stay level: turned, they would run into the rows above
-and below. The settings sheet stays portrait.
+and below. The settings sheet follows the screen.
 
 ### The layout
 

@@ -16,6 +16,7 @@ mod script;
 mod sensors;
 mod settings;
 mod theme;
+mod turned;
 mod viewfinder;
 
 use std::path::PathBuf;
