@@ -256,9 +256,15 @@ mod imp {
                 let t = f.since.elapsed().as_secs_f32() / FADE.as_secs_f32();
                 (t < 1.0).then_some((f, 1.0 - t))
             });
+            // Screen pixels per widget unit (fractional on a scaled screen).
+            let screen_scale = widget
+                .native()
+                .and_then(|n| n.surface())
+                .map_or(widget.scale_factor() as f64, |s| s.scale());
             draw(
                 snapshot,
                 (widget.width() as f32, widget.height() as f32),
+                screen_scale as f32,
                 self.insets.get(),
                 self.texture.borrow().as_ref(),
                 self.placement.get(),
@@ -269,11 +275,14 @@ mod imp {
     }
 }
 
-/// Draw `texture` placed as `p` in a `size` area, with the old camera's
-/// last frame (`fading`: texture, placement, opacity) over it.
+/// Draw `texture` placed as `p` in a `size` area of a screen with
+/// `screen_scale` pixels per unit, with the old camera's last frame
+/// (`fading`: texture, placement, opacity) over it.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     snapshot: &gtk::Snapshot,
     size: (f32, f32),
+    screen_scale: f32,
     insets: Insets,
     texture: Option<&gdk::Texture>,
     p: Placement,
@@ -293,13 +302,13 @@ pub fn draw(
     // doesn't reach (the main camera's 16:9 near 1x), the photo still
     // has picture.
     snapshot.append_color(&gdk::RGBA::new(0.07, 0.07, 0.07, 1.0), &rect);
-    draw_frame(snapshot, &rect, shown, tex, p);
+    draw_frame(snapshot, &rect, shown, screen_scale, tex, p);
     if let Some((old, op, alpha)) = fading {
         // The old frame in its own picture, fitted to the same rectangle.
         let (_, old_picture) = op.sizes((old.width() as f32, old.height() as f32));
         let old_shown = crop_to_aspect(old_picture, decor.aspect);
         snapshot.push_opacity(alpha.clamp(0.0, 1.0) as f64);
-        draw_frame(snapshot, &rect, old_shown, old, op);
+        draw_frame(snapshot, &rect, old_shown, screen_scale, old, op);
         snapshot.pop();
     }
     if decor.grid > 1 {
@@ -361,10 +370,21 @@ pub fn draw(
 /// Draw one frame into `rect`, the fitted `shown` part of its picture:
 /// zoomed about the view's center, mirrored, turned upright, at the size
 /// its coverage of the picture gives it.
+///
+/// The frame goes in as a texture scale node with linear filtering, in
+/// units of screen pixels. GTK's renderer draws such a node, when it is
+/// turned or not at a scale of exactly 1, into an offscreen of its size
+/// in its own units, and puts that on the screen: in logical pixels the
+/// picture showed at a third of the resolution of a 2.6x screen, in
+/// steps of three screen pixels. In screen pixels the offscreen has the
+/// screen's resolution. A plain texture node would be sampled straight
+/// to the screen, but GTK makes mipmaps for one that is shrunk more than
+/// twofold, a copy of every camera frame that cuts the frame rate.
 fn draw_frame(
     snapshot: &gtk::Snapshot,
     rect: &graphene::Rect,
     shown: (f32, f32),
+    screen_scale: f32,
     tex: &gdk::Texture,
     p: Placement,
 ) {
@@ -388,14 +408,15 @@ fn draw_frame(
         snapshot.scale(-1.0, 1.0);
     }
     snapshot.rotate(p.rotation as f32);
-    let (dw, dh) = (tw * s, th * s);
-    // A plain texture node: the renderer samples the frame once per
-    // screen pixel, through the turn and the scale. Not a texture scale
-    // node: under a turn or a scale other than 1 (a phone's screen) GTK
-    // draws one into an offscreen at its size in logical pixels first and
-    // scales that up, which shows the picture at a third of the screen's
-    // resolution on a 2.6x screen.
-    snapshot.append_texture(tex, &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh));
+    // From here on, a unit is a screen pixel.
+    let k = (screen_scale * zoom).max(1e-3);
+    snapshot.scale(1.0 / k, 1.0 / k);
+    let (dw, dh) = (tw * s * k, th * s * k);
+    snapshot.append_scaled_texture(
+        tex,
+        gsk::ScalingFilter::Linear,
+        &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh),
+    );
     snapshot.restore();
 }
 

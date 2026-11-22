@@ -3167,6 +3167,7 @@ impl App {
             crate::viewfinder::draw(
                 &snapshot,
                 (w, h),
+                1.0,
                 self.viewfinder.insets(),
                 self.viewfinder.texture().as_ref(),
                 self.viewfinder.placement(),
