@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- omacam's own symbolic icon set: 16x16, filled shapes in one color. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#000" fill-rule="evenodd" d="M1 1 L15 1 L15 15 L1 15zM2.4 2.4 L2.4 13.6 L13.6 2.4zM4.2 5 L6 5 L6 3.2 L7 3.2 L7 5 L8.8 5 L8.8 6 L7 6 L7 7.8 L6 7.8 L6 6 L4.2 6zM8.4 11.2 L12.6 11.2 L12.6 12.2 L8.4 12.2z"/>
+</svg>
