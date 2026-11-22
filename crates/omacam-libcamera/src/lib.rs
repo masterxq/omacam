@@ -1369,6 +1369,9 @@ fn set_controls(list: &mut ControlList, c: &Controls, exposure_hints: bool, awb_
     if let Some(s) = &c.settings {
         set_settings(list, s, awb_modes);
     }
+    if c.whole_frame_af {
+        let _ = list.set(controls::AfMetering::Auto);
+    }
     if let Some(w) = &c.metering_window {
         set_window(list, w);
     }

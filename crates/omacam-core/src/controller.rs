@@ -171,6 +171,10 @@ pub struct ViewState {
     pub exposure: ExposureView,
     /// The focus ring, after a tap.
     pub focus: Option<focus::Indicator>,
+    /// The tapped point (0..1 on the picture) that focus and metering
+    /// follow, as long as they do; None while they cover the whole
+    /// picture.
+    pub tap_point: Option<(f64, f64)>,
     pub mode: Mode,
     pub recording: bool,
     /// The telephoto's zoom is shown by the main camera because the light
@@ -298,6 +302,8 @@ pub struct Controller {
     /// Cameras that started without the still stream asked beside their
     /// preview: they aren't asked again.
     no_beside: std::collections::HashSet<String>,
+    /// The tapped point focus and metering follow ([`ViewState::tap_point`]).
+    tap_point: Option<(f64, f64)>,
 }
 
 impl Controller {
@@ -340,6 +346,7 @@ impl Controller {
             frame_rates: std::collections::HashMap::new(),
             beside: None,
             no_beside: std::collections::HashSet::new(),
+            tap_point: None,
         }
     }
 
@@ -456,6 +463,7 @@ impl Controller {
             last_switch: self.switch.last_switch_time(),
             exposure: self.exposure_view(),
             focus: self.focus.indicator(),
+            tap_point: self.tap_point,
             mode: self.mode,
             recording: self.recording,
             low_light: side.is_some_and(|s| s.falls_back()),
@@ -734,6 +742,7 @@ impl Controller {
         if let (Some(wanted), Some(next)) = (self.switch.wanted(), next) {
             if wanted.camera != next {
                 self.exposure.lens_switched();
+                self.tap_point = None;
             }
         }
         let target = self.target(Purpose::Preview);
@@ -743,6 +752,9 @@ impl Controller {
     /// Start streaming (the app opened, or came back to the foreground).
     pub fn resume(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
+        // A stream starts afresh: focus and metering over the whole
+        // picture, whatever was tapped before.
+        self.forget_tap();
         self.suspended = false;
         self.retry_at = None;
         self.request_preview(now, &mut out);
@@ -844,6 +856,8 @@ impl Controller {
         let mut out = Vec::new();
         if !self.recording && !self.capture.is_busy() && self.mode != mode {
             self.mode = mode;
+            // The stream restarts without the tapped window.
+            self.forget_tap();
             self.request_preview(now, &mut out);
             self.push_frame_rate(&mut out);
         }
@@ -1000,6 +1014,7 @@ impl Controller {
             return out;
         };
         self.exposure.tap(luma, &lens.caps);
+        self.tap_point = Some((u, v));
         let settings = self.exposure.effective(&lens.caps);
         // Spot metering meters the AfWindows rectangle: send it even when
         // focus is manual.
@@ -1056,6 +1071,39 @@ impl Controller {
                 focus: request,
                 settings: Some(settings),
                 metering_window,
+                ..Default::default()
+            },
+        }));
+        out
+    }
+
+    /// Forget the tapped point (its focus ring included): focus and
+    /// metering over the whole picture.
+    fn forget_tap(&mut self) {
+        self.tap_point = None;
+        self.exposure.clear_tap();
+        self.focus.reset();
+    }
+
+    /// Give up the tapped point: focus and metering over the whole picture
+    /// again, as before the tap (a tap on its marker, or the app coming
+    /// back to the front).
+    pub fn clear_tap(&mut self) -> Vec<Output> {
+        let mut out = Vec::new();
+        if self.capture.is_busy() {
+            return out;
+        }
+        self.forget_tap();
+        let Some((generation, lens)) = self.preview_lens() else {
+            return out;
+        };
+        let settings = self.exposure.effective(&lens.caps);
+        out.push(Output::Backend(Command::SetControls {
+            generation,
+            controls: crate::backend::Controls {
+                af_continuous: lens.autofocus && settings.lens.is_auto(),
+                settings: Some(settings),
+                whole_frame_af: true,
                 ..Default::default()
             },
         }));
@@ -1163,11 +1211,13 @@ impl Controller {
         out
     }
 
-    /// Everything back to automatic.
+    /// Everything back to automatic, a tapped point included.
     pub fn reset_exposure(&mut self) -> Vec<Output> {
         self.exposure.reset();
-        let mut out = Vec::new();
-        self.push_settings(&mut out);
+        let mut out = self.clear_tap();
+        if out.is_empty() {
+            self.push_settings(&mut out);
+        }
         out
     }
 
@@ -2453,6 +2503,35 @@ still = [2592, 1940]
         );
         c.set_zoom(3.0, ZoomSource::Preset, now);
         assert!(row(&c)[2].3, "the 2 stage shows 3x");
+    }
+
+    #[test]
+    fn a_tapped_point_holds_until_given_up_and_a_fresh_start_forgets_it() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        c.tap(0.3, 0.4, Some(60.0), now);
+        assert_eq!(c.view().tap_point, Some((0.3, 0.4)));
+        // The ring goes after the hold; the point still counts.
+        c.tick(now + Duration::from_secs(3));
+        c.tick(now + Duration::from_secs(10));
+        assert!(c.view().focus.is_none());
+        assert_eq!(c.view().tap_point, Some((0.3, 0.4)));
+        // Given up: the whole picture again, said to the camera.
+        match commands(&c.clear_tap()).as_slice() {
+            [Command::SetControls { controls, .. }] => {
+                assert!(controls.whole_frame_af && controls.af_continuous);
+                assert!(!controls.settings.unwrap().spot);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.view().tap_point, None);
+        // Back from the background: forgotten too.
+        c.tap(0.6, 0.6, None, now);
+        c.suspend(now);
+        c.resume(now);
+        assert_eq!(c.view().tap_point, None);
+        assert_eq!(c.view().exposure.ev_user, 0.0);
     }
 
     #[test]

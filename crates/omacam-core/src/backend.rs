@@ -367,6 +367,9 @@ pub struct Controls {
     /// the exposure lengthen frames up to the longest. None leaves the
     /// camera's.
     pub frame_duration_us: Option<(u32, u32)>,
+    /// Focus and metering over the whole picture again (AfMetering Auto):
+    /// a tapped point is given up.
+    pub whole_frame_af: bool,
 }
 
 impl Controls {
@@ -394,6 +397,11 @@ impl Controls {
                 self.af_window
             }),
             frame_duration_us: newer.frame_duration_us.or(self.frame_duration_us),
+            whole_frame_af: newer.whole_frame_af
+                || (self.whole_frame_af
+                    && newer.metering_window.is_none()
+                    && newer.af_window.is_none()
+                    && newer.focus.is_none()),
         }
     }
 }

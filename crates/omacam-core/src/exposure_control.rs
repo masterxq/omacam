@@ -147,6 +147,17 @@ impl Exposure {
         *self != before
     }
 
+    /// The tapped point is given up: metering over the whole picture
+    /// again, no correction for it, the slider at zero. Returns whether
+    /// anything changed.
+    pub fn clear_tap(&mut self) -> bool {
+        let before = self.clone();
+        self.spot = false;
+        self.ev_meter = 0.0;
+        self.ev_user = 0.0;
+        *self != before
+    }
+
     /// The EV slider.
     pub fn set_ev(&mut self, ev: f32, caps: &Caps) {
         self.ev_user = ev.clamp(-EV_LIMIT, EV_LIMIT);
