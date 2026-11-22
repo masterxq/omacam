@@ -906,7 +906,8 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 }
             }
             Step::CloseSettings => {
-                if let Some(d) = app.settings_dialog.borrow_mut().take() {
+                let dialog = app.settings_dialog.borrow_mut().take();
+                if let Some(d) = dialog {
                     d.close();
                 }
             }
@@ -2745,6 +2746,17 @@ impl App {
             dialog.set_presentation_mode(adw::DialogPresentationMode::BottomSheet);
             dialog.set_content_height(self.window.height() * 3 / 4);
         }
+        // Nothing in the camera's window takes text: when the sheet goes,
+        // no focus is left that could ask for the on-screen keyboard.
+        let a = Rc::downgrade(self);
+        dialog.connect_closed(move |_| {
+            if let Some(a) = a.upgrade() {
+                if let Ok(mut d) = a.settings_dialog.try_borrow_mut() {
+                    d.take();
+                }
+                GtkWindowExt::set_focus(&a.window, None::<&gtk::Widget>);
+            }
+        });
         dialog.present(Some(&self.window));
         *self.settings_dialog.borrow_mut() = Some(dialog);
     }

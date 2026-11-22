@@ -4,9 +4,16 @@
 //! Every change is applied at once through `on_change` (which saves the
 //! settings file). Settings that need features not built yet show as
 //! disabled rows with the reason.
+//!
+//! No row holds a text field. On a phone a focused text field brings up
+//! the on-screen keyboard, and libadwaita's text rows take the focus more
+//! eagerly than a tap on the field: a spin row's text on a press of its
+//! buttons or a swipe across it, an entry row's on any press on the row,
+//! a scroll of the sheet included. JPEG quality is a list of values and
+//! the photo folder comes from the folder chooser instead.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::Path;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -88,6 +95,76 @@ fn info(title: &str, value: &str) -> adw::ActionRow {
         .build()
 }
 
+/// The JPEG qualities offered, and the one in the settings if it is
+/// another (the file may hold any value from 50 to 100).
+fn qualities(current: u8) -> Vec<u8> {
+    let mut all = vec![50, 60, 70, 75, 80, 85, 90, 92, 95, 98, 100];
+    if let Err(i) = all.binary_search(&current) {
+        all.insert(i, current);
+    }
+    all
+}
+
+/// JPEG quality: a list, not a spin row (no text field, see the top).
+fn quality_row(current: u8, state: &Rc<RefCell<Settings>>, on_change: &OnChange) -> adw::ComboRow {
+    let all = qualities(current);
+    let labels: Vec<String> = all.iter().map(|q| q.to_string()).collect();
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let row = adw::ComboRow::builder()
+        .title("JPEG quality")
+        .subtitle("Higher keeps more detail in bigger files")
+        .model(&gtk::StringList::new(&labels))
+        .selected(all.iter().position(|q| *q == current).unwrap_or(0) as u32)
+        .build();
+    let (state, on_change) = (state.clone(), on_change.clone());
+    row.connect_selected_notify(move |r| {
+        if let Some(q) = all.get(r.selected() as usize) {
+            state.borrow_mut().jpeg_quality = *q;
+            on_change(&state.borrow());
+        }
+    });
+    row
+}
+
+/// Where photos are saved: the folder chooser, not an entry row (no text
+/// field, see the top). The Pictures folder's Camera directory is the
+/// default; choosing it again goes back to the default.
+fn folder_row(
+    current: &Path,
+    state: &Rc<RefCell<Settings>>,
+    on_change: &OnChange,
+) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Save photos in")
+        .subtitle(current.display().to_string())
+        .activatable(true)
+        .build();
+    row.add_suffix(&gtk::Image::from_icon_name("folder-open-symbolic"));
+    let (state, on_change) = (state.clone(), on_change.clone());
+    row.connect_activated(move |row| {
+        let chooser = gtk::FileDialog::builder()
+            .title("Save photos in")
+            .modal(true)
+            .build();
+        let dir = state.borrow().photo_dir();
+        if dir.is_dir() {
+            chooser.set_initial_folder(Some(&gtk::gio::File::for_path(&dir)));
+        }
+        let parent = row.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+        let (row, state, on_change) = (row.clone(), state.clone(), on_change.clone());
+        chooser.select_folder(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+            // An error is mostly the chooser dismissed: nothing changes.
+            let Some(path) = res.ok().and_then(|f| f.path()) else {
+                return;
+            };
+            row.set_subtitle(&path.display().to_string());
+            state.borrow_mut().save_dir = (path != default_photo_dir()).then_some(path);
+            on_change(&state.borrow());
+        });
+    });
+    row
+}
+
 pub fn dialog(
     settings: &Settings,
     on_change: impl Fn(&Settings) + 'static,
@@ -123,18 +200,7 @@ pub fn dialog(
         &on_change,
         |s, v| s.resolution = v,
     ));
-    let quality = adw::SpinRow::with_range(50.0, 100.0, 1.0);
-    quality.set_title("JPEG quality");
-    quality.set_subtitle("Higher keeps more detail in bigger files");
-    quality.set_value(s.jpeg_quality as f64);
-    {
-        let (state, on_change) = (state.clone(), on_change.clone());
-        quality.connect_value_notify(move |r| {
-            state.borrow_mut().jpeg_quality = r.value().round() as u8;
-            on_change(&state.borrow());
-        });
-    }
-    shape.add(&quality);
+    shape.add(&quality_row(s.jpeg_quality, &state, &on_change));
     photo.add(&shape);
 
     let taking = adw::PreferencesGroup::builder()
@@ -188,22 +254,7 @@ pub fn dialog(
         &on_change,
         |s, v| s.location = v,
     ));
-    let dir = adw::EntryRow::builder()
-        .title("Save photos in")
-        .text(s.photo_dir().display().to_string())
-        .show_apply_button(true)
-        .build();
-    {
-        let (state, on_change) = (state.clone(), on_change.clone());
-        dir.connect_apply(move |r| {
-            let text = r.text().trim().to_string();
-            let path = PathBuf::from(&text);
-            state.borrow_mut().save_dir =
-                (!text.is_empty() && path != default_photo_dir()).then_some(path);
-            on_change(&state.borrow());
-        });
-    }
-    saving.add(&dir);
+    saving.add(&folder_row(&s.photo_dir(), &state, &on_change));
     photo.add(&saving);
 
     // Video.
@@ -319,4 +370,19 @@ pub fn dialog(
     dialog.add(&video);
     dialog.add(&advanced);
     dialog
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualities_offer_the_one_in_the_settings() {
+        let q = qualities(92);
+        assert_eq!(q.iter().filter(|&&v| v == 92).count(), 1);
+        assert_eq!((q[0], q[q.len() - 1]), (50, 100));
+        let q = qualities(87);
+        assert!(q.contains(&87));
+        assert!(q.windows(2).all(|w| w[0] < w[1]));
+    }
 }
