@@ -33,10 +33,32 @@
 #   of those frames takes about 1.2 s: the app's Night and HDR bursts never
 #   get the exposure they ask for. The camera's merge stands in for them;
 #   Night and HDR stay hidden.
+# flash: the white LED beside the back cameras, on the MT6360's FLED1
+#   (white:flash-1). Its steps are 25 mA plus 12.5 mA each; the device tree
+#   caps them at 13 (175 mA), the torch current of the stock camera, which
+#   is also the most its strobe may draw. Photos and the torch use the
+#   steady light at 13 (see crates/omacam-core/src/flash.rs for why not
+#   the strobe). How warm it may get is the kernel's to guard.
+# flash.auto_above: auto lights the LED for a photo above this exposure
+#   time (us) times gain, analog and digital, on the preview. The preview
+#   stays at 1/30 s and puts analog gain 15.5, then digital gain on top,
+#   before it lengthens frames up to 100 ms; 4000000 (1/30 s at a total
+#   gain of 120) is about where it does. Measured on the main camera with
+#   the room's light panel: 0-10 % 12800000 (100 ms), 20 % 8660000 (70 ms),
+#   30 % 2820000, 40 % 1300000, 70 % 370000, 100 % 167000 (all 1/30 s).
+#   Above it the camera's own merge of frames still makes a usable photo
+#   at 1/30 s; below it frames grow long enough to blur, and the LED
+#   (175 mA), which only lights what is near, is worth its light.
 
 device = "lisbon"
 max_zoom = 4.0
 bursts = false
+
+[flash]
+led = "white:flash-1"
+torch = 13
+photo = 13
+auto_above = 4000000
 
 [[lens]]
 role = "main"

@@ -11,6 +11,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::backend::{CameraInfo, Location, Size};
+use crate::flash::{FlashSpec, Led};
 
 /// What a camera does in the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -141,8 +142,21 @@ struct TableFile {
     /// The app takes Night and HDR bursts of its own (see
     /// [`TableSpec::bursts`]); true when left out.
     bursts: Option<bool>,
+    /// The flash LED (see [`crate::flash`]).
+    flash: Option<FlashEntry>,
     #[serde(default, rename = "lens")]
     lenses: Vec<LensEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlashEntry {
+    /// The LED's name in /sys/class/leds; "" for no flash. Left out, the
+    /// app looks for an LED whose name says flash or torch.
+    led: Option<String>,
+    torch: Option<u32>,
+    photo: Option<u32>,
+    auto_above: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,6 +205,7 @@ pub enum TableError {
 pub struct TableSpec {
     max_zoom: f64,
     bursts: bool,
+    flash: FlashSpec,
     entries: Vec<LensEntry>,
 }
 
@@ -248,9 +263,35 @@ impl TableSpec {
         if !(max_zoom.is_finite() && max_zoom >= 1.0) {
             return Err(TableError::Invalid("max_zoom must be >= 1".into()));
         }
+        let flash = match file.flash {
+            None => FlashSpec::default(),
+            Some(f) => {
+                let d = FlashSpec::default();
+                let spec = FlashSpec {
+                    led: match f.led {
+                        None => Led::Find,
+                        Some(name) if name.is_empty() => Led::None,
+                        Some(name) => Led::Named(name),
+                    },
+                    torch: f.torch,
+                    photo: f.photo,
+                    auto_above: f.auto_above.unwrap_or(d.auto_above),
+                };
+                if !(spec.auto_above.is_finite() && spec.auto_above > 0.0) {
+                    return Err(TableError::Invalid("flash: auto_above must be > 0".into()));
+                }
+                if [spec.torch, spec.photo].contains(&Some(0)) {
+                    return Err(TableError::Invalid(
+                        "flash: a brightness must be at least 1".into(),
+                    ));
+                }
+                spec
+            }
+        };
         Ok(TableSpec {
             max_zoom,
             bursts: file.bursts.unwrap_or(true),
+            flash,
             entries: file.lenses,
         })
     }
@@ -292,6 +333,7 @@ impl TableSpec {
         TableSpec {
             max_zoom: DEFAULT_MAX_ZOOM,
             bursts: true,
+            flash: FlashSpec::default(),
             entries: Vec::new(),
         }
     }
@@ -303,6 +345,11 @@ impl TableSpec {
     /// work and stay hidden.
     pub fn bursts(&self) -> bool {
         self.bursts
+    }
+
+    /// The flash LED: which one, how bright, and when auto fires.
+    pub fn flash(&self) -> &FlashSpec {
+        &self.flash
     }
 
     /// Match the table against the cameras present.
@@ -378,6 +425,7 @@ impl TableSpec {
             lenses,
             max_zoom: self.max_zoom,
             bursts: self.bursts,
+            flash: self.flash.clone(),
         }
     }
 }
@@ -388,6 +436,7 @@ pub struct LensTable {
     lenses: Vec<Lens>,
     max_zoom: f64,
     bursts: bool,
+    flash: FlashSpec,
 }
 
 /// Which way the app looks.
@@ -439,6 +488,11 @@ impl LensTable {
     /// Whether the app may take bursts of its own ([`TableSpec::bursts`]).
     pub fn bursts(&self) -> bool {
         self.bursts
+    }
+
+    /// The flash LED ([`TableSpec::flash`]).
+    pub fn flash(&self) -> &FlashSpec {
+        &self.flash
     }
 }
 
@@ -547,6 +601,30 @@ mod tests {
         let off = TableSpec::parse("bursts = false\n").unwrap();
         assert!(!off.bursts() && !off.resolve(&[]).bursts());
         assert!(TableSpec::parse("bursts = \"no\"\n").is_err());
+    }
+
+    #[test]
+    fn the_flash_entry() {
+        // Left out: look for an LED, at its full brightness.
+        let any = TableSpec::empty();
+        assert_eq!(any.flash(), &FlashSpec::default());
+        assert_eq!(any.flash().led, Led::Find);
+        assert_eq!(TableSpec::cheetah().flash().led, Led::Find);
+        let lisbon = TableSpec::lisbon();
+        let f = lisbon.flash();
+        assert_eq!(f.led, Led::Named("white:flash-1".into()));
+        assert_eq!((f.torch, f.photo), (Some(13), Some(13)));
+        assert_eq!(lisbon.resolve(&[]).flash(), f);
+        let none = TableSpec::parse("[flash]\nled = \"\"\n").unwrap();
+        assert_eq!(none.flash().led, Led::None);
+        for bad in [
+            "[flash]\nauto_above = 0\n",
+            "[flash]\nthermal_zone = \"x\"\n",
+            "[flash]\ntorch = 0\n",
+            "[flash]\nstrobe = 1\n",
+        ] {
+            assert!(TableSpec::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

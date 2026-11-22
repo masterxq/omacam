@@ -114,8 +114,10 @@ rather than taking it).
   button), `shutter`, `tap U V` (a tap on the picture), `settings PAGE`
   (photo, video, advanced), `close-settings`, `mode`, `manual on|off`,
   `manual-edit ev|focus|wb|shutter|iso`, `focus P|auto`, `iso N|auto`,
-  `wb K|auto`, `flash auto|on|off|torch`, `flash-menu`, `aspect`, `timer`,
-  `hold`, `shot PATH` and `quit` (the full list is in `script.rs`). After each step the app logs a `state`
+  `wb K|auto`, `flash auto|on|off|torch` (as the flash button sets it),
+  `flash-menu`, `aspect`, `timer`, `hold`, `shot PATH` and `quit` (the
+  full list is in `script.rs`). `--flash MODE` sets the flash for one run
+  without saving it. After each step the app logs a `state`
   line: lens, zoom, frame size, frame rate, the last switch time. `shot`
   renders the window to a PNG itself; with the panel off, when the
   compositor draws nothing, it renders the viewfinder alone.

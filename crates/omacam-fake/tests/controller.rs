@@ -1,12 +1,13 @@
 //! The controller driving the fake backend through the real command and
 //! event path, in real time: open, zoom across lenses, take a full still,
-//! flip, and survive a busy camera.
+//! flip, survive a busy camera, and light the flash.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use omacam_core::backend::{Backend, Event};
 use omacam_core::controller::{Options, Output};
+use omacam_core::flash::{FlashMode, FlashSpec, Light};
 use omacam_core::lens::{Role, TableSpec};
 use omacam_core::zoom::ZoomSource;
 use omacam_core::{capture, Controller};
@@ -22,10 +23,19 @@ struct Rig {
     /// Burst frames: lens, exposure and whether a raw picture came along.
     bursts: Vec<(String, Option<i32>, bool)>,
     bursts_done: u32,
+    /// The LED as the controller set it, in order.
+    lights: Vec<Light>,
+    /// Each picture's exposure time times gain, and whether the LED was
+    /// lit then.
+    exposures: Vec<(Option<f64>, bool)>,
 }
 
 impl Rig {
     fn new(opts: FakeOptions) -> Rig {
+        Rig::with(opts, Options::default())
+    }
+
+    fn with(opts: FakeOptions, controller_opts: Options) -> Rig {
         let (tx, events) = mpsc::channel();
         let backend = FakeBackend::spawn(
             Box::new(move |e| {
@@ -37,7 +47,7 @@ impl Rig {
             Event::Cameras(c) => c,
             other => panic!("expected cameras, got {other:?}"),
         };
-        let controller = Controller::new(&TableSpec::cheetah(), &cameras, Options::default());
+        let controller = Controller::new(&TableSpec::cheetah(), &cameras, controller_opts);
         Rig {
             backend,
             events,
@@ -47,6 +57,8 @@ impl Rig {
             errors: Vec::new(),
             bursts: Vec::new(),
             bursts_done: 0,
+            lights: Vec::new(),
+            exposures: Vec::new(),
         }
     }
 
@@ -57,6 +69,8 @@ impl Rig {
                 Output::Show(f) => self.shown.push(f.camera),
                 Output::Picture(p) => {
                     assert!(p.frame.raw.is_none(), "a single still takes no raw picture");
+                    self.exposures
+                        .push((FlashSpec::demand(&p.frame.meta), self.lit()));
                     self.pictures
                         .push((p.lens.name.clone(), p.crop, p.frame.size))
                 }
@@ -67,8 +81,16 @@ impl Rig {
                 )),
                 Output::BurstDone => self.bursts_done += 1,
                 Output::Error(e) => self.errors.push(e),
+                Output::Light(l) => {
+                    self.backend.faults.lock().unwrap().flash_lit = l != Light::Off;
+                    self.lights.push(l);
+                }
             }
         }
+    }
+
+    fn lit(&self) -> bool {
+        self.lights.last().is_some_and(|&l| l != Light::Off)
     }
 
     /// Pump events and ticks until `done` or the timeout.
@@ -290,4 +312,132 @@ fn a_busy_camera_is_retried_until_it_frees() {
     assert!(rig.run_until(Duration::from_secs(1), |r| !r.errors.is_empty()));
     rig.backend.faults.lock().unwrap().busy.remove(&main);
     assert!(rig.run_until(Duration::from_secs(4), |r| r.showing(MAIN)));
+}
+
+/// A dim room (the main camera needs 500 ms at gain 1, past auto's
+/// threshold) with a flash that gives it 25 times the light.
+fn dim_with_flash() -> FakeOptions {
+    FakeOptions {
+        scene_light: 0.02,
+        flash_light: 0.5,
+        ..fast()
+    }
+}
+
+fn flash(mode: FlashMode) -> Options {
+    Options {
+        flash: true,
+        flash_mode: mode,
+        ..Options::default()
+    }
+}
+
+/// Open on the main camera, take a photo, and wait until it's done.
+fn photo(rig: &mut Rig) {
+    let out = rig.controller.resume(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(MAIN)));
+    // Let the exposure settle on the dim scene.
+    rig.run_until(Duration::from_millis(300), |_| false);
+    let out = rig.controller.shutter(Instant::now());
+    rig.apply(out);
+    assert!(rig.controller.view().capturing);
+    assert!(
+        rig.run_until(Duration::from_secs(5), |r| !r.pictures.is_empty()
+            && !r.controller.view().capturing)
+    );
+    assert!(rig.errors.is_empty(), "{:?}", rig.errors);
+}
+
+#[test]
+fn a_flash_photo_lights_the_led_settles_under_it_and_puts_it_out() {
+    let mut without = Rig::with(dim_with_flash(), flash(FlashMode::Off));
+    photo(&mut without);
+    assert!(without.lights.is_empty());
+    let (dark, lit) = without.exposures[0];
+    assert!(!lit);
+
+    let mut rig = Rig::with(dim_with_flash(), flash(FlashMode::On));
+    photo(&mut rig);
+    assert_eq!(rig.lights, vec![Light::Photo, Light::Off]);
+    let (t, lit) = rig.exposures[0];
+    assert!(lit, "the picture is taken under the light");
+    // 26 times the light: the exposure came down with it.
+    assert!(
+        t.unwrap() * 10.0 < dark.unwrap(),
+        "with flash {t:?}, without {dark:?}"
+    );
+}
+
+#[test]
+fn auto_flash_fires_in_a_dim_scene_only() {
+    let mut dim = Rig::with(dim_with_flash(), flash(FlashMode::Auto));
+    photo(&mut dim);
+    assert_eq!(dim.lights, vec![Light::Photo, Light::Off]);
+
+    let bright = FakeOptions {
+        scene_light: 1.0,
+        ..dim_with_flash()
+    };
+    let mut rig = Rig::with(bright, flash(FlashMode::Auto));
+    photo(&mut rig);
+    assert!(rig.lights.is_empty(), "{:?}", rig.lights);
+}
+
+#[test]
+fn the_torch_stays_on_through_a_photo_and_goes_out_on_the_front_and_when_put_away() {
+    let mut rig = Rig::with(dim_with_flash(), flash(FlashMode::Torch));
+    photo(&mut rig);
+    assert_eq!(
+        rig.lights,
+        vec![Light::Torch],
+        "lit once, through the photo"
+    );
+    assert!(rig.exposures[0].1);
+
+    let out = rig.controller.flip(Instant::now());
+    rig.apply(out);
+    assert_eq!(
+        rig.lights.last(),
+        Some(&Light::Off),
+        "the front has no flash"
+    );
+    assert!(!rig.controller.view().can_flash);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(FRONT)));
+    let out = rig.controller.flip(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.lit() && r.showing(MAIN)));
+    assert_eq!(rig.lights.last(), Some(&Light::Torch));
+
+    let out = rig.controller.suspend(Instant::now());
+    rig.apply(out);
+    assert_eq!(rig.lights.last(), Some(&Light::Off));
+    let out = rig.controller.resume(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.lit()));
+}
+
+#[test]
+fn a_busy_camera_puts_the_torch_out_until_it_streams_again() {
+    let mut rig = Rig::with(dim_with_flash(), flash(FlashMode::Torch));
+    let out = rig.controller.resume(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.lit()));
+    // The front camera is busy: flipping there and back hits it on the
+    // way; on the back side the main camera fails to restart.
+    rig.backend
+        .faults
+        .lock()
+        .unwrap()
+        .busy
+        .insert("/base/soc@0/usi@109000c0/i2c@10900000/camera-sensor@3d".into());
+    let out = rig.controller.flip(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(2), |r| r.showing(FRONT)));
+    let out = rig.controller.flip(Instant::now());
+    rig.apply(out);
+    assert!(rig.run_until(Duration::from_secs(2), |r| !r.errors.is_empty()));
+    assert!(!rig.lit(), "out while the camera fails");
+    rig.backend.faults.lock().unwrap().busy.clear();
+    assert!(rig.run_until(Duration::from_secs(4), |r| r.lit() && r.showing(MAIN)));
 }

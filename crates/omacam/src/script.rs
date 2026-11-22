@@ -53,8 +53,6 @@ pub enum Step {
     /// White balance at this color temperature, or auto.
     Wb(Option<u32>),
     Histogram(bool),
-    /// The flash mode: auto, on, off or torch.
-    Flash(String),
     /// Open the flash's choices.
     FlashMenu,
     /// The photo's aspect ratio: full, 4:3, 16:9 or 1:1.
@@ -69,6 +67,8 @@ pub enum Step {
     Ev(f64),
     /// How the phone is held, as the accelerometer would say.
     Hold(String),
+    /// The flash mode, as the flash button sets it.
+    Flash(omacam_core::flash::FlashMode),
     Quit,
 }
 
@@ -121,7 +121,6 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
             "wb" if arg == "auto" => Step::Wb(None),
             "wb" => Step::Wb(Some(number()? as u32)),
             "histogram" if arg == "on" || arg == "off" => Step::Histogram(arg == "on"),
-            "flash" if matches!(arg, "auto" | "on" | "off" | "torch") => Step::Flash(arg.into()),
             "flash-menu" => Step::FlashMenu,
             "aspect" if matches!(arg, "full" | "4:3" | "16:9" | "1:1") => Step::Aspect(arg.into()),
             "timer" if matches!(arg, "0" | "3" | "10") => Step::Timer(number()? as u32),
@@ -146,6 +145,7 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
             "hold" if matches!(arg, "normal" | "left" | "right" | "upside-down") => {
                 Step::Hold(arg.into())
             }
+            "flash" => Step::Flash(arg.parse()?),
             "quit" => Step::Quit,
             other => return Err(format!("unknown step {other:?}")),
         });
@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(
             parse("flash torch; aspect 16:9; timer 3; wb 4300").unwrap(),
             vec![
-                Step::Flash("torch".into()),
+                Step::Flash(omacam_core::flash::FlashMode::Torch),
                 Step::Aspect("16:9".into()),
                 Step::Timer(3),
                 Step::Wb(Some(4300)),
@@ -221,6 +221,15 @@ mod tests {
         assert!(parse("timer 5").is_err());
         assert_eq!(parse("hold left").unwrap(), vec![Step::Hold("left".into())]);
         assert!(parse("hold sideways").is_err());
+        assert_eq!(
+            parse("flash torch; flash auto").unwrap(),
+            vec![
+                Step::Flash(omacam_core::flash::FlashMode::Torch),
+                Step::Flash(omacam_core::flash::FlashMode::Auto)
+            ]
+        );
+        assert!(parse("flash").is_err());
+        assert!(parse("flash strobe").is_err());
         assert_eq!(
             parse("settings video; close-settings").unwrap(),
             vec![Step::Settings("video".into()), Step::CloseSettings]

@@ -254,12 +254,12 @@ chosen lens, from its own field of view up to the table's `max_zoom`.
 
 ### The flash
 
-The top bar's flash mode (`flash.rs`: auto, on, off, torch) is a setting;
-a `FlashLed` carries it out: the mode as it changes, and each photo
-before and after it is taken (auto fires when the exposure the camera
-chose is past 1/15 s at gain 4). Videos use the torch or nothing. The
-LED driver isn't wired in yet: `flash::Placeholder` logs what it would
-do.
+The top bar's flash button shows the mode (auto, on, off, torch) and drops
+its four choices down under it; a long press switches the torch on or
+back to the mode before it. The controller does the rest (see Flash
+below). In video only the torch or nothing applies. The torch isn't kept
+across launches: the setting keeps the mode it was switched on from, so
+the app never starts with the light on.
 
 ### Display paths
 
@@ -481,6 +481,56 @@ Automatic by default, with manual control where the camera allows it:
 - EXIF records what was used: exposure time, ISO, ExposureMode (manual
   when shutter or ISO was set by hand), WhiteBalance, and the exposure
   bias.
+
+## Flash (`flash.rs`)
+
+A phone's flash is a white LED beside the back cameras, driven by the
+kernel's LED class (`/sys/class/leds`). omacam uses its steady light, not
+its strobe: on the Moto G60s the device tree caps the strobe at the torch
+current (175 mA) and 384 ms, the camera makes each photo from a series of
+frames over one to two seconds, and nothing ties a strobe to a frame's
+exposure. A photo with the flash is the usual LED-flash sequence: light on,
+wait under it until the exposure and the white balance have settled, take
+the photo as usual (from the stream beside the preview, or the still mode),
+light off. The exposure must first have seen the light (exposure time
+times gain under 80 % of the one before it, or AeState Searching; with no
+change for 1 s the light doesn't reach the scene): on the Moto G60s AE
+still said Converged 300 ms after the light came on, at the old exposure,
+and that photo came out white. Then the photo is taken once AeState is no
+longer Searching with the exposure steady over two frames and the color
+gains steady, or 0.7 s after the reaction; at least four frames and 300 ms,
+at most 2.5 s. On the G60s the exposure loop sees the light after 300-500
+ms and then walks down for over 2 s, while its still stream sets an
+exposure of its own: photos 0.6 s after the reaction came out as well
+exposed as those after 1.6 s.
+
+- **Modes** (`FlashMode`, the flash button, `flash` in `settings.toml`):
+  off, auto (lit for a photo when the preview's exposure time times its
+  gain is above the lens table's `auto_above`), on (every photo), and
+  torch, a steady light on every back lens (the macro camera as a
+  magnifier) that stays on through photos. The front camera has no flash:
+  the mode is kept and nothing lights there.
+- **The LED goes out** when the app is put away (suspended, unfocused for
+  10 s, closed), on the front camera, and while the camera fails (until it
+  streams again). The controller says what the LED should do
+  (`Output::Light`: off, torch, photo) and the app sets it, only when
+  that changes.
+- **Rights.** The LED's files belong to root. logind sets an LED's
+  brightness for the user of the active graphical session
+  (`org.freedesktop.login1.Session.SetBrightness("leds", NAME, VALUE)`), as
+  Phosh's torch does; omacam calls it on the user's display session
+  (`org.freedesktop.login1.User.Display`), since the app runs in a systemd
+  user scope outside any session.
+- **A crash or a kill can't leave it on.** A helper process (`omacam
+  --led-helper NAME`) makes the calls, fed brightness values through a pipe;
+  when the app ends in any way, the pipe closes and the helper puts the LED
+  out. It ignores SIGINT, SIGTERM and SIGHUP and waits for the pipe.
+- **Temperature** is the kernel's to guard (the LED as a cooling device):
+  when it dims the LED or puts it out, the app leaves it so and doesn't
+  set it again until the light it wants changes.
+- **The lens table** (`[flash]`): `led` (the LED's name, `""` for none;
+  left out, an LED whose name says flash or torch), `torch` and `photo`
+  (brightness steps; the LED's maximum when left out), `auto_above`.
 
 ## Sharing the cameras
 

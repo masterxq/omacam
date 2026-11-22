@@ -172,6 +172,9 @@ pub struct Options {
     /// The highest frame rate every camera's modes report (as libcamera's
     /// FrameDurationLimits would); None reports none.
     pub max_fps: Option<f64>,
+    /// The light the flash LED adds to the scene while lit
+    /// ([`Faults::flash_lit`]), in the units of `scene_light`.
+    pub flash_light: f64,
 }
 
 impl Default for Options {
@@ -184,6 +187,7 @@ impl Default for Options {
             max_size: Size::new(1008, 760),
             scene_light: 1.0,
             max_fps: None,
+            flash_light: 0.5,
         }
     }
 }
@@ -201,6 +205,9 @@ pub struct Faults {
     pub sticky_settings: bool,
     /// The settings the last stream had (for `sticky_settings`).
     pub last_settings: Option<omacam_core::backend::ExposureSettings>,
+    /// The flash LED is lit: the scene has [`Options::flash_light`] more
+    /// light, and the exposure walks to it over a few frames.
+    pub flash_lit: bool,
 }
 
 enum Msg {
@@ -277,6 +284,9 @@ struct Stream {
     /// The lens moves: the test card's target is sharp only near the
     /// middle of the lens's travel (where auto focus puts it).
     movable_lens: bool,
+    /// Where the auto exposure stands (microseconds), walking towards what
+    /// the scene needs; None until the first frame.
+    ae_us: Option<f64>,
 }
 
 /// The aperture of the Pixel 7 Pro's cameras by sensor model, against the
@@ -483,6 +493,7 @@ fn handle(
                 started: false,
                 notice,
                 sequence: 0,
+                ae_us: None,
                 next_frame: now,
                 settings: {
                     let mut f = faults.lock().unwrap();
@@ -523,7 +534,7 @@ fn handle(
     }
 }
 
-fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
+fn step(s: &mut Stream, sink: &EventSink, opts: &Options, faults: &Mutex<Faults>, epoch: Instant) {
     let now = Instant::now();
     if !s.started {
         if now >= s.started_at {
@@ -549,12 +560,19 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
         return;
     }
     // An auto-exposure that walks from the start hint towards what the
-    // scene needs over a few frames, like the soft ISP's AGC.
-    let demand = 10_000.0 * s.aperture / opts.scene_light.max(1e-4);
+    // scene needs, halfway each frame, like the soft ISP's AGC.
+    let flash = if faults.lock().unwrap().flash_lit {
+        opts.flash_light
+    } else {
+        0.0
+    };
+    let demand = 10_000.0 * s.aperture / (opts.scene_light + flash).max(1e-4);
     let (settle_t, settle_gain, digital) = auto_exposure(demand);
-    let start = s.controls.exposure_us.unwrap_or(settle_t) as f64;
-    let k = 0.5f64.powi(s.sequence.min(30) as i32);
-    let exposure = (settle_t as f64 + (start - settle_t as f64) * k) as i32;
+    let current = *s
+        .ae_us
+        .get_or_insert(s.controls.exposure_us.unwrap_or(settle_t) as f64);
+    let exposure = current as i32;
+    s.ae_us = Some(settle_t as f64 + (current - settle_t as f64) * 0.5);
     let analog = s.settings.gain.manual().unwrap_or(settle_gain);
     sink(Event::Frame(Frame {
         generation: s.generation,
@@ -619,7 +637,7 @@ fn run(rx: mpsc::Receiver<Msg>, sink: EventSink, opts: Options, faults: Arc<Mute
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(s) = stream.as_mut() {
-                    step(s, &sink, &opts, epoch);
+                    step(s, &sink, &opts, &faults, epoch);
                 }
             }
         }
@@ -649,6 +667,7 @@ mod tests {
             started: true,
             notice: None,
             sequence: 0,
+            ae_us: None,
             next_frame: Instant::now(),
             controls: Controls::default(),
             settings: Default::default(),

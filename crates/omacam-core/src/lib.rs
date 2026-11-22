@@ -10,6 +10,7 @@
 //!   the next.
 //! - [`capture`]: the still-capture sequence.
 //! - [`pixels`]: reading frames of any layout (RGB, YUYV, NV12) as RGB.
+//! - [`flash`]: the flash LED, for photos and as a torch.
 //! - [`lowlight`]: the low-light fallback from the telephoto to the main.
 //! - [`exposure`]: carrying exposure from one camera to the next.
 //! - [`stabilize`]: video stabilization from the gyroscope.
@@ -21,6 +22,7 @@ pub mod capture;
 pub mod controller;
 pub mod exposure;
 pub mod exposure_control;
+pub mod flash;
 pub mod focus;
 pub mod framing;
 pub mod lens;

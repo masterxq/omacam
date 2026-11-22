@@ -13,6 +13,7 @@ use libadwaita as adw;
 
 use omacam_core::backend::{Backend, Command, Event, Frame, FrameData, PixelLayout};
 use omacam_core::controller::{Options, Output, Picture};
+use omacam_core::flash::{FlashMode, Light};
 use omacam_core::focus::Status as FocusStatus;
 use omacam_core::lens::Role;
 use omacam_core::orientation::{self, DeviceOrientation};
@@ -21,7 +22,6 @@ use omacam_core::zoom::ZoomSource;
 use omacam_core::{capture, Controller};
 
 use crate::exif;
-use crate::flash::{FlashLed, FlashMode};
 use crate::lensrow::{LensEvent, LensRow};
 use crate::manual::ManualBar;
 use crate::modebar::ModeBar;
@@ -237,12 +237,8 @@ struct App {
     thumb: gtk::Button,
     thumb_picture: gtk::Image,
     debug: gtk::Label,
-    flash_led: Box<dyn FlashLed>,
-    /// The flash mode before the torch was switched on beside the lens
-    /// row, to go back to.
+    /// The flash mode before the torch was switched on, to go back to.
     before_torch: Cell<FlashMode>,
-    /// The flash fires for the photo being taken.
-    flash_firing: Cell<bool>,
 
     backend: RefCell<Option<Box<dyn Backend>>>,
     controller: RefCell<Option<Controller>>,
@@ -257,7 +253,7 @@ struct App {
     /// When the viewfinder last took a frame (`--debug`: long gaps are
     /// logged, such as a photo's).
     shown_at: Cell<Option<Instant>>,
-    shown_ae: Cell<(Option<i32>, Option<f32>)>,
+    shown_ae: Cell<(Option<i32>, Option<f32>, Option<f32>)>,
     fps: RefCell<Fps>,
     pinch_base: Cell<f64>,
     hide_source: RefCell<Option<glib::SourceId>>,
@@ -313,6 +309,8 @@ struct App {
     bursts: bool,
     /// GeoClue, while location tags are on.
     locator: RefCell<Option<crate::location::Locator>>,
+    /// The flash LED, where the phone has one (`flash.rs`).
+    flash_led: Option<crate::flash::FlashLed>,
 }
 
 /// A recording in progress.
@@ -509,6 +507,32 @@ fn top_button_icon(b: &gtk::Button) -> Option<gtk::Image> {
     b.child()?.first_child()?.downcast::<gtk::Image>().ok()
 }
 
+/// The flash menu's choices, in their order.
+const FLASH_MENU: [FlashMode; 4] = [
+    FlashMode::Auto,
+    FlashMode::On,
+    FlashMode::Off,
+    FlashMode::Torch,
+];
+
+fn flash_icon(m: FlashMode) -> &'static str {
+    match m {
+        FlashMode::Auto => "omacam-flash-auto-symbolic",
+        FlashMode::On => "omacam-flash-on-symbolic",
+        FlashMode::Off => "omacam-flash-off-symbolic",
+        FlashMode::Torch => "omacam-torch-symbolic",
+    }
+}
+
+fn flash_label(m: FlashMode) -> &'static str {
+    match m {
+        FlashMode::Auto => "Auto",
+        FlashMode::On => "On",
+        FlashMode::Off => "Off",
+        FlashMode::Torch => "Torch",
+    }
+}
+
 fn aspect_label(a: Aspect) -> &'static str {
     match a {
         Aspect::Full => "Full",
@@ -553,7 +577,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
 
     // Top: the quick settings. Flash, timer, aspect ratio, HDR or 60 fps;
     // the settings gear at the end.
-    let flash_button = top_button(Some(settings.flash.icon()), None, "Flash");
+    let flash_button = top_button(Some(flash_icon(settings.flash)), None, "Flash");
     let timer_button = top_button(Some("omacam-timer-symbolic"), None, "Self-timer");
     let aspect_button = top_button(None, Some(aspect_label(settings.aspect)), "Aspect ratio");
     let hdr_toggle = gtk::ToggleButton::with_label("HDR");
@@ -589,10 +613,10 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     let choices = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     choices.add_css_class("flash-menu");
     let mut flash_choices = Vec::new();
-    for mode in FlashMode::ALL {
+    for mode in FLASH_MENU {
         let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        col.append(&gtk::Image::from_icon_name(mode.icon()));
-        col.append(&gtk::Label::new(Some(mode.label())));
+        col.append(&gtk::Image::from_icon_name(flash_icon(mode)));
+        col.append(&gtk::Label::new(Some(flash_label(mode))));
         let b = gtk::Button::new();
         b.set_child(Some(&col));
         b.add_css_class("flash-choice");
@@ -666,6 +690,11 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     low_light_chip.set_visible(false);
     low_light_chip.set_can_target(false);
     overlay.add_overlay(&low_light_chip);
+    let flash_led = if cli.fake {
+        None
+    } else {
+        crate::flash::FlashLed::find(cli.lens_table().flash())
+    };
     let burst_label = gtk::Label::new(None);
     let burst_spinner = gtk::Spinner::new();
     burst_spinner.set_spinning(true);
@@ -778,7 +807,6 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     }));
     let has_gyro = crate::sensors::gyro::available();
     tracing::info!(has_gyro, "gyroscope");
-    let flash_mode = settings.flash;
     let app = Rc::new(App {
         cli,
         window: window.clone(),
@@ -806,9 +834,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         thumb,
         thumb_picture,
         debug,
-        flash_led: Box::new(crate::flash::Placeholder),
         before_torch: Cell::new(FlashMode::Off),
-        flash_firing: Cell::new(false),
         backend: RefCell::new(None),
         controller: RefCell::new(None),
         frame_slot: Arc::new(Mutex::new(None)),
@@ -817,7 +843,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         shown_size: Cell::new((0, 0)),
         shown_luma: Cell::new(None),
         shown_at: Cell::new(None),
-        shown_ae: Cell::new((None, None)),
+        shown_ae: Cell::new((None, None, None)),
         fps: RefCell::new(Fps {
             window_start: Instant::now(),
             frames: 0,
@@ -860,6 +886,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         has_gyro,
         bursts,
         locator: RefCell::new(None),
+        flash_led,
     });
     // How the phone is held: the accelerometer, unless the command line
     // says (or the fake cameras run: the O key turns the phone then).
@@ -929,7 +956,6 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     }
     app.turn_controls();
     app.location_setting_changed();
-    app.flash_led.set_mode(flash_mode);
     {
         let a = Rc::downgrade(&app);
         gear.connect_clicked(move |_| {
@@ -1079,12 +1105,7 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 None => Setting::Auto,
             })),
             Step::Histogram(on) => app.manual.set_histogram(on),
-            Step::Flash(m) => app.set_flash(match m.as_str() {
-                "auto" => FlashMode::Auto,
-                "on" => FlashMode::On,
-                "torch" => FlashMode::Torch,
-                _ => FlashMode::Off,
-            }),
+            Step::Flash(mode) => app.set_flash(mode),
             Step::FlashMenu => app.flash_menu.set_reveal_child(true),
             Step::Aspect(a) => {
                 let aspect = match a.as_str() {
@@ -1392,7 +1413,6 @@ impl App {
                 }
                 Output::Show(frame) => self.show(frame),
                 Output::Picture(p) => {
-                    self.flash_done();
                     if self.settings.borrow().shutter_sound {
                         play_shutter_sound();
                     }
@@ -1405,11 +1425,13 @@ impl App {
                     }
                     burst.push(*p);
                 }
-                Output::BurstDone => {
-                    self.flash_done();
-                    self.merge_burst()
-                }
+                Output::BurstDone => self.merge_burst(),
                 Output::Error(msg) => self.error(&msg),
+                Output::Light(light) => {
+                    if let Some(led) = &self.flash_led {
+                        led.set(light);
+                    }
+                }
             }
         }
         self.refresh();
@@ -1429,6 +1451,10 @@ impl App {
                     tap_to_focus: self.settings.borrow().tap_to_focus,
                     low_light: self.settings.borrow().low_light,
                     hold_lens: !self.settings.borrow().switch_lenses_by_zoom,
+                    // The fake cameras show the controls; the light is
+                    // only logged.
+                    flash: self.flash_led.is_some() || self.cli.fake,
+                    flash_mode: self.cli.flash.unwrap_or(self.settings.borrow().flash),
                     video_fps: self.settings.borrow().video_fps,
                     raw_merge: !self.cli.no_raw_merge,
                     ..Options::default()
@@ -1546,13 +1572,11 @@ impl App {
                 }
             }
         }
-        // The exposure the camera chose, for the auto flash (and the log).
+        // The exposure the camera chose, for the log.
         self.shown_ae.set((
             frame.meta.exposure_us,
-            frame
-                .meta
-                .analog_gain
-                .map(|g| g * frame.meta.digital_gain.unwrap_or(1.0)),
+            frame.meta.analog_gain,
+            frame.meta.digital_gain,
         ));
         if let FrameData::Shared(px) = &frame.data {
             *self.last_pixels.borrow_mut() = Some((
@@ -1968,12 +1992,11 @@ impl App {
             }
             None => self.manual_hint.set_visible(false),
         }
-        // The torch beside the lens row, with the macro lens on.
-        let torch = &self.lens_row.torch;
-        torch.set_visible(view.macro_on && self.flash_led.available());
-        let lit = settings.flash == FlashMode::Torch;
-        if torch.is_active() != lit {
-            torch.set_active(lit);
+        // The shutter's ring while the flash is lit for the photo.
+        if view.light == Light::Photo {
+            self.shutter.add_css_class("flash");
+        } else {
+            self.shutter.remove_css_class("flash");
         }
         self.debug.set_visible(self.debug_enabled());
         self.viewfinder.set_measure(self.debug_enabled());
@@ -2014,14 +2037,17 @@ impl App {
         let settings = self.settings.borrow().clone();
         let video = view.mode == omacam_core::controller::Mode::Video;
         let night = self.ui_mode.get() == UiMode::Night;
-        let flash = if video {
-            settings.flash.for_video()
-        } else {
-            settings.flash
+        // Videos have no photo to flash for: the torch, or nothing.
+        let flash = match view.flash_mode {
+            FlashMode::Auto | FlashMode::On if video => FlashMode::Off,
+            m => m,
         };
-        self.flash_button.set_visible(self.flash_led.available());
+        self.flash_button.set_visible(view.can_flash);
+        if !view.can_flash {
+            self.flash_menu.set_reveal_child(false);
+        }
         if let Some(i) = top_button_icon(&self.flash_button) {
-            i.set_icon_name(Some(flash.icon()));
+            i.set_icon_name(Some(flash_icon(flash)));
         }
         if flash == FlashMode::Off {
             self.flash_button.remove_css_class("on");
@@ -2148,31 +2174,35 @@ impl App {
         if let Some(out) = self.with_controller(|c| c.set_mode(cmode, Instant::now())) {
             self.apply(out);
         }
-        // The torch stays as it is; the flash for photos has nothing to
-        // do in a video.
-        self.flash_led.set_mode(self.effective_flash());
         self.push_capture_mode();
     }
 
-    /// The flash mode in force: the setting, or for videos only the torch.
-    fn effective_flash(&self) -> FlashMode {
-        let f = self.settings.borrow().flash;
-        if self.ui_mode.get() == UiMode::Video {
-            f.for_video()
-        } else {
-            f
-        }
-    }
-
+    /// The flash mode, from the menu, a long press or a script. The
+    /// torch isn't kept: the setting keeps the mode it was switched on
+    /// from, so the app never starts with the light on.
     fn set_flash(self: &Rc<Self>, mode: FlashMode) {
         let before = self.settings.borrow().flash;
-        if mode == FlashMode::Torch && before != FlashMode::Torch {
-            self.before_torch.set(before);
+        let now = self
+            .controller
+            .borrow()
+            .as_ref()
+            .map_or(before, |c| c.flash_mode());
+        if mode == FlashMode::Torch && now != FlashMode::Torch {
+            self.before_torch.set(now);
         }
-        self.change_settings(|s| s.flash = mode);
-        self.flash_led.set_mode(self.effective_flash());
+        let kept = if mode == FlashMode::Torch {
+            self.before_torch.get()
+        } else {
+            mode
+        };
+        if kept != before {
+            self.change_settings(|s| s.flash = kept);
+        }
         self.flash_menu.set_reveal_child(false);
-        self.refresh();
+        match self.with_controller(|c| c.set_flash_mode(mode)) {
+            Some(out) => self.apply(out),
+            None => self.refresh(),
+        }
     }
 
     /// Change the settings and save them.
@@ -2266,15 +2296,6 @@ impl App {
                 a.set_manual_open(b.is_active());
             }
         });
-        let a = Rc::downgrade(self);
-        self.lens_row.torch.connect_clicked(move |b| {
-            let Some(a) = a.upgrade() else { return };
-            if b.is_active() {
-                a.set_flash(FlashMode::Torch);
-            } else {
-                a.set_flash(a.before_torch.get());
-            }
-        });
         // The quick settings.
         let a = Rc::downgrade(self);
         self.flash_button.connect_clicked(move |_| {
@@ -2289,7 +2310,8 @@ impl App {
         press.connect_pressed(move |g, _, _| {
             g.set_state(gtk::EventSequenceState::Claimed);
             let Some(a) = a.upgrade() else { return };
-            if a.settings.borrow().flash == FlashMode::Torch {
+            let now = a.with_controller(|c| c.flash_mode());
+            if now == Some(FlashMode::Torch) {
                 a.set_flash(a.before_torch.get());
             } else {
                 a.set_flash(FlashMode::Torch);
@@ -2935,33 +2957,8 @@ impl App {
     }
 
     fn take_photo(self: &Rc<Self>) {
-        // The flash: always, or (auto) when the camera's exposure says the
-        // scene is dark.
-        let (t, g) = self.shown_ae.get();
-        let dark = crate::flash::is_dark(t, g);
-        let fires = self.effective_flash().fires(dark);
-        let out = self.with_controller(|c| c.shutter(Instant::now()));
-        if let Some(out) = out {
-            let started = !out.is_empty()
-                || self
-                    .controller
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|c| c.view().capturing);
-            if fires && started {
-                self.flash_firing.set(true);
-                self.shutter.add_css_class("flash");
-                self.flash_led.photo_starts();
-            }
+        if let Some(out) = self.with_controller(|c| c.shutter(Instant::now())) {
             self.apply(out);
-        }
-    }
-
-    /// The photo's frame is in: the flash goes back to the mode's state.
-    fn flash_done(&self) {
-        if self.flash_firing.replace(false) {
-            self.shutter.remove_css_class("flash");
-            self.flash_led.photo_done();
         }
     }
 
@@ -3208,6 +3205,7 @@ impl App {
             luma = self.shown_luma.get().map(|l| format!("{l:.0}")),
             exposure_us = self.shown_ae.get().0,
             gain = self.shown_ae.get().1,
+            digital = self.shown_ae.get().2,
             "state"
         );
     }
@@ -3225,6 +3223,9 @@ impl App {
                     }
                 }
             }
+        }
+        if let Some(led) = &self.flash_led {
+            led.set(omacam_core::flash::Light::Off);
         }
         // Dropping the backend joins its thread after the stop.
         self.backend.borrow_mut().take();

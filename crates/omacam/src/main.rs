@@ -137,6 +137,13 @@ pub struct Cli {
     /// pixels, such as 412x915).
     #[arg(long, value_parser = parse_size, default_value = "480x1040")]
     size: (i32, i32),
+    /// The flash for this run: auto, on, off or torch (the setting stays).
+    #[arg(long, value_parser = parse_flash)]
+    flash: Option<omacam_core::flash::FlashMode>,
+    /// Run as the flash LED's helper (see `flash.rs`): set the LED to each
+    /// brightness read from standard input, put it out at the end.
+    #[arg(long, hide = true, value_name = "LED")]
+    led_helper: Option<String>,
 }
 
 fn parse_size(s: &str) -> Result<(i32, i32), String> {
@@ -150,6 +157,10 @@ fn parse_size(s: &str) -> Result<(i32, i32), String> {
             .ok_or_else(|| format!("{s:?}: WIDTHxHEIGHT, 100 to 8000 each"))
     };
     Ok((n(w)?, n(h)?))
+}
+
+fn parse_flash(s: &str) -> Result<omacam_core::flash::FlashMode, String> {
+    s.parse()
 }
 
 /// The built-in lens table for this device, by its device-tree compatible.
@@ -328,6 +339,9 @@ fn init_logging() {
 fn main() -> gtk::glib::ExitCode {
     init_logging();
     let cli = Cli::parse();
+    if let Some(led) = &cli.led_helper {
+        return flash::helper(led);
+    }
     if let Some(text) = &cli.script {
         if let Err(e) = script::parse(text) {
             eprintln!("omacam: --script: {e}");

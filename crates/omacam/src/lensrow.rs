@@ -5,8 +5,7 @@
 //! dial ([`crate::dial`]) for a stepless zoom; the dial stays a moment
 //! after the finger lifts and can be dragged again.
 //!
-//! At its ends the row holds the adjust button (the manual controls) and,
-//! with the macro lens on, a torch switch.
+//! At its end the row holds the adjust button (the manual controls).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -44,8 +43,6 @@ pub struct LensRow {
     pill: gtk::Box,
     buttons: RefCell<Vec<(ZoomButton, gtk::Button)>>,
     macro_button: gtk::Button,
-    /// The torch, beside the row while the macro lens is on.
-    pub torch: gtk::ToggleButton,
     /// Opens the manual controls.
     pub adjust: gtk::ToggleButton,
     dial: ZoomDial,
@@ -80,11 +77,8 @@ impl LensRow {
         macro_button.add_css_class("turnable");
         macro_button.set_tooltip_text(Some("Macro lens: sharp a few centimeters away"));
         macro_button.set_visible(false);
-        let torch = side_button("omacam-torch-symbolic", "Torch");
-        torch.set_visible(false);
         let adjust = side_button("omacam-adjust-symbolic", "Manual controls");
         let row = gtk::CenterBox::new();
-        row.set_start_widget(Some(&torch));
         row.set_center_widget(Some(&pill));
         row.set_end_widget(Some(&adjust));
         row.add_css_class("lens-row");
@@ -101,7 +95,6 @@ impl LensRow {
             pill,
             buttons: RefCell::new(Vec::new()),
             macro_button,
-            torch,
             adjust,
             dial,
             on_event: Rc::new(on_event),

@@ -8,6 +8,7 @@ use crate::backend::{CameraInfo, Command, Event, Frame, FrameMeta, Purpose, Stre
 use crate::capture::{self, CaptureController, Step};
 use crate::exposure;
 use crate::exposure_control::{self, Exposure};
+use crate::flash::{FlashMode, Light, PreFlash, PreFlashStep};
 use crate::focus::{self, FocusController};
 use crate::framing;
 pub use crate::framing::Transform;
@@ -48,6 +49,10 @@ pub struct Options {
     /// to another camera, only the lens buttons do (no low-light stand-in
     /// either). Off, the zoom picks the lens ([`crate::zoom`]).
     pub hold_lens: bool,
+    /// The back has a flash LED the app can light ([`crate::flash`]).
+    pub flash: bool,
+    /// What the flash does.
+    pub flash_mode: FlashMode,
 }
 
 impl Default for Options {
@@ -62,6 +67,8 @@ impl Default for Options {
             video_fps: 30,
             raw_merge: true,
             hold_lens: false,
+            flash: false,
+            flash_mode: FlashMode::Off,
         }
     }
 }
@@ -95,6 +102,9 @@ pub enum Output {
     BurstFrame(Box<Picture>),
     /// The burst's last frame was the one before: merge them.
     BurstDone,
+    /// Light the flash LED so, or put it out ([`Light::Off`]). Sent when
+    /// it changes.
+    Light(Light),
     /// Something to tell the user.
     Error(String),
 }
@@ -184,6 +194,13 @@ pub struct ViewState {
     pub can_60fps: bool,
     /// The frame rate video mode asks for now (30 or 60).
     pub video_fps: u32,
+    /// What the flash does (the setting, kept on the front camera too).
+    pub flash_mode: FlashMode,
+    /// The flash can be used here: the phone has one and a back lens
+    /// streams. (The front camera has none: its mode is kept but unused.)
+    pub can_flash: bool,
+    /// What the LED does now.
+    pub light: Light,
 }
 
 /// The presets within a ladder's range; the ".5" button is the widest
@@ -304,6 +321,12 @@ pub struct Controller {
     no_beside: std::collections::HashSet<String>,
     /// The tapped point focus and metering follow ([`ViewState::tap_point`]).
     tap_point: Option<(f64, f64)>,
+    /// The wait under the light before a flash photo.
+    pre_flash: Option<PreFlash>,
+    /// The LED is lit for the photo being taken.
+    flash_photo: bool,
+    /// What the LED was last told.
+    light: Light,
 }
 
 impl Controller {
@@ -347,6 +370,9 @@ impl Controller {
             beside: None,
             no_beside: std::collections::HashSet::new(),
             tap_point: None,
+            pre_flash: None,
+            flash_photo: false,
+            light: Light::Off,
         }
     }
 
@@ -376,6 +402,7 @@ impl Controller {
     ) -> Vec<Output> {
         let mut out = Vec::new();
         self.capture.abort();
+        self.abort_flash();
         self.focus.reset();
         self.retry_at = None;
         self.last_meta = None;
@@ -411,6 +438,7 @@ impl Controller {
                 self.request(None, now, &mut out);
             }
         }
+        self.sync_light(&mut out);
         out
     }
 
@@ -456,7 +484,7 @@ impl Controller {
             lens_role: lens.map(|l| l.role),
             lens_name: lens.map(|l| l.name.clone()).unwrap_or_default(),
             switching: self.switch.is_switching(),
-            capturing: self.capture.is_busy(),
+            capturing: self.busy(),
             can_flip: self.back.is_some() && self.front.is_some(),
             can_macro: self.facing == Facing::Back && self.macro_side.is_some(),
             macro_on: self.facing == Facing::Back && self.macro_on,
@@ -469,6 +497,9 @@ impl Controller {
             low_light: side.is_some_and(|s| s.falls_back()),
             can_60fps: self.can_60fps(),
             video_fps: self.opts.video_fps,
+            flash_mode: self.opts.flash_mode,
+            can_flash: self.opts.flash && self.facing == Facing::Back,
+            light: self.light,
         }
     }
 
@@ -615,7 +646,7 @@ impl Controller {
     pub fn next_tick(&self, now: Instant) -> Option<Duration> {
         let zoom = self.side().and_then(|s| s.planner.next_tick(now));
         let retry = self.retry_at.map(|t| t.saturating_duration_since(now));
-        let capture = self.capture.is_busy().then_some(Duration::from_millis(100));
+        let capture = self.busy().then_some(Duration::from_millis(100));
         let focus = self
             .focus
             .indicator()
@@ -758,6 +789,7 @@ impl Controller {
         self.suspended = false;
         self.retry_at = None;
         self.request_preview(now, &mut out);
+        self.sync_light(&mut out);
         out
     }
 
@@ -768,14 +800,16 @@ impl Controller {
         self.recording = false;
         self.retry_at = None;
         self.capture.abort();
+        self.abort_flash();
         self.request(None, now, &mut out);
         out.push(Output::Backend(Command::Release));
+        self.sync_light(&mut out);
         out
     }
 
     pub fn set_zoom(&mut self, zoom: f64, source: ZoomSource, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.capture.is_busy() {
+        if self.busy() {
             return out;
         }
         let changed = self
@@ -854,7 +888,7 @@ impl Controller {
     /// lens table, a still stream beside the photo preview).
     pub fn set_mode(&mut self, mode: Mode, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if !self.recording && !self.capture.is_busy() && self.mode != mode {
+        if !self.recording && !self.busy() && self.mode != mode {
             self.mode = mode;
             // The stream restarts without the tapped window.
             self.forget_tap();
@@ -922,11 +956,7 @@ impl Controller {
         let before = back.lens();
         back.fallback = want;
         let after = back.lens();
-        if self.facing == Facing::Back
-            && !self.macro_on
-            && before != after
-            && !self.capture.is_busy()
-        {
+        if self.facing == Facing::Back && !self.macro_on && before != after && !self.busy() {
             self.request_preview(now, out);
         }
     }
@@ -1004,7 +1034,7 @@ impl Controller {
     /// AE/AF lock and resets the EV slider.
     pub fn tap(&mut self, u: f64, v: f64, luma: Option<f64>, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if !self.opts.tap_to_focus || self.capture.is_busy() {
+        if !self.opts.tap_to_focus || self.busy() {
             return out;
         }
         let Some((generation, lens)) = self.preview_lens() else {
@@ -1235,7 +1265,7 @@ impl Controller {
 
     pub fn flip(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.recording || self.capture.is_busy() || self.back.is_none() || self.front.is_none() {
+        if self.recording || self.busy() || self.back.is_none() || self.front.is_none() {
             return out;
         }
         self.facing = match self.facing {
@@ -1247,6 +1277,7 @@ impl Controller {
         // Exposure doesn't carry between the two sides.
         self.last_meta = None;
         self.request_preview(now, &mut out);
+        self.sync_light(&mut out);
         out
     }
 
@@ -1255,10 +1286,7 @@ impl Controller {
     /// recording or taking a photo, nor on the front side.
     pub fn toggle_macro(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.recording
-            || self.capture.is_busy()
-            || self.facing != Facing::Back
-            || self.macro_side.is_none()
+        if self.recording || self.busy() || self.facing != Facing::Back || self.macro_side.is_none()
         {
             return out;
         }
@@ -1267,16 +1295,46 @@ impl Controller {
         self.focus.reset();
         self.last_meta = None;
         self.request_preview(now, &mut out);
+        self.sync_light(&mut out);
         out
     }
 
     pub fn shutter(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.recording || self.switch.streaming().is_none() || self.switch.is_switching() {
+        if self.recording
+            || self.pre_flash.is_some()
+            || self.switch.streaming().is_none()
+            || self.switch.is_switching()
+            || self.side().is_none()
+        {
             return out;
         }
-        let Some(lens) = self.side().map(|s| s.lens()) else {
+        if !self.capture.is_busy() && self.flash_fires() {
+            // Light first; the photo once the picture has settled under it.
+            let demand = self
+                .last_meta
+                .as_ref()
+                .and_then(|(_, m)| crate::flash::FlashSpec::demand(m));
+            tracing::info!(
+                mode = self.opts.flash_mode.name(),
+                demand = demand.map(|d| format!("{d:.0}")),
+                "flash: light on for the photo"
+            );
+            self.pre_flash = Some(PreFlash::new(now, self.last_meta.as_ref().map(|(_, m)| m)));
+            self.flash_photo = true;
+            self.sync_light(&mut out);
             return out;
+        }
+        self.begin_capture(now, &mut out);
+        self.sync_light(&mut out);
+        out
+    }
+
+    /// Start taking the photo: the capture mode the lens and its stream
+    /// allow.
+    fn begin_capture(&mut self, now: Instant, out: &mut Vec<Output>) {
+        let Some(lens) = self.side().map(|s| s.lens()) else {
+            return;
         };
         let l = self.table.get(lens);
         let autofocus = l.autofocus;
@@ -1305,8 +1363,82 @@ impl Controller {
         };
         let meta = self.last_meta.as_ref().map(|(_, m)| m);
         let step = self.capture.begin(mode, autofocus, meta, now);
-        self.capture_step(step, now, &mut out);
+        self.capture_step(step, now, out);
+    }
+
+    /// Busy with a photo: taking it, or waiting under the flash's light.
+    fn busy(&self) -> bool {
+        self.capture.is_busy() || self.pre_flash.is_some()
+    }
+
+    /// Whether the next photo lights the flash first: on, or auto in a
+    /// dim scene; on a back lens, in photo mode. (The torch is lit
+    /// already.)
+    fn flash_fires(&self) -> bool {
+        if !self.opts.flash || self.facing != Facing::Back || self.mode != Mode::Photo {
+            return false;
+        }
+        match self.opts.flash_mode {
+            FlashMode::On => true,
+            FlashMode::Auto => self
+                .table
+                .flash()
+                .auto_fires(self.last_meta.as_ref().map(|(_, m)| m)),
+            FlashMode::Off | FlashMode::Torch => false,
+        }
+    }
+
+    /// Forget a flash photo (the stream stopped or broke).
+    fn abort_flash(&mut self) {
+        self.pre_flash = None;
+        self.flash_photo = false;
+    }
+
+    /// What the LED should do now.
+    fn wanted_light(&self) -> Light {
+        if !self.opts.flash || self.suspended || self.facing != Facing::Back {
+            return Light::Off;
+        }
+        // The torch comes on once a back lens streams and stays on through
+        // lens switches; it goes out when nothing is wanted (put away, or
+        // the camera failed).
+        let torch = self.opts.flash_mode == FlashMode::Torch
+            && self.switch.wanted().is_some()
+            && (self.switch.streaming().is_some() || self.light != Light::Off);
+        if self.flash_photo {
+            Light::Photo
+        } else if torch {
+            Light::Torch
+        } else {
+            Light::Off
+        }
+    }
+
+    /// Bring the LED in line: the photo's light ends with the photo.
+    fn sync_light(&mut self, out: &mut Vec<Output>) {
+        if self.flash_photo && self.pre_flash.is_none() && !self.capture.is_busy() {
+            self.flash_photo = false;
+        }
+        let want = self.wanted_light();
+        if want != self.light {
+            tracing::info!(light = ?want, "flash");
+            self.light = want;
+            out.push(Output::Light(want));
+        }
+    }
+
+    /// What the flash does: off, auto, on, or the torch. Kept on the
+    /// front camera (where nothing lights) for when the back comes back.
+    /// A flash photo under way finishes with its light.
+    pub fn set_flash_mode(&mut self, mode: FlashMode) -> Vec<Output> {
+        let mut out = Vec::new();
+        self.opts.flash_mode = mode;
+        self.sync_light(&mut out);
         out
+    }
+
+    pub fn flash_mode(&self) -> FlashMode {
+        self.opts.flash_mode
     }
 
     fn capture_step(&mut self, step: Step, now: Instant, out: &mut Vec<Output>) {
@@ -1395,6 +1527,16 @@ impl Controller {
             let meta = self.last_meta.as_ref().map(|(_, m)| m.clone());
             let step = self.capture.tick(meta.as_ref(), now);
             self.capture_step(step, now, &mut out);
+        } else if let Some(p) = &self.pre_flash {
+            if p.tick(now) != PreFlashStep::Wait {
+                tracing::info!(
+                    frames = p.frames(),
+                    reacted = p.reacted(),
+                    "flash: the wait under the light ran out; the photo anyway"
+                );
+                self.pre_flash = None;
+                self.begin_capture(now, &mut out);
+            }
         } else if self.side_mut().and_then(|s| s.planner.tick(now)).is_some() {
             self.request_preview(now, &mut out);
         }
@@ -1425,6 +1567,7 @@ impl Controller {
             self.retry_at = None;
             self.request_preview(now, &mut out);
         }
+        self.sync_light(&mut out);
         out
     }
 
@@ -1456,7 +1599,7 @@ impl Controller {
         if self.facing != Facing::Back
             || self.macro_on
             || self.recording
-            || self.capture.is_busy()
+            || self.busy()
             || self.switch.is_switching()
         {
             return;
@@ -1525,6 +1668,7 @@ impl Controller {
                 let actions = self.switch.on_error(generation);
                 self.run(actions, &mut out);
                 self.capture.abort();
+                self.abort_flash();
                 out.push(Output::Error(message));
                 if !self.suspended && self.switch.wanted().is_none() {
                     self.retry_at = Some(now + RETRY_AFTER);
@@ -1532,6 +1676,7 @@ impl Controller {
             }
             Event::Frame(frame) => self.on_frame(frame, now, &mut out),
         }
+        self.sync_light(&mut out);
         out
     }
 
@@ -1571,6 +1716,33 @@ impl Controller {
                 self.focus.on_meta(&frame.meta, now);
                 self.judge_light(lens_idx, &frame.meta, now, out);
                 self.last_meta = Some((lens_idx, frame.meta.clone()));
+                if let Some(p) = &mut self.pre_flash {
+                    let step = p.on_frame(&frame.meta, now);
+                    tracing::debug!(
+                        ms = p.elapsed(now).as_millis() as u64,
+                        exposure_us = frame.meta.exposure_us,
+                        gain = frame.meta.analog_gain,
+                        digital = frame.meta.digital_gain,
+                        ae = ?frame.meta.ae_state,
+                        gains = ?frame.meta.color_gains,
+                        reacted = p.reacted(),
+                        ?step,
+                        "flash: frame under the light"
+                    );
+                    if step != PreFlashStep::Wait {
+                        tracing::info!(
+                            frames = p.frames(),
+                            ms = p.elapsed(now).as_millis() as u64,
+                            settled = step == PreFlashStep::Settled,
+                            reacted = p.reacted(),
+                            exposure_us = frame.meta.exposure_us,
+                            gain = frame.meta.analog_gain,
+                            "flash: the picture under the light"
+                        );
+                        self.pre_flash = None;
+                        self.begin_capture(now, out);
+                    }
+                }
                 match self.capture.on_preview_frame(&frame.meta, now) {
                     Step::Keep => out.push(self.picture(frame, lens_idx, purpose)),
                     step => {
@@ -2771,6 +2943,158 @@ still = [2592, 1940]
             other => panic!("{other:?}"),
         }
         assert!(!c.view().capturing);
+    }
+
+    fn lights(out: &[Output]) -> Vec<Light> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Light(l) => Some(*l),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_flash_photo_beside_the_preview_waits_under_the_light() {
+        let now = Instant::now();
+        let at = |ms: u64| now + Duration::from_millis(ms);
+        let opts = Options {
+            flash: true,
+            flash_mode: FlashMode::On,
+            ..Options::default()
+        };
+        let mut c = Controller::new(&spec(), &cameras(), opts);
+        let (g, _, _) = start_of(&c.resume(now));
+        let mut e = started(g, "main");
+        if let Event::Started { still, .. } = &mut e {
+            *still = Some(Size::new(4080, 3072));
+        }
+        assert!(lights(&c.on_event(e, now)).is_empty(), "no torch");
+        c.on_event(frame(g, "main", 66_000), now);
+        // The shutter lights the LED and asks for nothing yet.
+        let out = c.shutter(now);
+        assert_eq!(lights(&out), vec![Light::Photo]);
+        assert!(commands(&out).is_empty(), "{out:?}");
+        assert!(c.view().capturing);
+        assert_eq!(c.view().light, Light::Photo);
+        // A second press while waiting does nothing; nor do zoom or flip.
+        assert!(c.shutter(now).is_empty());
+        assert!(c.flip(now).is_empty());
+        // Frames under the light: no AeState here, so the fixed wait.
+        let mut asked = None;
+        for i in 1..=crate::flash::PRE_FLASH_FIXED {
+            let out = c.on_event(frame(g, "main", 20_000), at(50 * i as u64));
+            if let [Command::Capture { generation }] = commands(&out).as_slice() {
+                asked = Some((i, *generation));
+                break;
+            }
+        }
+        assert_eq!(asked, Some((crate::flash::PRE_FLASH_FIXED, g)));
+        assert_eq!(c.view().light, Light::Photo, "lit until the still comes");
+        let mut still = frame(g, "main", 20_000);
+        if let Event::Frame(f) = &mut still {
+            f.still = true;
+        }
+        let out = c.on_event(still, at(2000));
+        assert!(matches!(out.first(), Some(Output::Picture(_))), "{out:?}");
+        assert_eq!(lights(&out), vec![Light::Off]);
+        assert!(!c.view().capturing);
+    }
+
+    #[test]
+    fn a_flash_photo_goes_ahead_without_frames_and_stops_with_the_app() {
+        let now = Instant::now();
+        let opts = Options {
+            flash: true,
+            flash_mode: FlashMode::On,
+            ..Options::default()
+        };
+        let mut c = Controller::new(&spec(), &cameras(), opts.clone());
+        let g = open(&mut c, now);
+        assert_eq!(lights(&c.shutter(now)), vec![Light::Photo]);
+        // No frame comes: the photo is taken anyway at the longest wait
+        // (the main camera's still mode, here, with a stop and a start).
+        assert!(commands(&c.tick(now + Duration::from_millis(500))).is_empty());
+        let out = c.tick(now + crate::flash::PRE_FLASH_MAX);
+        assert!(
+            matches!(commands(&out).as_slice(), [Command::Start { generation, stream, .. }]
+                if *generation > g && stream.purpose == Purpose::Still),
+            "{out:?}"
+        );
+        assert!(lights(&out).is_empty(), "still lit for the still");
+        // Put away mid-photo: the light goes out.
+        let out = c.suspend(now + Duration::from_secs(3));
+        assert_eq!(lights(&out), vec![Light::Off]);
+        // Off, or no LED: nothing lights.
+        for (flash, mode) in [
+            (true, FlashMode::Off),
+            (false, FlashMode::On),
+            (false, FlashMode::Torch),
+        ] {
+            let mut c = Controller::new(
+                &spec(),
+                &cameras(),
+                Options {
+                    flash,
+                    flash_mode: mode,
+                    ..Options::default()
+                },
+            );
+            open(&mut c, now);
+            assert!(lights(&c.shutter(now)).is_empty(), "{flash} {mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_torch_follows_the_mode_and_the_side() {
+        let now = Instant::now();
+        let opts = Options {
+            flash: true,
+            ..Options::default()
+        };
+        let mut c = Controller::new(&spec(), &cameras(), opts);
+        let g = open(&mut c, now);
+        assert_eq!(
+            lights(&c.set_flash_mode(FlashMode::Torch)),
+            vec![Light::Torch]
+        );
+        // Zooming to another back lens keeps it lit.
+        let out = c.set_zoom(5.0, ZoomSource::Preset, now);
+        assert!(lights(&out).is_empty());
+        let (g2, _, _) = start_of(&out);
+        assert!(g2 > g);
+        assert!(lights(&c.on_event(Event::Stopped { generation: g }, now)).is_empty());
+        assert!(lights(&c.on_event(started(g2, "tele"), now)).is_empty());
+        // The front side has no flash.
+        let out = c.flip(now);
+        assert_eq!(lights(&out), vec![Light::Off]);
+        assert_eq!(c.view().flash_mode, FlashMode::Torch, "kept for the back");
+        assert!(!c.view().can_flash);
+        // A camera that fails puts it out.
+        let mut c = Controller::new(
+            &spec(),
+            &cameras(),
+            Options {
+                flash: true,
+                flash_mode: FlashMode::Torch,
+                ..Options::default()
+            },
+        );
+        let (g, _, _) = start_of(&c.resume(now));
+        assert!(lights(&c.resume(now)).is_empty(), "not before it streams");
+        assert_eq!(
+            lights(&c.on_event(started(g, "main"), now)),
+            vec![Light::Torch]
+        );
+        let out = c.on_event(
+            Event::Error {
+                generation: Some(g),
+                message: "gone".into(),
+            },
+            now,
+        );
+        assert_eq!(lights(&out), vec![Light::Off]);
+        assert_eq!(lights(&c.set_flash_mode(FlashMode::Off)), vec![]);
     }
 
     #[test]
