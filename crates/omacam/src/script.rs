@@ -2,7 +2,8 @@
 //! `--script "wait 3; zoom 5; wait 2; shot /tmp/tele.png; quit"`.
 //!
 //! Steps: `wait SECONDS`, `zoom Z` (as a preset button), `pinch Z` (as a
-//! pinch that ends at Z), `flip`, `shutter`, `tap U V` (a tap on the
+//! pinch that ends at Z), `flip`, `macro` (the macro button), `shutter`,
+//! `tap U V` (a tap on the
 //! picture), `settings PAGE` and `close-settings`, `shot PATH` (the window
 //! as a PNG, rendered by the app itself, so it works with the panel off),
 //! `hold normal|left|right|upside-down` (as if the accelerometer said the
@@ -17,6 +18,8 @@ pub enum Step {
     Zoom(f64),
     Pinch(f64),
     Flip,
+    /// The macro button.
+    Macro,
     Shutter,
     Shot(PathBuf),
     /// Open the settings sheet on a page (photo, video, advanced).
@@ -65,6 +68,7 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
             "zoom" => Step::Zoom(number()?),
             "pinch" => Step::Pinch(number()?),
             "flip" => Step::Flip,
+            "macro" => Step::Macro,
             "shutter" => Step::Shutter,
             "shot" if !arg.is_empty() => Step::Shot(PathBuf::from(arg)),
             "shot" => return Err("shot: needs a path".into()),

@@ -24,6 +24,7 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(2);
 /// above the widest lens (0.5 over 0.45) snaps to that lens's full view.
 pub const BACK_PRESETS: [f64; 4] = [0.5, 1.0, 2.0, 5.0];
 pub const FRONT_PRESETS: [f64; 2] = [1.0, 2.0];
+pub const MACRO_PRESETS: [f64; 3] = [1.0, 2.0, 4.0];
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -134,6 +135,10 @@ pub struct ViewState {
     pub switching: bool,
     pub capturing: bool,
     pub can_flip: bool,
+    /// The back side has a macro lens to turn on.
+    pub can_macro: bool,
+    /// The macro lens streams instead of the back side's zoom ladder.
+    pub macro_on: bool,
     pub last_switch: Option<Duration>,
     /// Exposure, white balance and focus: what the camera offers, what's
     /// set, and what auto chose.
@@ -164,12 +169,21 @@ struct Side {
 
 impl Side {
     fn new(table: &LensTable, facing: Facing) -> Option<Side> {
-        let lenses = table.ladder(facing);
+        Side::of(table, table.ladder(facing), table.max_zoom(facing))
+    }
+
+    /// The macro lens alone, zoomed digitally.
+    fn macro_lens(table: &LensTable) -> Option<Side> {
+        let lens = table.by_role(Role::Macro)?;
+        Side::of(table, vec![lens], crate::lens::MACRO_MAX_ZOOM)
+    }
+
+    fn of(table: &LensTable, lenses: Vec<usize>, max_zoom: f64) -> Option<Side> {
         if lenses.is_empty() {
             return None;
         }
         let factors = lenses.iter().map(|&i| table.get(i).zoom).collect();
-        let ladder = Ladder::new(factors, table.max_zoom(facing));
+        let ladder = Ladder::new(factors, max_zoom);
         let roles = lenses.iter().map(|&i| table.get(i).role).collect();
         let axes = lenses
             .iter()
@@ -213,6 +227,10 @@ pub struct Controller {
     opts: Options,
     back: Option<Side>,
     front: Option<Side>,
+    /// The back side's macro lens, outside its zoom ladder.
+    macro_side: Option<Side>,
+    /// The macro lens streams for the back side.
+    macro_on: bool,
     facing: Facing,
     switch: SwitchController,
     capture: CaptureController,
@@ -243,6 +261,7 @@ impl Controller {
         let table = spec.resolve(cameras);
         let back = Side::new(&table, Facing::Back);
         let front = Side::new(&table, Facing::Front);
+        let macro_side = Side::macro_lens(&table);
         // The back camera, unless there's only a front one.
         let facing = if back.is_some() || front.is_none() {
             Facing::Back
@@ -254,6 +273,8 @@ impl Controller {
             opts,
             back,
             front,
+            macro_side,
+            macro_on: false,
             facing,
             switch: SwitchController::new(),
             capture: CaptureController::new(),
@@ -304,6 +325,8 @@ impl Controller {
         let table = spec.resolve(cameras);
         self.back = Side::new(&table, Facing::Back);
         self.front = Side::new(&table, Facing::Front);
+        self.macro_side = Side::macro_lens(&table);
+        self.macro_on &= self.macro_side.is_some();
         self.table = table;
         let table = &self.table;
         self.switch.remap(|id| table.index_of(id));
@@ -329,6 +352,7 @@ impl Controller {
 
     fn side(&self) -> Option<&Side> {
         match self.facing {
+            Facing::Back if self.macro_on => self.macro_side.as_ref(),
             Facing::Back => self.back.as_ref(),
             Facing::Front => self.front.as_ref(),
         }
@@ -336,6 +360,7 @@ impl Controller {
 
     fn side_mut(&mut self) -> Option<&mut Side> {
         match self.facing {
+            Facing::Back if self.macro_on => self.macro_side.as_mut(),
             Facing::Back => self.back.as_mut(),
             Facing::Front => self.front.as_mut(),
         }
@@ -351,6 +376,7 @@ impl Controller {
             })
             .unwrap_or((1.0, 1.0, 1.0));
         let presets = match self.facing {
+            Facing::Back if self.macro_on => &MACRO_PRESETS[..],
             Facing::Back => &BACK_PRESETS[..],
             Facing::Front => &FRONT_PRESETS[..],
         };
@@ -378,6 +404,8 @@ impl Controller {
             switching: self.switch.is_switching(),
             capturing: self.capture.is_busy(),
             can_flip: self.back.is_some() && self.front.is_some(),
+            can_macro: self.facing == Facing::Back && self.macro_side.is_some(),
+            macro_on: self.facing == Facing::Back && self.macro_on,
             last_switch: self.switch.last_switch_time(),
             exposure: self.exposure_view(),
             focus: self.focus.indicator(),
@@ -470,7 +498,9 @@ impl Controller {
         let Some(side) = self.side() else {
             return Some(t);
         };
-        if lens.role.faces_front() != (self.facing == Facing::Front) {
+        // A lens of another side (or the macro lens beside the ladder)
+        // shows its whole view.
+        if !side.lenses.contains(&i) {
             return Some(t);
         }
         let zoom = side.planner.zoom();
@@ -743,7 +773,11 @@ impl Controller {
         let before = back.lens();
         back.fallback = want;
         let after = back.lens();
-        if self.facing == Facing::Back && before != after && !self.capture.is_busy() {
+        if self.facing == Facing::Back
+            && !self.macro_on
+            && before != after
+            && !self.capture.is_busy()
+        {
             self.request_preview(now, out);
         }
     }
@@ -1023,7 +1057,29 @@ impl Controller {
             Facing::Back => Facing::Front,
             Facing::Front => Facing::Back,
         };
+        // The back side comes back with its zoom ladder.
+        self.macro_on = false;
         // Exposure doesn't carry between the two sides.
+        self.last_meta = None;
+        self.request_preview(now, &mut out);
+        out
+    }
+
+    /// Turn the macro lens on or off: on, it streams for the back side
+    /// instead of the zoom ladder's lens, at its own zoom. Not while
+    /// recording or taking a photo, nor on the front side.
+    pub fn toggle_macro(&mut self, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        if self.recording
+            || self.capture.is_busy()
+            || self.facing != Facing::Back
+            || self.macro_side.is_none()
+        {
+            return out;
+        }
+        self.macro_on = !self.macro_on;
+        // Another lens, nothing to carry over from the old one's focus.
+        self.focus.reset();
         self.last_meta = None;
         self.request_preview(now, &mut out);
         out
@@ -1204,6 +1260,7 @@ impl Controller {
         out: &mut Vec<Output>,
     ) {
         if self.facing != Facing::Back
+            || self.macro_on
             || self.recording
             || self.capture.is_busy()
             || self.switch.is_switching()
@@ -2185,6 +2242,108 @@ axis = [0.56, 0.48]
             c.reset_exposure()
         });
         assert_eq!(s, crate::backend::ExposureSettings::default());
+    }
+
+    /// The main, ultrawide and front cameras and a macro lens.
+    fn macro_controller() -> Controller {
+        let cam = |id: &str, location| CameraInfo {
+            id: id.into(),
+            location,
+            rotation: 90,
+            model: "sensor".into(),
+            autofocus: id == "main",
+            ..CameraInfo::default()
+        };
+        let cams = vec![
+            cam("macro", Location::Back),
+            cam("front", Location::Front),
+            cam("main", Location::Back),
+            cam("uw", Location::Back),
+        ];
+        let spec = TableSpec::parse(
+            r#"
+[[lens]]
+role = "main"
+id = "main"
+zoom = 1.0
+autofocus = true
+[[lens]]
+role = "ultrawide"
+id = "uw"
+zoom = 0.45
+[[lens]]
+role = "front"
+id = "front"
+zoom = 1.0
+[[lens]]
+role = "macro"
+id = "macro"
+zoom = 1.0
+preview = [1296, 970]
+still = [2592, 1940]
+"#,
+        )
+        .unwrap();
+        Controller::new(&spec, &cams, Options::default())
+    }
+
+    #[test]
+    fn the_macro_lens_is_turned_on_and_off_and_zooms_on_its_own() {
+        let now = Instant::now();
+        let mut c = macro_controller();
+        open(&mut c, now);
+        let v = c.view();
+        assert!(v.can_macro && !v.macro_on);
+        // Not on the zoom ladder: the widest zoom is the ultrawide's.
+        let (g, cam, _) = start_of(&c.set_zoom(0.45, ZoomSource::Preset, now));
+        assert_eq!(cam, "uw");
+        c.on_event(started(g, "uw"), now);
+        c.on_event(frame(g, "uw", 10_000), now);
+        let (g, cam, _) = start_of(&c.toggle_macro(now));
+        assert_eq!(cam, "macro");
+        c.on_event(started(g, "macro"), now);
+        c.on_event(frame(g, "macro", 10_000), now);
+        let v = c.view();
+        assert!(v.macro_on);
+        assert_eq!(v.presets, MACRO_PRESETS.to_vec());
+        assert_eq!(v.lens_role, Some(Role::Macro));
+        // Its zoom is a crop of its own frames, up to 4x.
+        assert!(commands(&c.set_zoom(8.0, ZoomSource::Preset, now)).is_empty());
+        assert_eq!(c.view().zoom, crate::lens::MACRO_MAX_ZOOM);
+        assert_eq!(c.transform("macro").unwrap().scale, 4.0);
+        // The ladder's lenses show their whole view meanwhile.
+        assert_eq!(c.transform("uw").unwrap().scale, 1.0);
+        // Off: back to the ladder at its zoom.
+        let (_, cam, _) = start_of(&c.toggle_macro(now));
+        assert_eq!(cam, "uw");
+        assert!(!c.view().macro_on);
+    }
+
+    #[test]
+    fn a_flip_leaves_the_macro_lens_and_the_front_has_none() {
+        let now = Instant::now();
+        let mut c = macro_controller();
+        open(&mut c, now);
+        let (g, cam, _) = start_of(&c.toggle_macro(now));
+        assert_eq!(cam, "macro");
+        c.on_event(started(g, "macro"), now);
+        let (g, cam, _) = start_of(&c.flip(now));
+        assert_eq!(cam, "front");
+        c.on_event(started(g, "front"), now);
+        let v = c.view();
+        assert!(!v.can_macro && !v.macro_on);
+        assert!(c.toggle_macro(now).is_empty());
+        let (_, cam, _) = start_of(&c.flip(now));
+        assert_eq!(cam, "main");
+    }
+
+    #[test]
+    fn without_a_macro_lens_there_is_nothing_to_turn_on() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        assert!(!c.view().can_macro);
+        assert!(c.toggle_macro(now).is_empty());
     }
 
     #[test]

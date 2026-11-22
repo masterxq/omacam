@@ -170,6 +170,8 @@ struct App {
     status_box: gtk::Box,
     shutter: gtk::Button,
     flip: gtk::Button,
+    /// Turns the macro lens on and off, beside the zoom pills.
+    macro_pill: gtk::Button,
     thumb: gtk::Button,
     thumb_picture: gtk::Image,
     debug: gtk::Label,
@@ -511,6 +513,11 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     let pills = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     pills.add_css_class("zoom-pills");
     pills.set_halign(gtk::Align::Center);
+    let macro_pill = gtk::Button::with_label("Macro");
+    macro_pill.add_css_class("zoom-pill");
+    macro_pill.add_css_class("turnable");
+    macro_pill.set_tooltip_text(Some("Macro lens: sharp a few centimeters away"));
+    macro_pill.set_visible(false);
 
     let thumb_picture = gtk::Image::from_icon_name("image-x-generic-symbolic");
     thumb_picture.set_pixel_size(22);
@@ -678,6 +685,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         status_box,
         shutter,
         flip,
+        macro_pill,
         thumb,
         thumb_picture,
         debug,
@@ -864,6 +872,7 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 app.zoom_released();
             }
             Step::Flip => app.flip.emit_clicked(),
+            Step::Macro => app.macro_pill.emit_clicked(),
             Step::Shutter => app.shutter.emit_clicked(),
             Step::Shot(path) => match app.shot_after_paint(path.clone()).await {
                 Ok(()) => tracing::info!(path = %path.display(), "window saved"),
@@ -1578,6 +1587,14 @@ impl App {
         self.lens_label.set_label(&view.lens_name);
         self.flip.set_visible(view.can_flip);
         self.flip.set_sensitive(!view.capturing);
+        self.macro_pill.set_visible(view.can_macro);
+        self.macro_pill
+            .set_sensitive(!view.capturing && !view.recording);
+        if view.macro_on {
+            self.macro_pill.add_css_class("active");
+        } else {
+            self.macro_pill.remove_css_class("active");
+        }
         if view.capturing {
             self.shutter.add_css_class("busy");
         } else {
@@ -1811,6 +1828,7 @@ impl App {
             self.pills.append(&b);
             buttons.push((p, b));
         }
+        self.pills.append(&self.macro_pill);
         *self.pill_buttons.borrow_mut() = buttons;
         *self.built_presets.borrow_mut() = presets.to_vec();
         // Slider marks at the presets.
@@ -2059,6 +2077,14 @@ impl App {
         self.flip.connect_clicked(move |_| {
             if let Some(a) = a.upgrade() {
                 if let Some(out) = a.with_controller(|c| c.flip(Instant::now())) {
+                    a.apply(out);
+                }
+            }
+        });
+        let a = Rc::downgrade(self);
+        self.macro_pill.connect_clicked(move |_| {
+            if let Some(a) = a.upgrade() {
+                if let Some(out) = a.with_controller(|c| c.toggle_macro(Instant::now())) {
                     a.apply(out);
                 }
             }

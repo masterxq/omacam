@@ -20,6 +20,10 @@ pub enum Role {
     Main,
     Tele,
     Front,
+    /// A back camera that focuses at a few centimeters only. It stays out
+    /// of the zoom ladder: the user turns it on and off
+    /// ([`crate::Controller::toggle_macro`]).
+    Macro,
 }
 
 impl Role {
@@ -200,6 +204,8 @@ pub const DEFAULT_MAX_ZOOM: f64 = 8.0;
 pub const DEFAULT_BASE_ISO: f64 = 50.0;
 /// Highest digital zoom of the front camera.
 pub const FRONT_MAX_ZOOM: f64 = 4.0;
+/// Highest digital zoom of the macro camera.
+pub const MACRO_MAX_ZOOM: f64 = 4.0;
 
 impl TableSpec {
     pub fn parse(text: &str) -> Result<TableSpec, TableError> {
@@ -396,9 +402,10 @@ impl LensTable {
     }
 
     /// The lenses of one side, ordered by zoom: the indices into
-    /// [`LensTable::lenses`].
+    /// [`LensTable::lenses`]. The macro lens isn't on it.
     pub fn ladder(&self, facing: Facing) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..self.lenses.len())
+            .filter(|&i| self.lenses[i].role != Role::Macro)
             .filter(|&i| (self.lenses[i].role == Role::Front) == (facing == Facing::Front))
             .collect();
         idx.sort_by(|&a, &b| self.lenses[a].zoom.total_cmp(&self.lenses[b].zoom));
@@ -658,5 +665,29 @@ mod tests {
         )
         .is_err());
         assert!(TableSpec::parse("[[lens]]\nrole = \"side\"\nid = \"a\"\nzoom = 1\n").is_err());
+    }
+
+    #[test]
+    fn the_lisbon_table_has_a_macro_lens_beside_the_ladder() {
+        let cam = |id: &str, location| CameraInfo {
+            id: id.into(),
+            location,
+            rotation: 270,
+            model: "sensor".into(),
+            ..CameraInfo::default()
+        };
+        let cams = vec![
+            cam("/base/soc/i2c@11009000/camera@22", Location::Back),
+            cam("/base/soc/i2c@11011000/camera@10", Location::Front),
+            cam("/base/soc/i2c@1101a000/camera@10", Location::Back),
+        ];
+        let t = TableSpec::builtin(&["motorola,lisbon", "mediatek,mt6785"]).resolve(&cams);
+        assert_eq!(t.lenses().len(), 3);
+        let m = t.get(t.by_role(Role::Macro).expect("macro"));
+        assert_eq!(m.id, "/base/soc/i2c@1101a000/camera@10");
+        assert!(!m.autofocus && !m.mirror);
+        assert_eq!(m.still, Some(Size::new(2592, 1940)));
+        let main = t.by_role(Role::Main).unwrap();
+        assert_eq!(t.ladder(Facing::Back), vec![main]);
     }
 }
