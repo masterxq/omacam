@@ -27,10 +27,11 @@ finds.
   down), HDR or 60 fps, the settings. Every launch starts them afresh:
   flash on auto, no timer, the full frame, the main camera at 1x, all
   manual values automatic.
-- Zoom and lenses apart: a row of zoom stages ("1×", "2×") of the lens in
-  use, the one showing now with the exact zoom; drag sideways across it
-  for a zoom dial, or pinch the picture (it rests a moment at 1x).
-  Zooming never changes the camera. The lens button beside the stages
+- Zoom and lenses apart: the zoom field shows the zoom of the lens in use
+  ("1.0×"); tap it (or drag across it) for the zoom dial, whose marks at
+  the lens's least and most zoom and at 1× go there with a tap, or pinch
+  the picture (it rests a moment at 1x). Each lens zooms as far as the
+  lens table says. Zooming never changes the camera. The lens button beside the stages
   shows the lens in use; tap it for the lenses, each with its symbol and
   name (Wide, Main, Tele, Macro), and the chosen lens's name shows over
   the picture for a moment. (The setting

@@ -30,6 +30,8 @@ pub struct Ladder {
     /// Each lens's zoom factor, ascending.
     factors: Vec<f64>,
     max: f64,
+    /// The zoom each lens shows while it is held: its lowest and highest.
+    limits: Vec<(f64, f64)>,
 }
 
 impl Ladder {
@@ -41,7 +43,32 @@ impl Ladder {
             "ladder factors must ascend"
         );
         let max = max.max(factors[factors.len() - 1]);
-        Ladder { factors, max }
+        let limits = factors.iter().map(|&f| (f, max)).collect();
+        Ladder {
+            factors,
+            max,
+            limits,
+        }
+    }
+
+    /// The zoom each lens shows while it is held, lowest and highest, in
+    /// the ladder's order (from the lens table; by default from the lens's
+    /// own view up to the ladder's most).
+    pub fn with_limits(mut self, limits: Vec<(f64, f64)>) -> Ladder {
+        assert_eq!(limits.len(), self.factors.len(), "a limit per lens");
+        self.limits = limits
+            .into_iter()
+            .zip(&self.factors)
+            .map(|((lo, hi), &f)| (lo.max(f), hi.max(lo.max(f))))
+            .collect();
+        // A lens may zoom further than the ladder's most.
+        self.max = self.limits.iter().fold(self.max, |m, l| m.max(l.1));
+        self
+    }
+
+    /// The lowest and highest zoom of a lens while it is held.
+    pub fn limits(&self, step: usize) -> (f64, f64) {
+        self.limits[step]
     }
 
     pub fn len(&self) -> usize {
@@ -168,9 +195,19 @@ impl ZoomPlanner {
     /// factor while the lens is held, else the widest lens's.
     pub fn floor(&self) -> f64 {
         if self.hold_lens {
-            self.ladder.factor(self.target)
+            self.ladder.limits(self.target).0
         } else {
             self.ladder.min()
+        }
+    }
+
+    /// The highest zoom a gesture reaches now: the chosen lens's while
+    /// it is held, else the ladder's.
+    pub fn ceiling(&self) -> f64 {
+        if self.hold_lens {
+            self.ladder.limits(self.target).1
+        } else {
+            self.ladder.max()
         }
     }
 
@@ -197,11 +234,15 @@ impl ZoomPlanner {
         match source {
             ZoomSource::Preset => {
                 self.pending_since = None;
-                self.retarget(self.ladder.natural(self.zoom))
+                let changed = self.retarget(self.ladder.natural(self.zoom));
+                if self.hold_lens {
+                    self.zoom = self.zoom.clamp(self.floor(), self.ceiling());
+                }
+                changed
             }
             ZoomSource::Gesture if self.hold_lens => {
-                // Within the chosen lens: never below its own view.
-                self.zoom = self.zoom.max(self.ladder.factor(self.target));
+                // Within the chosen lens and its limits.
+                self.zoom = self.zoom.clamp(self.floor(), self.ceiling());
                 self.pending_since = None;
                 None
             }

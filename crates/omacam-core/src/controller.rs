@@ -180,10 +180,13 @@ pub struct ViewState {
     /// The back's lenses to choose from (the macro lens last); empty on
     /// the front, and where the back has one lens.
     pub lenses: Vec<LensChoice>,
-    /// The zoom stages of the chosen lens ("1", "2"): the presets from its
-    /// own view up to the most it zooms, its own view first. While the
-    /// lens is held, a stage crops it; otherwise a stage may switch lens.
-    pub stages: Vec<f64>,
+    /// The highest zoom a gesture reaches now: the chosen lens's most
+    /// while the lens is held ([`Options::hold_lens`]), else `max_zoom`.
+    pub zoom_ceiling: f64,
+    /// What the zoom is shown relative to: the chosen lens's own view
+    /// while the lens is held (its zoom reads "1×" there), else the main
+    /// camera's (1).
+    pub zoom_unit: f64,
     /// The lens that is wanted for the current zoom.
     pub lens_role: Option<Role>,
     pub lens_name: String,
@@ -267,7 +270,16 @@ impl Side {
             return None;
         }
         let factors = lenses.iter().map(|&i| table.get(i).zoom).collect();
-        let ladder = Ladder::new(factors, max_zoom);
+        // Each lens's own limits, from its view; the side's most by default.
+        let limits = lenses
+            .iter()
+            .map(|&i| {
+                let l = table.get(i);
+                let hi = l.max_zoom.map_or(max_zoom, |m| l.zoom * m);
+                (l.zoom * l.min_zoom, hi)
+            })
+            .collect();
+        let ladder = Ladder::new(factors, max_zoom).with_limits(limits);
         let roles = lenses.iter().map(|&i| table.get(i).role).collect();
         let axes = lenses
             .iter()
@@ -521,7 +533,11 @@ impl Controller {
             presets: preset_values(presets, min_zoom, max_zoom),
             buttons: self.zoom_buttons(),
             lenses: self.lens_choices(),
-            stages: self.zoom_stages(),
+            zoom_ceiling: side.map(|s| s.planner.ceiling()).unwrap_or(max_zoom),
+            zoom_unit: side
+                .filter(|s| s.planner.holds_lens())
+                .map(|s| self.table.get(s.planned()).zoom)
+                .unwrap_or(1.0),
             lens_role: lens.map(|l| l.role),
             lens_name: lens.map(|l| l.name.clone()).unwrap_or_default(),
             switching: self.switch.is_switching(),
@@ -570,29 +586,6 @@ impl Controller {
                 active: Some(lens) == chosen,
             })
             .collect()
-    }
-
-    /// The zoom stages of the side in use: its presets from the floor (the
-    /// chosen lens's own view while it is held) up to its most.
-    fn zoom_stages(&self) -> Vec<f64> {
-        let Some(side) = self.side() else {
-            return Vec::new();
-        };
-        let presets = match self.facing {
-            Facing::Back if self.macro_on => &MACRO_PRESETS[..],
-            Facing::Back => &BACK_PRESETS[..],
-            Facing::Front => &FRONT_PRESETS[..],
-        };
-        let ladder = side.planner.ladder();
-        let floor = side.planner.floor();
-        let mut stages: Vec<f64> = preset_values(presets, ladder.min(), ladder.max())
-            .into_iter()
-            // Not one just above the lens's own view (5 over the
-            // telephoto's 4.78).
-            .filter(|&z| z > floor * 1.1)
-            .collect();
-        stages.insert(0, floor);
-        stages
     }
 
     /// The lens row: the presets of the side's ladder, each shown by the
@@ -935,32 +928,11 @@ impl Controller {
         out
     }
 
-    /// A zoom stage of the lens row. While the lens is held it crops the
-    /// chosen lens and never changes it; otherwise the stage's lens takes
-    /// over, as a preset does.
-    pub fn press_stage(&mut self, zoom: f64, now: Instant) -> Vec<Output> {
-        let mut out = Vec::new();
-        if self.busy() {
-            return out;
-        }
-        let changed = self.side_mut().and_then(|s| {
-            let source = if s.planner.holds_lens() {
-                ZoomSource::Gesture
-            } else {
-                ZoomSource::Preset
-            };
-            s.planner.set(zoom, source, now)
-        });
-        if changed.is_some() {
-            self.request_preview(now, &mut out);
-        }
-        out
-    }
-
     /// Choose a back lens from the lens menu ([`ViewState::lenses`]): it
     /// opens at its own view. The macro lens can't be chosen or left while
     /// recording; nor can any lens while taking a photo. Choosing the lens
-    /// in use does nothing.
+    /// in use does nothing. The lens opens at its own view (or the least
+    /// zoom the lens table gives it).
     pub fn choose_lens(&mut self, lens: usize, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         let Some(choice) = self.lens_choices().into_iter().find(|c| c.lens == lens) else {
@@ -979,9 +951,10 @@ impl Controller {
             self.focus.reset();
             self.last_meta = None;
         }
-        let factor = self.table.get(lens).zoom;
+        let l = self.table.get(lens);
+        let open = l.zoom * l.min_zoom;
         if let Some(s) = self.side_mut() {
-            s.planner.set(factor, ZoomSource::Preset, now);
+            s.planner.set(open, ZoomSource::Preset, now);
         }
         self.request_preview(now, &mut out);
         self.sync_light(&mut out);
@@ -2165,13 +2138,17 @@ mirror = true
     }
 
     #[test]
-    fn lenses_are_chosen_apart_from_the_zoom_stages() {
+    fn lenses_are_chosen_apart_from_the_zoom() {
         let now = Instant::now();
         let opts = Options {
             hold_lens: true,
             ..Options::default()
         };
-        let mut c = Controller::new(&spec(), &cameras(), opts);
+        // The telephoto zooms 2x at most of its own view, the main camera
+        // starts no wider than 1x.
+        let text = SPEC.replacen("zoom = 4.78", "zoom = 4.78\nmax_zoom = 2.0", 1);
+        let spec = TableSpec::parse(&text).unwrap();
+        let mut c = Controller::new(&spec, &cameras(), opts);
         let g = open(&mut c, now);
         let v = c.view();
         let roles: Vec<(Role, bool)> = v.lenses.iter().map(|l| (l.role, l.active)).collect();
@@ -2183,29 +2160,30 @@ mirror = true
                 (Role::Tele, false)
             ]
         );
-        assert_eq!(v.stages, vec![1.0, 2.0, 5.0]);
-        // A stage crops the main camera, even the telephoto's 5.
-        assert!(commands(&c.press_stage(5.0, now)).is_empty());
-        assert_eq!(c.view().zoom, 5.0);
+        assert_eq!((v.zoom_floor, v.zoom_unit), (1.0, 1.0));
+        // A zoom of 5 crops the main camera: zooming never switches.
+        assert!(commands(&c.set_zoom(5.0, ZoomSource::Gesture, now)).is_empty());
         assert_eq!(c.view().lens_role, Some(Role::Main));
-        // The ultrawide from the menu: its own view, its stages.
+        // The ultrawide from the menu: its own view, shown as 1x.
         let uw = v.lenses[0].lens;
         let (g2, cam, _) = start_of(&c.choose_lens(uw, now));
         assert!(g2 > g && cam == "uw", "{cam}");
         let v = c.view();
         assert!((v.zoom - 0.45).abs() < 1e-9 && v.lenses[0].active);
-        assert_eq!(v.stages, vec![0.45, 1.0, 2.0, 5.0]);
-        assert!(commands(&c.press_stage(2.0, now)).is_empty(), "no switch");
-        // The telephoto: one stage, its own view.
+        assert!((v.zoom / v.zoom_unit - 1.0).abs() < 1e-9);
+        // The telephoto: from its own view up to twice it, its table's.
         c.choose_lens(v.lenses[2].lens, now);
-        assert_eq!(c.view().stages, vec![4.78]);
+        let v = c.view();
+        assert!((v.zoom_floor - 4.78).abs() < 1e-9);
+        assert!((v.zoom_ceiling - 9.56).abs() < 1e-9, "{}", v.zoom_ceiling);
+        c.set_zoom(20.0, ZoomSource::Gesture, now);
+        assert!((c.view().zoom - 9.56).abs() < 1e-9);
         // The lens in use again: nothing.
         let tele = c.view().lenses[2].lens;
         assert!(c.choose_lens(tele, now).is_empty());
         // The front side has no lens menu.
         c.flip(now);
         assert!(c.view().lenses.is_empty());
-        assert_eq!(c.view().stages, vec![1.0, 2.0]);
     }
 
     #[test]

@@ -27,8 +27,15 @@
 #   exposure.
 # f_number, focal lengths: left out until measured.
 # autofocus: the S5K5E9 has a fixed focus, sharp at a few centimeters.
-# max_zoom: 4, where a crop of the 4624x3472 mode still keeps 1156x868.
-# bursts: false. The camera's pipeline merges a series of frames of its own
+# max_zoom: 10, the most of any lens (each lens's own below).
+# min_zoom/max_zoom of a lens: how far it zooms, relative to its own view
+#   (from 1 by default; up to the table's max_zoom). Generous, for the
+#   cameras as magnifiers, where seeing something matters more than detail:
+#   the main camera 1 to 10 (a 10x crop of the 4624x3472 still keeps
+#   462x347, of the 2304x1728 preview 230x173), the macro 1 to 8 (2592x1940
+#   still, 1296x970 preview: 324x242 and 162x121), the front 1 to 4.
+#   Nothing in omacam or the ISP limits the crop: it is the viewfinder's
+#   render transform and the photo's own crop of the full frame.# bursts: false. The camera's pipeline merges a series of frames of its own
 #   for each photo on the still stream, at an exposure of its own, and each
 #   of those frames takes about 1.2 s: the app's Night and HDR bursts never
 #   get the exposure they ask for. The camera's merge stands in for them;
@@ -51,7 +58,7 @@
 #   (175 mA), which only lights what is near, is worth its light.
 
 device = "lisbon"
-max_zoom = 4.0
+max_zoom = 10.0
 bursts = false
 
 [flash]
@@ -65,6 +72,7 @@ role = "main"
 name = "Main"
 id = "/base/soc/i2c@11009000/camera@22" # OmniVision OV64B40
 zoom = 1.0
+max_zoom = 10.0
 preview = [2304, 1728]
 still = [4624, 3472]
 video = [1920, 1080]
@@ -77,6 +85,7 @@ role = "front"
 name = "Front"
 id = "/base/soc/i2c@11011000/camera@10" # OmniVision OV16A1Q
 zoom = 1.0
+max_zoom = 4.0
 preview = [2304, 1728]
 still = [2304, 1728]
 coverage = [1.0, 1.0]
@@ -89,6 +98,7 @@ role = "macro"
 name = "Macro"
 id = "/base/soc/i2c@1101a000/camera@10" # Samsung S5K5E9
 zoom = 1.0
+max_zoom = 8.0
 preview = [1296, 970]
 still = [2592, 1940]
 coverage = [1.0, 1.0]

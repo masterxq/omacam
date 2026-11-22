@@ -109,8 +109,9 @@ rather than taking it).
      flip; wait 3; flip; wait 3; shutter; wait 4; quit"
   ```
 
-  Steps: `wait SECONDS`, `zoom Z` (a preset), `pinch Z`, `lens Z` (the
-  lens row's zoom stage), `dial Z` (the zoom dial), `camera
+  Steps: `wait SECONDS`, `zoom Z` (a preset), `pinch Z`, `zoom-field`
+  (opens the zoom dial), `mark Z` (a tap on the dial's mark Z, relative to
+  the lens), `dial Z` (the zoom dial), `camera
   main|macro|wide|tele` and `lens-menu` (the lens menu), `flip`, `macro`
   (the macro lens, or back to the main one), `shutter`, `tap U V` (a tap on the picture), `settings PAGE`
   (photo, video, advanced), `close-settings`, `mode`, `manual on|off`,

@@ -251,18 +251,21 @@ picture.
   the main camera at 1x, all automatic): what stays across launches is
   what the gear's sheet sets. Within a run, leaving the app and coming
   back keeps them all; only a tapped point is given up.
-- **Lens row** (`lensrow.rs`): the zoom stages of the chosen lens
-  (`ViewState::stages`: the presets from its own view up to the most it
-  zooms, "1×", "2×"), the one in use with the exact zoom. A stage only
-  zooms (`Controller::press_stage`): it crops the chosen lens. Dragging
-  sideways across the stages shows the zoom dial (`dial.rs`) in their
-  place, a ruler of zoom values under a marker, stages labeled, with a
-  light detent at each. Beside the stages the lens button, a ring with
+- **Lens row** (`lensrow.rs`): the zoom field, the zoom of the chosen
+  lens relative to its own view (`ViewState::zoom_unit`), "1.0×". A tap
+  on it, or a sideways drag across it, shows the zoom dial (`dial.rs`) in
+  its place, a ruler of zoom values under a marker with the lens's limits
+  and its 1× marked, a light detent at each and a tap on a mark going
+  there; the dial closes 2.5 s after the last touch or at a tap
+  elsewhere. Its writing turns with the phone. Zooming crops the chosen
+  lens within its limits (`min_zoom`/`max_zoom` per lens in the lens
+  table, relative to its own view; by default from its view up to the
+  table's `max_zoom`), never changing it. Beside the stages the lens button, a ring with
   the chosen lens's symbol (`ViewState::lenses`); a tap drops the lens
   menu over the row, each back lens with its symbol and name, and a
   choice (`Controller::choose_lens`) opens that lens at its own view and
   shows its name over the picture for a moment. The macro lens is one of
-  them. At the row's end the adjust button for the manual controls.
+  them. A pinch shows its zoom in the zoom field, not over the picture. At the row's end the adjust button for the manual controls.
 - **Mode bar** (`modebar.rs`): one line, Night (where the lens table
   allows bursts), Photo, Video; a tap or a swipe chooses, and the line
   slides so the chosen mode sits in the middle.

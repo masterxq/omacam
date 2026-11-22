@@ -1,8 +1,10 @@
 //! The zoom dial: a ruler of zoom values under a fixed marker, shown in
-//! place of the lens buttons while a finger drags across them. Values grow
-//! to the right on a logarithmic scale, so dragging the ruler to the left
-//! zooms in; the zoom stages are marked and labeled, the current value is
-//! written over the marker.
+//! place of the zoom field when it is tapped or dragged. Values grow to the
+//! right on a logarithmic scale, so dragging the ruler to the left zooms
+//! in; the lens's limits and its 1× are marked and labeled, and a tap on a
+//! mark goes there; the current value is written over the marker. Values
+//! are written relative to a unit (the lens's own view), and the writing
+//! turns with the phone.
 
 use std::cell::{Cell, RefCell};
 
@@ -36,6 +38,10 @@ mod imp {
         pub value: Cell<f64>,
         pub range: Cell<(f64, f64)>,
         pub stops: RefCell<Vec<f64>>,
+        /// What the written values are relative to.
+        pub unit: Cell<f64>,
+        /// Clockwise degrees the phone is turned (the writing turns back).
+        pub turn: Cell<u32>,
     }
 
     #[glib::object_subclass]
@@ -51,11 +57,22 @@ mod imp {
 
     impl ObjectImpl for ZoomDial {}
 
+    impl ZoomDial {
+        pub fn unit(&self) -> f64 {
+            let u = self.unit.get();
+            if u > 0.0 {
+                u
+            } else {
+                1.0
+            }
+        }
+    }
+
     impl WidgetImpl for ZoomDial {
         fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
             match orientation {
                 gtk::Orientation::Horizontal => (120, 320, -1, -1),
-                _ => (56, 56, -1, -1),
+                _ => (64, 64, -1, -1),
             }
         }
 
@@ -100,10 +117,17 @@ mod imp {
                     &white(0.9),
                     &graphene::Rect::new(x - 1.0, base - 14.0, 2.0, 14.0),
                 );
-                let layout = widget.create_pango_layout(Some(&crate::app::stage_label(s)));
-                let (lw, _) = layout.pixel_size();
+                // At the marker the readout says it already.
+                if (x - cx).abs() < 30.0 {
+                    continue;
+                }
+                let layout =
+                    widget.create_pango_layout(Some(&crate::app::stage_label(s / self.unit())));
+                let (lw, lh) = layout.pixel_size();
                 snapshot.save();
-                snapshot.translate(&graphene::Point::new(x - lw as f32 / 2.0, base - 32.0));
+                snapshot.translate(&graphene::Point::new(x, base - 32.0 + lh as f32 / 2.0));
+                snapshot.rotate(-(self.turn.get() as f32));
+                snapshot.translate(&graphene::Point::new(-lw as f32 / 2.0, -lh as f32 / 2.0));
                 snapshot.append_layout(&layout, &white(0.85));
                 snapshot.restore();
             }
@@ -114,19 +138,29 @@ mod imp {
                 &accent,
                 &graphene::Rect::new(cx - 1.5, base - 22.0, 3.0, 26.0),
             );
-            let layout = widget.create_pango_layout(Some(&crate::app::format_zoom(value)));
+            let layout =
+                widget.create_pango_layout(Some(&crate::app::format_zoom(value / self.unit())));
             let mut font = gtk::pango::FontDescription::new();
             font.set_weight(gtk::pango::Weight::Bold);
             font.set_size(13 * gtk::pango::SCALE);
             layout.set_font_description(Some(&font));
             let (lw, lh) = layout.pixel_size();
-            let (bx, by) = (cx - lw as f32 / 2.0 - 8.0, 0.0);
-            let bounds = graphene::Rect::new(bx, by, lw as f32 + 16.0, lh as f32 + 4.0);
+            // Turned a quarter, the readout stands as tall as it is wide.
+            let turned = self.turn.get() % 180 == 90;
+            let (bw, bh) = if turned {
+                (lh as f32 + 4.0, lw as f32 + 16.0)
+            } else {
+                (lw as f32 + 16.0, lh as f32 + 4.0)
+            };
+            let (bx, by) = (cx - bw / 2.0, 0.0);
+            let bounds = graphene::Rect::new(bx, by, bw, bh);
             snapshot.push_rounded_clip(&gtk::gsk::RoundedRect::from_rect(bounds, 10.0));
             snapshot.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.55), &bounds);
             snapshot.pop();
             snapshot.save();
-            snapshot.translate(&graphene::Point::new(bx + 8.0, by + 2.0));
+            snapshot.translate(&graphene::Point::new(bx + bw / 2.0, by + bh / 2.0));
+            snapshot.rotate(-(self.turn.get() as f32));
+            snapshot.translate(&graphene::Point::new(-lw as f32 / 2.0, -lh as f32 / 2.0));
             snapshot.append_layout(&layout, &accent);
             snapshot.restore();
         }
@@ -150,17 +184,52 @@ impl ZoomDial {
         glib::Object::builder().property("hexpand", true).build()
     }
 
-    /// The value, the range it can take and the stages to mark.
-    pub fn set(&self, value: f64, range: (f64, f64), stops: &[f64]) {
+    /// The value, the range it can take, the values to mark, and what the
+    /// written values are relative to.
+    pub fn set(&self, value: f64, range: (f64, f64), stops: &[f64], unit: f64) {
         let imp = self.imp();
         let changed = imp.value.replace(value) != value
             || imp.range.replace(range) != range
+            || imp.unit.replace(unit) != unit
             || *imp.stops.borrow() != stops;
         if changed {
             imp.stops.replace(stops.to_vec());
             self.queue_draw();
         }
     }
+
+    /// How the phone is held, clockwise degrees: the writing turns back.
+    pub fn set_turn(&self, degrees: u32) {
+        if self.imp().turn.replace(degrees) != degrees {
+            self.queue_draw();
+        }
+    }
+
+    /// The mark at `x` (widget coordinates), if one is near.
+    pub fn mark_at(&self, x: f64) -> Option<f64> {
+        let imp = self.imp();
+        let (lo, hi) = imp.range.get();
+        let value = imp.value.get().clamp(lo, hi);
+        let cx = self.width() as f64 / 2.0;
+        mark_near(x, cx, value, &imp.stops.borrow())
+    }
+}
+
+/// The value of the mark nearest to `x` within reach of a finger, on a
+/// ruler whose marker at `cx` stands at `value`.
+fn mark_near(x: f64, cx: f64, value: f64, stops: &[f64]) -> Option<f64> {
+    const REACH: f64 = 28.0;
+    stops
+        .iter()
+        .map(|&s| {
+            (
+                s,
+                (cx + (s.log2() - value.log2()) * PX_PER_DOUBLING - x).abs(),
+            )
+        })
+        .filter(|&(_, d)| d <= REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(s, _)| s)
 }
 
 #[cfg(test)]
@@ -172,6 +241,21 @@ mod tests {
         assert_eq!(zoom_after_drag(1.0, 0.0), 1.0);
         assert!((zoom_after_drag(1.0, -PX_PER_DOUBLING) - 2.0).abs() < 1e-9);
         assert!((zoom_after_drag(2.0, PX_PER_DOUBLING) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_tap_near_a_mark_finds_it() {
+        // At 2x in the middle of a 300 wide dial, 1x lies a doubling left.
+        let stops = [1.0, 4.0];
+        assert_eq!(
+            mark_near(150.0 - PX_PER_DOUBLING + 10.0, 150.0, 2.0, &stops),
+            Some(1.0)
+        );
+        assert_eq!(
+            mark_near(150.0 + PX_PER_DOUBLING, 150.0, 2.0, &stops),
+            Some(4.0)
+        );
+        assert_eq!(mark_near(150.0, 150.0, 2.0, &stops), None);
     }
 
     #[test]

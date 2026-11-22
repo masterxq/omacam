@@ -52,6 +52,11 @@ pub struct Lens {
     /// for instead of the preview (the frames feed the viewfinder and the
     /// recording alike). None: video records the preview's frames.
     pub video: Option<Size>,
+    /// How far the lens zooms, relative to its own view: from `min_zoom`
+    /// (1 unless the table says) up to `max_zoom` (None: as far as the
+    /// table's `max_zoom` for the whole side reaches).
+    pub min_zoom: f64,
+    pub max_zoom: Option<f64>,
     /// Table says it focuses, and the camera has autofocus.
     pub autofocus: bool,
     pub af_windows: bool,
@@ -173,6 +178,9 @@ struct LensEntry {
     preview: Option<[u32; 2]>,
     still: Option<[u32; 2]>,
     video: Option<[u32; 2]>,
+    /// Zoom limits relative to the lens's own view.
+    min_zoom: Option<f64>,
+    max_zoom: Option<f64>,
     #[serde(default)]
     autofocus: bool,
     #[serde(default)]
@@ -232,6 +240,16 @@ impl TableSpec {
         for e in &file.lenses {
             if !(e.zoom.is_finite() && e.zoom > 0.0) {
                 return Err(TableError::Invalid(format!("{}: zoom must be > 0", e.id)));
+            }
+            let lo = e.min_zoom.unwrap_or(1.0);
+            if !(lo.is_finite()
+                && lo >= 1.0
+                && e.max_zoom.is_none_or(|hi| hi.is_finite() && hi >= lo))
+            {
+                return Err(TableError::Invalid(format!(
+                    "{}: min_zoom must be >= 1 and max_zoom at least min_zoom",
+                    e.id
+                )));
             }
             let unit = |v: Option<[f64; 2]>, lo: f64| {
                 v.is_none_or(|[a, b]| {
@@ -368,6 +386,8 @@ impl TableSpec {
                     preview: e.preview.map(|[w, h]| Size::new(w, h)),
                     still: e.still.map(|[w, h]| Size::new(w, h)),
                     video: e.video.map(|[w, h]| Size::new(w, h)),
+                    min_zoom: e.min_zoom.unwrap_or(1.0),
+                    max_zoom: e.max_zoom,
                     autofocus: e.autofocus && cam.autofocus,
                     af_windows: cam.af_windows,
                     crop_maximum: cam.crop_maximum,
@@ -409,6 +429,8 @@ impl TableSpec {
                 preview: None,
                 still: None,
                 video: None,
+                min_zoom: 1.0,
+                max_zoom: None,
                 autofocus: cam.autofocus,
                 af_windows: cam.af_windows,
                 crop_maximum: cam.crop_maximum,
@@ -586,7 +608,7 @@ mod tests {
         assert_eq!(main.shown_coverage(), (1.0, 1.0));
         let front = t.get(t.by_role(Role::Front).expect("front"));
         assert!(front.mirror && !front.autofocus);
-        assert_eq!(t.max_zoom(Facing::Back), 4.0);
+        assert_eq!(t.max_zoom(Facing::Back), 10.0);
         // Its camera merges a series of frames for each photo itself.
         assert!(!t.bursts());
     }

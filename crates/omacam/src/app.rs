@@ -54,16 +54,10 @@ window.omacam, window.omacam viewfinder { background: black; }
   padding: 6px 12px 16px 12px;
   background: linear-gradient(to top, rgba(0,0,0,0.6), rgba(0,0,0,0.25));
 }
-.lens-pill { background: rgba(0,0,0,0.45); border-radius: 999px; padding: 3px; }
-.lens-button {
-  min-width: 38px; min-height: 38px; padding: 0; margin: 2px; border-radius: 999px;
-  background: rgba(255,255,255,0.10); color: white; box-shadow: none;
-  font-size: 12px; font-weight: bold;
-}
-.lens-button.stage { background: transparent; }
-.lens-button.active {
-  min-width: 46px; min-height: 46px; margin: 0;
-  background: rgba(255,255,255,0.24); color: var(--accent-color); font-size: 14px;
+.zoom-field {
+  min-width: 52px; min-height: 44px; padding: 0 4px; border-radius: 14px;
+  background: rgba(0,0,0,0.45); color: var(--accent-color); box-shadow: none;
+  font-size: 15px; font-weight: bold; font-feature-settings: "tnum";
 }
 .lens-choice {
   min-width: 44px; min-height: 44px; padding: 0; border-radius: 999px;
@@ -1002,6 +996,14 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         w.add_css_class("turnable");
     }
     app.turn_controls();
+    {
+        let a = Rc::downgrade(&app);
+        app.turned.connect_turn(move |_| {
+            if let Some(a) = a.upgrade() {
+                a.turn_controls();
+            }
+        });
+    }
     app.location_setting_changed();
     {
         let a = Rc::downgrade(&app);
@@ -1078,7 +1080,16 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 app.zoom_to(z, ZoomSource::Gesture);
                 app.zoom_released();
             }
-            Step::Lens(z) => app.lens_event(LensEvent::Stage(z)),
+            Step::ZoomField => app.lens_row.zoom_field.emit_clicked(),
+            Step::Mark(z) => {
+                let unit = app
+                    .controller
+                    .borrow()
+                    .as_ref()
+                    .map_or(1.0, |c| c.view().zoom_unit);
+                app.lens_event(LensEvent::Drag(z * unit));
+                app.lens_event(LensEvent::Released);
+            }
             Step::Dial(z) => {
                 app.lens_row.show_dial();
                 app.lens_event(LensEvent::Drag(z));
@@ -2166,7 +2177,6 @@ impl App {
         if let Some(out) = self.with_controller(|c| c.set_zoom(zoom, source, now)) {
             self.apply(out);
         }
-        self.flash_zoom();
     }
 
     fn zoom_released(self: &Rc<Self>) {
@@ -2175,19 +2185,8 @@ impl App {
         }
     }
 
-    /// Show the zoom readout for a moment.
-    fn flash_zoom(self: &Rc<Self>) {
-        let zoom = self
-            .controller
-            .borrow()
-            .as_ref()
-            .map(|c| c.view().zoom)
-            .unwrap_or(1.0);
-        self.flash_note(&format_zoom(zoom));
-    }
-
-    /// Show a word over the middle of the picture for a moment (the zoom,
-    /// a lens's name).
+    /// Show a word over the middle of the picture for a moment (a lens's
+    /// name).
     fn flash_note(self: &Rc<Self>, text: &str) {
         self.zoom_indicator.set_label(text);
         self.zoom_indicator.set_visible(true);
@@ -2216,23 +2215,17 @@ impl App {
     /// Close the menus over the picture; whether one was open.
     fn close_menus(&self) -> bool {
         let menus = [&self.flash_menu, &self.aspect_menu, &self.lens_row.menu];
-        let open = menus.iter().any(|m| m.reveals_child());
+        let open = menus.iter().any(|m| m.reveals_child()) | self.lens_row.hide_dial();
         for m in menus {
             m.set_reveal_child(false);
         }
         open
     }
 
-    /// The lens row: a stage, a lens from the menu, the dial.
+    /// The lens row: a lens from the menu, the dial.
     fn lens_event(self: &Rc<Self>, e: LensEvent) {
         let now = Instant::now();
         match e {
-            LensEvent::Stage(z) => {
-                if let Some(out) = self.with_controller(|c| c.press_stage(z, now)) {
-                    self.apply(out);
-                }
-                self.flash_zoom();
-            }
             LensEvent::Lens(lens) => {
                 if let Some(out) = self.with_controller(|c| c.choose_lens(lens, now)) {
                     self.apply(out);
@@ -2669,11 +2662,19 @@ impl App {
     /// below. The banners over the top of the picture (recording time,
     /// AE/AF lock, low light) move to the edge that is up, along it.
     fn turn_controls(&self) {
-        let turn = self.held.get().degrees();
-        self.turned.set_held(turn);
+        let held = self.held.get().degrees();
+        self.turned.set_held(held);
+        // A landscape window says the phone is sideways even where the
+        // accelerometer can't be had: then the layout's turn stands in.
+        let turn = if held.is_multiple_of(180) && self.turned.turn() != 0 {
+            self.turned.turn()
+        } else {
+            held
+        };
         // No words on their side: the modes' names only upright, the
         // line of manual values only then too.
         self.mode_bar.set_named(turn == 0);
+        self.lens_row.set_turn(turn);
         self.manual_hint
             .set_visible(turn == 0 && self.manual_hint.is_visible());
         let old = self.controls_turn.replace(turn);

@@ -23,6 +23,8 @@ use gtk::subclass::prelude::*;
 use gtk::{glib, graphene, gsk};
 use gtk4 as gtk;
 
+type OnTurn = Box<dyn Fn(u32)>;
+
 mod imp {
     use super::*;
 
@@ -34,6 +36,8 @@ mod imp {
         pub quarter: Cell<u32>,
         /// The turn of the last layout (0 in a portrait window).
         pub applied: Cell<u32>,
+        /// Called (from the main loop) when the turn of the layout changes.
+        pub on_turn: std::cell::RefCell<Option<OnTurn>>,
     }
 
     #[glib::object_subclass]
@@ -77,7 +81,16 @@ mod imp {
             } else {
                 0
             };
-            self.applied.set(turn);
+            if self.applied.replace(turn) != turn {
+                let obj = self.obj().downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(t) = obj.upgrade() {
+                        if let Some(f) = t.imp().on_turn.borrow().as_ref() {
+                            f(t.imp().applied.get());
+                        }
+                    }
+                });
+            }
             let (cw, ch) = if turn == 0 {
                 (width, height)
             } else {
@@ -140,6 +153,11 @@ impl Turned {
         if (degrees == 90 || degrees == 270) && self.imp().quarter.replace(degrees) != degrees {
             self.queue_allocate();
         }
+    }
+
+    /// Call `f` with the layout's turn whenever it changes.
+    pub fn connect_turn(&self, f: impl Fn(u32) + 'static) {
+        self.imp().on_turn.replace(Some(Box::new(f)));
     }
 
     /// The turn of the last layout: 0, 90 or 270.

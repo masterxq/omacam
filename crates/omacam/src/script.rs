@@ -2,8 +2,9 @@
 //! `--script "wait 3; zoom 5; wait 2; shot /tmp/tele.png; quit"`.
 //!
 //! Steps: `wait SECONDS`, `zoom Z` (as a preset button), `pinch Z` (as a
-//! pinch that ends at Z), `lens Z` (the lens row's zoom stage for Z),
-//! `dial Z` (the zoom dial, dragged to Z), `camera main|macro|wide|tele`
+//! pinch that ends at Z), `zoom-field` (a tap on the zoom field: the
+//! dial opens), `mark Z` (a tap on the dial's mark Z, relative to the lens's
+//! own view), `dial Z` (the zoom dial, dragged to Z), `camera main|macro|wide|tele`
 //! (a lens from the lens menu), `lens-menu` (open it), `flip`, `macro`
 //! (the macro lens from the menu, or back to the main camera),
 //! `shutter`, `tap U V` (a tap on the picture), `settings PAGE` and
@@ -47,8 +48,10 @@ pub enum Step {
     Mode(String),
     /// The HDR chip.
     Hdr(bool),
-    /// The lens row's zoom stage for this zoom.
-    Lens(f64),
+    /// A tap on the zoom field (the dial opens).
+    ZoomField,
+    /// A tap on the dial's mark for this zoom, relative to the lens.
+    Mark(f64),
     /// The zoom dial, as if dragged to this zoom.
     Dial(f64),
     /// Open or close the manual controls.
@@ -124,7 +127,8 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
             "close-settings" => Step::CloseSettings,
             "mode" if matches!(arg, "night" | "photo" | "video") => Step::Mode(arg.into()),
             "hdr" if arg == "on" || arg == "off" => Step::Hdr(arg == "on"),
-            "lens" => Step::Lens(number()?),
+            "zoom-field" => Step::ZoomField,
+            "mark" => Step::Mark(number()?),
             "dial" => Step::Dial(number()?),
             "pro" | "manual" if arg == "on" || arg == "off" => Step::Pro(arg == "on"),
             "pro-edit" | "manual-edit"
@@ -216,13 +220,17 @@ mod tests {
         );
         assert_eq!(parse("tap 0.25 0.75").unwrap(), vec![Step::Tap(0.25, 0.75)]);
         assert_eq!(
-            parse("manual on; manual-edit focus; focus 0.3; iso auto; lens 2; dial 1.5").unwrap(),
+            parse(
+                "manual on; manual-edit focus; focus 0.3; iso auto; zoom-field; mark 2; dial 1.5"
+            )
+            .unwrap(),
             vec![
                 Step::Pro(true),
                 Step::ProEdit("focus".into()),
                 Step::Focus(Some(0.3)),
                 Step::Iso(None),
-                Step::Lens(2.0),
+                Step::ZoomField,
+                Step::Mark(2.0),
                 Step::Dial(1.5),
             ]
         );

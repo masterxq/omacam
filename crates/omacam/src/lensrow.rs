@@ -1,14 +1,14 @@
-//! The lens row above the mode bar: the zoom stages of the chosen lens
-//! ("1×", "2×"), the lens button beside them, and the adjust button at the
-//! end.
+//! The lens row above the mode bar: the zoom field, the lens button
+//! beside it, and the adjust button at the end.
 //!
-//! The stages only zoom: a tap goes to a stage, the button showing now
-//! carries the exact zoom ("1.4×"), and dragging sideways across them
-//! turns the row into the zoom dial ([`crate::dial`]) for a stepless zoom;
-//! the dial stays a moment after the finger lifts and can be dragged
-//! again. The lens changes only through the lens button: it shows the
-//! lens in use, and a tap drops the lens menu down (up, here) over the
-//! row, each lens with its symbol and its name.
+//! The zoom field shows the zoom of the lens in use ("1.0×"). A tap on it,
+//! or a sideways drag across it, opens the zoom dial ([`crate::dial`]) in
+//! its place: drag it for a stepless zoom, or tap one of its marks (the
+//! lens's least and most zoom, and 1×) to go there. The dial closes a
+//! moment after the last touch, or at a tap elsewhere. Zooming never
+//! changes the lens: the lens button does. It shows the lens in use, and a
+//! tap drops the lens menu down (up, here) over the row, each lens with
+//! its symbol and its name.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -21,19 +21,16 @@ use gtk4 as gtk;
 use omacam_core::controller::LensChoice;
 use omacam_core::lens::Role;
 
-use crate::app::{format_zoom, stage_label};
 use crate::dial::{self, ZoomDial};
 
-/// How long the dial stays after the finger lifts.
-const DIAL_STAYS: Duration = Duration::from_millis(1500);
+/// How long the dial stays after the last touch.
+const DIAL_STAYS: Duration = Duration::from_millis(2500);
 /// How far a finger moves sideways before a drag becomes a zoom.
 const DRAG_START: f64 = 10.0;
 
 /// What the user did in the row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LensEvent {
-    /// A zoom stage: its zoom.
-    Stage(f64),
     /// A lens from the lens menu (its index in the lens table).
     Lens(usize),
     /// The dial moved to this zoom.
@@ -66,8 +63,8 @@ pub fn lens_name(role: Role) -> &'static str {
 
 pub struct LensRow {
     pub root: gtk::Stack,
-    pill: gtk::Box,
-    stages: RefCell<Vec<(f64, gtk::Button)>>,
+    /// Shows the zoom; a tap opens the dial.
+    pub zoom_field: gtk::Button,
     /// Shows the lens in use; a tap opens [`LensRow::menu`].
     pub lens_button: gtk::Button,
     lens_icon: gtk::Image,
@@ -89,9 +86,11 @@ pub struct LensRow {
 
 impl LensRow {
     pub fn new(on_event: impl Fn(LensEvent) + 'static) -> Rc<LensRow> {
-        let pill = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        pill.add_css_class("lens-pill");
-        pill.set_valign(gtk::Align::Center);
+        let zoom_field = gtk::Button::with_label("1.0×");
+        zoom_field.add_css_class("zoom-field");
+        zoom_field.add_css_class("turnable");
+        zoom_field.set_tooltip_text(Some("Zoom"));
+        zoom_field.set_valign(gtk::Align::Center);
         let lens_icon = gtk::Image::from_icon_name(lens_icon(Role::Main));
         let lens_button = gtk::Button::new();
         lens_button.set_child(Some(&lens_icon));
@@ -102,7 +101,7 @@ impl LensRow {
         lens_button.set_size_request(44, 44);
         lens_button.set_visible(false);
         let group = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        group.append(&pill);
+        group.append(&zoom_field);
         group.append(&lens_button);
         let adjust = gtk::ToggleButton::new();
         adjust.set_icon_name("omacam-adjust-symbolic");
@@ -111,8 +110,8 @@ impl LensRow {
         adjust.add_css_class("turnable");
         adjust.set_valign(gtk::Align::Center);
         adjust.set_size_request(44, 44);
-        // As wide as the adjust button at the start, so the stages and the
-        // lens button stay in the middle.
+        // As wide as the adjust button at the start, so the zoom field and
+        // the lens button stay in the middle.
         let balance = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         balance.set_size_request(44, -1);
         let row = gtk::CenterBox::new();
@@ -137,8 +136,7 @@ impl LensRow {
             .build();
         let lr = Rc::new(LensRow {
             root,
-            pill,
-            stages: RefCell::new(Vec::new()),
+            zoom_field,
             lens_button,
             lens_icon,
             menu,
@@ -159,11 +157,50 @@ impl LensRow {
                 lr.menu.set_reveal_child(!lr.menu.reveals_child());
             }
         });
+        let weak = Rc::downgrade(&lr);
+        lr.zoom_field.connect_clicked(move |_| {
+            if let Some(lr) = weak.upgrade() {
+                lr.show_dial();
+                lr.hide_dial_later();
+            }
+        });
+        // A tap on one of the dial's marks goes there.
+        let tap = gtk::GestureClick::new();
+        let weak = Rc::downgrade(&lr);
+        tap.connect_released(move |_, _, x, _| {
+            let Some(lr) = weak.upgrade() else { return };
+            if let Some(z) = lr.dial.mark_at(x) {
+                (lr.on_event)(LensEvent::Drag(z));
+                (lr.on_event)(LensEvent::Released);
+            }
+            lr.hide_dial_later();
+        });
+        lr.dial.add_controller(tap);
         lr.connect_drag();
         lr
     }
 
-    /// A sideways drag that starts on the stages or the dial zooms.
+    /// The dial is open.
+    pub fn dial_open(&self) -> bool {
+        self.root.visible_child_name().as_deref() == Some("dial")
+    }
+
+    /// Close the dial at once (a tap elsewhere); whether it was open.
+    pub fn hide_dial(&self) -> bool {
+        if let Some(id) = self.hide.borrow_mut().take() {
+            id.remove();
+        }
+        let open = self.dial_open();
+        self.root.set_visible_child_name("row");
+        open
+    }
+
+    /// Hold the dial's writing upright for a phone turned so.
+    pub fn set_turn(&self, degrees: u32) {
+        self.dial.set_turn(degrees);
+    }
+
+    /// A sideways drag that starts on the zoom field or the dial zooms.
     fn connect_drag(self: &Rc<Self>) {
         let drag = gtk::GestureDrag::new();
         drag.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -172,7 +209,7 @@ impl LensRow {
             let Some(lr) = lr.upgrade() else { return };
             let on_dial = lr.root.visible_child_name().as_deref() == Some("dial");
             let on_pill = lr
-                .pill
+                .zoom_field
                 .compute_bounds(&lr.root)
                 .is_some_and(|b| b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)));
             if !on_dial && !on_pill {
@@ -235,7 +272,7 @@ impl LensRow {
         *self.hide.borrow_mut() = Some(id);
     }
 
-    /// Bring the row in line with the controller's view: the stages, the
+    /// Bring the row in line with the controller's view: the zoom, the
     /// one showing now with the zoom, the lens button and its menu, the
     /// dial's range.
     pub fn update(
@@ -244,27 +281,15 @@ impl LensRow {
         lens_sensitive: bool,
         sensitive: bool,
     ) {
-        let (zoom, floor, max) = (view.zoom, view.zoom_floor, view.max_zoom);
-        let same = {
-            let built = self.stages.borrow();
-            built.len() == view.stages.len()
-                && built.iter().zip(&view.stages).all(|((a, _), b)| a == b)
+        let (zoom, floor, max) = (view.zoom, view.zoom_floor, view.zoom_ceiling);
+        let unit = if view.zoom_unit > 0.0 {
+            view.zoom_unit
+        } else {
+            1.0
         };
-        if !same {
-            self.build_stages(&view.stages);
-        }
-        // The highest stage at or below the zoom shows it.
-        let active = view.stages.iter().rposition(|&s| s <= zoom + 1e-6);
-        for (i, (stage, b)) in self.stages.borrow().iter().enumerate() {
-            if Some(i) == active {
-                b.add_css_class("active");
-                b.set_label(&format_zoom(zoom));
-            } else {
-                b.remove_css_class("active");
-                b.set_label(&stage_label(*stage));
-            }
-            b.set_sensitive(sensitive);
-        }
+        self.zoom_field
+            .set_label(&format!("{:.1}×", (zoom / unit * 10.0).round() / 10.0));
+        self.zoom_field.set_sensitive(sensitive);
         // The lens button and its menu.
         let same = {
             let built = self.choices.borrow();
@@ -303,32 +328,13 @@ impl LensRow {
             built.0 = *now;
         }
         self.range.set((zoom, floor, max));
-        // The dial marks the stages within its range.
-        let mut stops: Vec<f64> = view.stages.clone();
+        // The dial marks the lens's limits and its 1×.
+        let mut stops = vec![floor, unit, max];
         stops.retain(|s| *s >= floor - 1e-6 && *s <= max + 1e-6);
-        if !stops.iter().any(|s| (s - floor).abs() < 1e-6) {
-            stops.insert(0, floor);
-        }
-        self.dial.set(zoom, (floor, max), &stops);
+        stops.sort_by(f64::total_cmp);
+        stops.dedup_by(|a, b| (*a / *b - 1.0).abs() < 1e-6);
+        self.dial.set(zoom, (floor, max), &stops, unit);
         *self.stops.borrow_mut() = stops;
-    }
-
-    fn build_stages(&self, stages: &[f64]) {
-        while let Some(c) = self.pill.first_child() {
-            self.pill.remove(&c);
-        }
-        let mut built = Vec::new();
-        for &z in stages {
-            let b = gtk::Button::with_label(&stage_label(z));
-            b.add_css_class("lens-button");
-            b.add_css_class("turnable");
-            b.set_tooltip_text(Some(&format_zoom(z)));
-            let e = self.on_event.clone();
-            b.connect_clicked(move |_| e(LensEvent::Stage(z)));
-            self.pill.append(&b);
-            built.push((z, b));
-        }
-        *self.stages.borrow_mut() = built;
     }
 
     fn build_menu(&self, lenses: &[LensChoice]) {
