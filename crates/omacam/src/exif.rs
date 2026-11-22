@@ -39,6 +39,8 @@ pub struct Info {
     pub manual_white_balance: bool,
     /// Exposure compensation, EV.
     pub exposure_bias: Option<f32>,
+    /// The Flash tag: fired or not, and the mode (EXIF 2.32 4.6.5).
+    pub flash: Option<u16>,
 }
 
 /// A position for the GPS IFD.
@@ -276,6 +278,9 @@ pub fn tiff(info: &Info) -> Vec<u8> {
     }
     exif.push(short(0xa402, u16::from(info.manual_exposure)));
     exif.push(short(0xa403, u16::from(info.manual_white_balance)));
+    if let Some(f) = info.flash {
+        exif.push(short(0x9209, f));
+    }
     if let Some(ev) = info.exposure_bias {
         // SRATIONAL: hundredths of an EV.
         let mut data = ((ev * 100.0).round() as i32).to_le_bytes().to_vec();
@@ -391,6 +396,7 @@ mod tests {
             manual_exposure: true,
             manual_white_balance: false,
             exposure_bias: Some(-0.7),
+            flash: Some(0x19),
         }
     }
 
@@ -438,6 +444,10 @@ mod tests {
         assert_eq!(get(Tag::ExposureMode), "manual exposure");
         assert_eq!(get(Tag::WhiteBalance), "auto white balance");
         assert_eq!(get(Tag::ExposureBiasValue), "-0.7");
+        assert_eq!(
+            get(Tag::Flash),
+            "fired, no return light detection function, auto"
+        );
         assert!(
             exif.get_field(Tag::GPSLatitude, ::exif::In::PRIMARY)
                 .is_none(),

@@ -96,6 +96,23 @@ impl std::str::FromStr for FlashMode {
     }
 }
 
+/// The EXIF Flash tag's value for a photo: whether the light was on for
+/// it (`fired`: lit for the photo, or the torch), and the mode. A camera
+/// without a flash (the front one) has none.
+pub fn exif_flash(available: bool, mode: FlashMode, fired: bool) -> u16 {
+    if !available {
+        return 0x20;
+    }
+    match (mode, fired) {
+        (FlashMode::On, true) => 0x09,
+        (FlashMode::Auto, true) => 0x19,
+        (FlashMode::Auto, false) => 0x18,
+        (FlashMode::Off, false) => 0x10,
+        (_, true) => 0x01,
+        (_, false) => 0x00,
+    }
+}
+
 /// What the LED should do now. The app turns it into a brightness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Light {
@@ -227,6 +244,8 @@ pub struct PreFlash {
     reacted: Option<Instant>,
     /// Frames in a row whose demand stayed within [`PRE_FLASH_STEADY`].
     steady: u32,
+    /// The light went out instead of on: the demand rises.
+    darker: bool,
 }
 
 /// How the wait under the light ended.
@@ -253,6 +272,19 @@ impl PreFlash {
             last_demand: before,
             reacted: None,
             steady: 0,
+            darker: false,
+        }
+    }
+
+    /// The same wait after the torch went out at `now`, `before` being the
+    /// last frame under it: a photo taken at once would get the exposure
+    /// set for the light (on the Moto G60s it came out dark). The exposure
+    /// has seen the dark when the demand rises over the one before by as
+    /// much as it falls for the light ([`PRE_FLASH_DROP`]).
+    pub fn light_out(now: Instant, before: Option<&FrameMeta>) -> PreFlash {
+        PreFlash {
+            darker: true,
+            ..PreFlash::new(now, before)
         }
     }
 
@@ -267,8 +299,11 @@ impl PreFlash {
             return PreFlashStep::TimedOut;
         }
         if self.reacted.is_none() {
-            let dropped =
-                matches!((demand, self.before), (Some(d), Some(b)) if d < b * PRE_FLASH_DROP);
+            let dropped = match (demand, self.before) {
+                (Some(d), Some(b)) if self.darker => d * PRE_FLASH_DROP > b,
+                (Some(d), Some(b)) => d < b * PRE_FLASH_DROP,
+                _ => false,
+            };
             if dropped || meta.ae_state == Some(AeState::Searching) || elapsed >= PRE_FLASH_REACT {
                 self.reacted = Some(now);
             } else {
@@ -381,6 +416,16 @@ mod tests {
         };
         assert!(spec.auto_fires(Some(&m)));
         assert!(!spec.auto_fires(Some(&FrameMeta::default())));
+    }
+
+    #[test]
+    fn exif_flash_says_whether_it_fired_and_why() {
+        assert_eq!(exif_flash(false, FlashMode::On, false), 0x20);
+        assert_eq!(exif_flash(true, FlashMode::On, true), 0x09);
+        assert_eq!(exif_flash(true, FlashMode::Auto, true), 0x19);
+        assert_eq!(exif_flash(true, FlashMode::Auto, false), 0x18);
+        assert_eq!(exif_flash(true, FlashMode::Off, false), 0x10);
+        assert_eq!(exif_flash(true, FlashMode::Torch, true), 0x01);
     }
 
     #[test]

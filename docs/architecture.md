@@ -526,6 +526,13 @@ exposed as those after 1.6 s.
   --led-helper NAME`) makes the calls, fed brightness values through a pipe;
   when the app ends in any way, the pipe closes and the helper puts the LED
   out. It ignores SIGINT, SIGTERM and SIGHUP and waits for the pipe.
+- **After the torch.** The torch out, the exposure walks back from the
+  light; a photo taken at once would get the exposure set for it (on the
+  Moto G60s it came out dark). So a photo asked for then waits the same
+  way, until the exposure has seen the dark (its demand up by a quarter)
+  and settled, at most 2.5 s.
+- **EXIF** records the Flash tag: fired or not, and the mode (the torch
+  counts as fired).
 - **Temperature** is the kernel's to guard (the LED as a cooling device):
   when it dims the LED or puts it out, the app leaves it so and doesn't
   set it again until the light it wants changes.

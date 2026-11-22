@@ -88,6 +88,8 @@ pub struct Picture {
     pub zoom: f64,
     /// The exposure settings in force (EXIF records them).
     pub settings: ExposureSettings,
+    /// The EXIF Flash tag ([`crate::flash::exif_flash`]).
+    pub flash: u16,
 }
 
 /// What the UI should do.
@@ -287,6 +289,14 @@ impl Side {
     }
 }
 
+/// The exposure after the torch went out (`Controller::light_out`).
+#[derive(Debug, Clone)]
+enum LightOut {
+    /// The last frame under the light; no frame since.
+    Pending(Option<FrameMeta>),
+    Waiting(PreFlash),
+}
+
 pub struct Controller {
     table: LensTable,
     opts: Options,
@@ -327,6 +337,12 @@ pub struct Controller {
     flash_photo: bool,
     /// What the LED was last told.
     light: Light,
+    /// The torch went out while a back camera streams: the exposure walks
+    /// back to the dark. The last frame under the light until the next
+    /// frame starts the wait ([`PreFlash::light_out`]), then the wait.
+    light_out: Option<LightOut>,
+    /// A photo waits for the exposure to settle after the torch.
+    light_out_photo: bool,
 }
 
 impl Controller {
@@ -373,6 +389,8 @@ impl Controller {
             pre_flash: None,
             flash_photo: false,
             light: Light::Off,
+            light_out: None,
+            light_out_photo: false,
         }
     }
 
@@ -1309,7 +1327,11 @@ impl Controller {
         {
             return out;
         }
+        if self.light_out_photo {
+            return out;
+        }
         if !self.capture.is_busy() && self.flash_fires() {
+            self.light_out = None;
             // Light first; the photo once the picture has settled under it.
             let demand = self
                 .last_meta
@@ -1324,6 +1346,18 @@ impl Controller {
             self.flash_photo = true;
             self.sync_light(&mut out);
             return out;
+        }
+        if !self.capture.is_busy() {
+            // The torch just went out: the photo once the exposure has
+            // walked back from it.
+            if let Some(LightOut::Pending(before)) = &self.light_out {
+                self.light_out = Some(LightOut::Waiting(PreFlash::light_out(now, before.as_ref())));
+            }
+            if self.light_out.is_some() {
+                tracing::info!("flash: the photo waits for the exposure after the torch");
+                self.light_out_photo = true;
+                return out;
+            }
         }
         self.begin_capture(now, &mut out);
         self.sync_light(&mut out);
@@ -1368,7 +1402,7 @@ impl Controller {
 
     /// Busy with a photo: taking it, or waiting under the flash's light.
     fn busy(&self) -> bool {
-        self.capture.is_busy() || self.pre_flash.is_some()
+        self.capture.is_busy() || self.pre_flash.is_some() || self.light_out_photo
     }
 
     /// Whether the next photo lights the flash first: on, or auto in a
@@ -1392,6 +1426,8 @@ impl Controller {
     fn abort_flash(&mut self) {
         self.pre_flash = None;
         self.flash_photo = false;
+        self.light_out = None;
+        self.light_out_photo = false;
     }
 
     /// What the LED should do now.
@@ -1421,9 +1457,55 @@ impl Controller {
         }
         let want = self.wanted_light();
         if want != self.light {
+            // The torch out while the back camera keeps streaming: the
+            // next photo waits for the exposure (not the photo's light,
+            // which ends with its photo, nor when the stream stops).
+            let torch_out = self.light == Light::Torch
+                && want == Light::Off
+                && !self.suspended
+                && !self.flash_photo
+                && self.facing == Facing::Back
+                && self.switch.streaming().is_some();
+            if torch_out {
+                let before = self.last_meta.as_ref().map(|(_, m)| m.clone());
+                self.light_out = Some(LightOut::Pending(before));
+            }
             tracing::info!(light = ?want, "flash");
             self.light = want;
             out.push(Output::Light(want));
+        }
+    }
+
+    /// A preview frame after the torch went out: the wait for the exposure
+    /// starts, or goes on, or ends (and a photo waiting for it is taken).
+    fn light_out_frame(&mut self, meta: &FrameMeta, now: Instant, out: &mut Vec<Output>) {
+        let step = match &mut self.light_out {
+            None => return,
+            Some(LightOut::Pending(before)) => {
+                let mut p = PreFlash::light_out(now, before.as_ref());
+                let step = p.on_frame(meta, now);
+                self.light_out = Some(LightOut::Waiting(p));
+                step
+            }
+            Some(LightOut::Waiting(p)) => p.on_frame(meta, now),
+        };
+        if step == PreFlashStep::Wait {
+            return;
+        }
+        if let Some(LightOut::Waiting(p)) = &self.light_out {
+            tracing::info!(
+                frames = p.frames(),
+                ms = p.elapsed(now).as_millis() as u64,
+                settled = step == PreFlashStep::Settled,
+                exposure_us = meta.exposure_us,
+                gain = meta.analog_gain,
+                photo = self.light_out_photo,
+                "flash: the exposure after the torch"
+            );
+        }
+        self.light_out = None;
+        if std::mem::take(&mut self.light_out_photo) {
+            self.begin_capture(now, out);
         }
     }
 
@@ -1537,6 +1619,17 @@ impl Controller {
                 self.pre_flash = None;
                 self.begin_capture(now, &mut out);
             }
+        } else if let Some(LightOut::Waiting(p)) = &self.light_out {
+            if p.tick(now) != PreFlashStep::Wait {
+                tracing::info!(
+                    frames = p.frames(),
+                    "flash: the wait after the torch ran out; the photo anyway"
+                );
+                self.light_out = None;
+                if std::mem::take(&mut self.light_out_photo) {
+                    self.begin_capture(now, &mut out);
+                }
+            }
         } else if self.side_mut().and_then(|s| s.planner.tick(now)).is_some() {
             self.request_preview(now, &mut out);
         }
@@ -1581,6 +1674,11 @@ impl Controller {
             rotation: lens.upright_clockwise(),
             zoom,
             settings: self.exposure.effective(&lens.caps),
+            flash: crate::flash::exif_flash(
+                self.opts.flash && lens.role != Role::Front,
+                self.opts.flash_mode,
+                self.flash_photo || self.light != Light::Off,
+            ),
             lens,
             frame,
         }))
@@ -1743,6 +1841,7 @@ impl Controller {
                         self.begin_capture(now, out);
                     }
                 }
+                self.light_out_frame(&frame.meta, now, out);
                 match self.capture.on_preview_frame(&frame.meta, now) {
                     Step::Keep => out.push(self.picture(frame, lens_idx, purpose)),
                     step => {
@@ -2999,6 +3098,72 @@ still = [2592, 1940]
         assert!(matches!(out.first(), Some(Output::Picture(_))), "{out:?}");
         assert_eq!(lights(&out), vec![Light::Off]);
         assert!(!c.view().capturing);
+    }
+
+    #[test]
+    fn a_photo_right_after_the_torch_waits_for_the_exposure() {
+        let now = Instant::now();
+        let at = |ms: u64| now + Duration::from_millis(ms);
+        let opts = Options {
+            flash: true,
+            flash_mode: FlashMode::Torch,
+            ..Options::default()
+        };
+        let mut c = Controller::new(&spec(), &cameras(), opts);
+        let (g, _, _) = start_of(&c.resume(now));
+        let mut e = started(g, "main");
+        if let Event::Started { still, .. } = &mut e {
+            *still = Some(Size::new(4080, 3072));
+        }
+        assert_eq!(lights(&c.on_event(e, now)), vec![Light::Torch]);
+        // Under the torch the exposure is short.
+        c.on_event(frame(g, "main", 10_000), now);
+        assert_eq!(lights(&c.set_flash_mode(FlashMode::Off)), vec![Light::Off]);
+        // The shutter at once: nothing asked yet, the photo waits.
+        let out = c.shutter(at(10));
+        assert!(commands(&out).is_empty(), "{out:?}");
+        assert!(c.view().capturing);
+        assert!(c.shutter(at(20)).is_empty(), "one photo");
+        // The exposure walks back up in the dark, then holds.
+        let mut asked = None;
+        let walk = [10_000, 25_000].into_iter().chain([40_000; 12]);
+        for (i, exposure) in walk.enumerate() {
+            let ms = 50 * (i as u64 + 1);
+            let out = c.on_event(frame(g, "main", exposure), at(ms));
+            if let [Command::Capture { .. }] = commands(&out).as_slice() {
+                asked = Some(ms);
+                break;
+            }
+        }
+        let ms = asked.expect("the photo once the exposure settled");
+        assert!(ms >= crate::flash::PRE_FLASH_MIN.as_millis() as u64, "{ms}");
+
+        // Once the exposure has settled, a photo goes ahead at once.
+        let mut c = Controller::new(
+            &spec(),
+            &cameras(),
+            Options {
+                flash: true,
+                flash_mode: FlashMode::Torch,
+                ..Options::default()
+            },
+        );
+        let (g, _, _) = start_of(&c.resume(now));
+        let mut e = started(g, "main");
+        if let Event::Started { still, .. } = &mut e {
+            *still = Some(Size::new(4080, 3072));
+        }
+        c.on_event(e, now);
+        c.on_event(frame(g, "main", 10_000), now);
+        c.set_flash_mode(FlashMode::Off);
+        for (i, exposure) in [30_000].into_iter().chain([40_000; 12]).enumerate() {
+            c.on_event(frame(g, "main", exposure), at(50 * (i as u64 + 1)));
+        }
+        let out = c.shutter(at(700));
+        assert!(
+            matches!(commands(&out).as_slice(), [Command::Capture { .. }]),
+            "{out:?}"
+        );
     }
 
     #[test]

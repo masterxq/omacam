@@ -3292,6 +3292,7 @@ fn encode_and_write(
         manual_exposure: !p.settings.shutter.is_auto() || !p.settings.gain.is_auto(),
         manual_white_balance: !p.settings.white_balance.is_auto(),
         exposure_bias: Some(p.settings.ev),
+        flash: Some(p.flash),
         f_number: p.lens.f_number,
         // The crop narrows the view like a longer lens.
         focal_length_35mm: p
