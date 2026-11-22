@@ -64,8 +64,9 @@ pub const FIXED_DISCARD: u32 = 8;
 /// Longest wait for the still frame before giving up.
 pub const STILL_TIMEOUT: Duration = Duration::from_secs(6);
 /// Longest wait for a still from the stream beside the preview: it comes
-/// with one of the next few requests.
-pub const BESIDE_TIMEOUT: Duration = Duration::from_secs(2);
+/// with one of the next few requests, or later when the camera makes it
+/// from a series of frames (about 2 s on the main camera of the lisbon).
+pub const BESIDE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How close each color gain must be to the preview's.
 pub const GAINS_WITHIN: f64 = 0.10;
 /// Without the preview's gains to compare: how little they may change
