@@ -225,9 +225,12 @@ gallery and flip buttons, the manual chips, the zoom readout and the
 toasts turn a quarter (CSS `transform` with a 250 ms transition, from the
 accelerometer's orientation; `--hold`, or the O key with `--fake`, on a
 laptop). The banners over the top of the picture (recording time, AE/AF
-lock, low light) move to the edge that is up and run along it. The words
-of the mode bar stay level: turned, they would run into the rows above
-and below. The settings sheet follows the screen.
+lock, low light) move to the edge that is up and run along it. No word
+lies on its side: the mode bar shows its modes as symbols (Night, Photo,
+Video), which turn too, and names the chosen one beside its symbol only
+while the phone is upright; the line of manual values set by hand shows
+only then as well (the adjust button's accent color says so either way).
+The settings sheet follows the screen.
 
 ### The layout
 

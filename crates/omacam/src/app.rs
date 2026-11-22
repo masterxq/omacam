@@ -785,7 +785,11 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     row.set_margin_start(12);
     row.set_margin_end(12);
 
-    let mode_bar = ModeBar::new(&["Night", "Photo", "Video"]);
+    let mode_bar = ModeBar::new(&[
+        ("Night", "omacam-night-symbolic"),
+        ("Photo", "omacam-photo-symbolic"),
+        ("Video", "omacam-video-symbolic"),
+    ]);
     mode_bar.set_item_visible(0, bursts);
     mode_bar.set_selected(1);
     if omacam_record::init().is_err() {
@@ -1168,6 +1172,7 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                     "1:1" => Aspect::Square,
                     _ => Aspect::Full,
                 };
+                app.aspect_menu.set_reveal_child(false);
                 app.change_settings(|s| s.aspect = aspect);
                 app.refresh();
             }
@@ -2037,7 +2042,8 @@ impl App {
         }
         // Night bursts take their own exposure: no manual values then.
         adjust.set_sensitive(!night);
-        match crate::manual::summary(ex).filter(|_| !open) {
+        let upright = self.controls_turn.get() == 0;
+        match crate::manual::summary(ex).filter(|_| !open && upright) {
             Some(text) => {
                 self.manual_hint_label.set_label(&format!("● {text}"));
                 self.manual_hint.set_visible(true);
@@ -2665,6 +2671,11 @@ impl App {
     fn turn_controls(&self) {
         let turn = self.held.get().degrees();
         self.turned.set_held(turn);
+        // No words on their side: the modes' names only upright, the
+        // line of manual values only then too.
+        self.mode_bar.set_named(turn == 0);
+        self.manual_hint
+            .set_visible(turn == 0 && self.manual_hint.is_visible());
         let old = self.controls_turn.replace(turn);
         if old != 0 {
             self.window.remove_css_class(&format!("turn-{old}"));

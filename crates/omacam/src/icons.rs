@@ -35,9 +35,11 @@ const ICONS: &[(&str, &str)] = icons!(
     "lens-wide",
     "macro",
     "night",
+    "photo",
     "settings",
     "timer",
     "torch",
+    "video",
 );
 
 /// Make the icons findable by name (`omacam-flash-on-symbolic`).

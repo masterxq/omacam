@@ -1,5 +1,7 @@
-//! The mode bar: one line of mode names (Night, Photo, Video), the chosen
-//! one in the middle and highlighted, the others beside it. A tap on a
+//! The mode bar: one line of modes (Night, Photo, Video), each a symbol
+//! that turns with the phone, the chosen one in the middle, highlighted
+//! and, while the phone is upright, named beside its symbol (turned, the
+//! words would lie on their side, and the bar has no room to turn them). A tap on a
 //! name or a swipe across the bar chooses; the line slides so the chosen
 //! mode is in the middle. Names never wrap: what doesn't fit runs off the
 //! bar's edges.
@@ -26,6 +28,10 @@ mod imp {
     #[derive(Default)]
     pub struct ModeBar {
         pub items: RefCell<Vec<gtk::Button>>,
+        /// Each mode's name, shown beside the chosen one's symbol.
+        pub words: RefCell<Vec<gtk::Label>>,
+        /// The chosen mode is named (the phone is upright).
+        pub named: Cell<bool>,
         pub active: Cell<usize>,
         /// The line's offset now (the middle of the chosen name sits at
         /// the bar's middle at 0), and where it slides from.
@@ -113,14 +119,25 @@ glib::wrapper! {
 }
 
 impl ModeBar {
-    /// A bar of these names, the first chosen.
-    pub fn new(names: &[&str]) -> ModeBar {
+    /// A bar of these modes (name, symbol), the first chosen.
+    pub fn new(modes: &[(&str, &str)]) -> ModeBar {
         let bar: ModeBar = glib::Object::builder().property("hexpand", true).build();
         bar.set_overflow(gtk::Overflow::Hidden);
+        bar.imp().named.set(true);
         let mut items = Vec::new();
-        for (i, name) in names.iter().enumerate() {
-            let b = gtk::Button::with_label(name);
+        let mut words = Vec::new();
+        for (i, (name, icon)) in modes.iter().enumerate() {
+            let symbol = gtk::Image::from_icon_name(icon);
+            symbol.add_css_class("turnable");
+            let word = gtk::Label::new(Some(name));
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            row.append(&symbol);
+            row.append(&word);
+            let b = gtk::Button::new();
+            b.set_child(Some(&row));
+            b.set_tooltip_text(Some(name));
             b.add_css_class("mode-item");
+            words.push(word);
             b.set_parent(&bar);
             let weak = bar.downgrade();
             b.connect_clicked(move |_| {
@@ -131,6 +148,7 @@ impl ModeBar {
             items.push(b);
         }
         bar.imp().items.replace(items);
+        bar.imp().words.replace(words);
         bar.mark();
         // Swipe: the line follows the finger; past `SWIPE` the next mode.
         let drag = gtk::GestureDrag::new();
@@ -249,9 +267,18 @@ impl ModeBar {
         self.slide_home();
     }
 
+    /// Name the chosen mode beside its symbol (the phone upright), or
+    /// show the symbols alone (held otherwise).
+    pub fn set_named(&self, named: bool) {
+        if self.imp().named.replace(named) != named {
+            self.mark();
+        }
+    }
+
     /// Highlight the chosen mode.
     fn mark(&self) {
         let active = self.imp().active.get();
+        let named = self.imp().named.get();
         for (k, b) in self.imp().items.borrow().iter().enumerate() {
             if k == active {
                 b.add_css_class("active");
@@ -259,6 +286,10 @@ impl ModeBar {
                 b.remove_css_class("active");
             }
         }
+        for (k, w) in self.imp().words.borrow().iter().enumerate() {
+            w.set_visible(named && k == active);
+        }
+        self.queue_resize();
     }
 
     /// Slide the line until the chosen mode is in the middle.
