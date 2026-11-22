@@ -18,28 +18,41 @@ finds.
 
 ## What you get
 
-- A full-screen viewfinder, upright and mirrored for selfies.
-- Zoom from 0.45x to 15x: the 0.5, 1, 2 and 5 buttons, a slider (drag
-  sideways across the buttons), or a pinch anywhere on the picture. The
-  ultrawide, main and telephoto cameras take over as you pass 1x and 4.78x,
-  with a short cross-fade. (Until the main camera has a 4:3 preview mode,
+- A viewfinder that takes the screen's whole width, upright and mirrored
+  for selfies, with the controls over it where it runs under them; it
+  never shows less than the photo gets. Held sideways, the layout stays
+  and the icons turn.
+- Quick settings along the top: flash (auto, on, off, torch), self-timer,
+  aspect ratio, HDR or 60 fps, the settings.
+- Lenses and zoom: a row of round buttons, one per lens and zoom stage
+  (".5", "1", "2", "5", and a flower for the macro lens); the one in use
+  shows the exact zoom. Drag sideways across the row for a zoom dial, or
+  pinch the picture (it rests a moment at 1x). The lens changes only when
+  you pick another one: zooming crops the lens you chose. (The setting
+  "Switch lenses while zooming" brings back the ultrawide, main and
+  telephoto taking over as you pass 1x and 4.78x, with a short
+  cross-fade.) (Until the main camera has a 4:3 preview mode,
   its 16:9 preview fills the screen and shows less than its photos: the
   photo holds about a third more width than the preview at 1x, except in
   16:9, and the view jumps by as much at its switches.)
-- Low light: when it's too dark for the telephoto, its zoom comes from the
-  main camera instead (a "Low light" note shows), and the telephoto comes
-  back when the light does. Not in the Pro panel, where the lens is the
-  one you zoom to.
+- Low light, with lenses switching while zooming: when it's too dark for
+  the telephoto, its zoom comes from the main camera instead (a "Low
+  light" note shows), and the telephoto comes back when the light does.
+  Not with the manual controls open.
 - Photos from the full-resolution mode (12.5 MP from the main camera),
   cropped to the zoom and saved upright as JPEG in `~/Pictures/Camera`.
 - Switching between the back and the front camera.
 - Continuous autofocus. Tap the picture to focus and meter there (in
-  video, autofocus keeps following the tapped spot), then slide the EV
-  control beside the ring; long-press for AE/AF lock.
-- A Pro panel: shutter, ISO, white balance and manual focus, each with
-  Auto, and a histogram. Each control appears as the camera offers it
-  (today's libcamera offers manual focus on the main camera; the rest
-  light up as libcamera adds them).
+  video, autofocus keeps following the tapped spot); a small marker stays
+  on the spot while focus and metering follow it, and a tap on it (or
+  leaving the app) gives the whole picture back to them. Long-press for
+  AE/AF lock.
+- Manual controls behind one button beside the lens row: exposure
+  correction, focus, white balance, shutter time and ISO, and a
+  histogram. Everything stays automatic until you move a value's slider;
+  values set by hand show in the accent color with a dot, and "Auto" (or
+  a long press on the value) gives one back. Each control appears as the
+  camera offers it.
 - The last photo as a thumbnail; tap it to open it.
 - Video: 1080p or 720p at 30 fps, or 60 where the lens's mode allows it,
   H.264 with Opus sound in MP4, saved in `~/Videos/Camera`. Zoom while

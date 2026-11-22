@@ -18,7 +18,7 @@ omacam-core        no UI, no camera library; unit-tested
                    or one frame of a still stream beside the preview)
   pixels           reading RGB, YUYV and NV12 frames as RGB
   exposure         carrying exposure across a lens switch by aperture
-  exposure_control the Pro panel's settings, metering, AE/AF lock
+  exposure_control the manual values, metering, AE/AF lock
   focus            tap to focus: picture point to sensor window, the scan
   framing          which part of each lens's frame a zoom shows
   lowlight         the telephoto's low-light fallback to the main camera
@@ -187,9 +187,11 @@ before anything switches, so the exposure settling after a switch doesn't
 flap the lenses. Any back lens judges the light, so 5x in the dark goes
 straight to the main camera.
 
-- **Never in the Pro panel:** there the lens is the one the zoom picks,
-  since the user is choosing the camera's settings by hand. Closing the
-  panel restores the fallback. The setting "Low-light lens" turns it off.
+- **Only where the zoom picks the lens** (the setting "Switch lenses while
+  zooming"; by default the lens is the one the user chose and never
+  changes on its own), and never with the manual controls open: there
+  the user is choosing the camera's settings by hand. Closing them
+  restores the fallback. The setting "Low-light lens" turns it off.
 - **Not for the ultrawide:** the main camera can't show a wider view than
   its own, so falling back would change the framing, and f/2.2 is close
   to the main camera's f/1.85 anyway.
@@ -211,14 +213,53 @@ turned the same way before encoding.
 ### Turning the controls
 
 Held sideways, the layout stays portrait and the controls turn in place,
-as Android cameras do: the zoom buttons, the gallery, flip and settings
-buttons, the Pro chips, the zoom readout and the toasts turn a quarter
-(CSS `transform` with a 250 ms transition, from the accelerometer's
-orientation). The banners over the top of the picture (recording time,
-AE/AF lock, low light) move to the edge that is up and run along it. The
-words of the Photo/Video/Pro switch and the lens name stay level: turned,
-they would run into the rows above and below. The settings sheet stays
-portrait.
+as Android cameras do: the quick settings, the lens buttons, the gallery
+and flip buttons, the manual chips, the zoom readout and the toasts turn
+a quarter (CSS `transform` with a 250 ms transition, from the
+accelerometer's orientation; `--hold`, or the O key with `--fake`, on a
+laptop). The banners over the top of the picture (recording time, AE/AF
+lock, low light) move to the edge that is up and run along it. The words
+of the mode bar stay level: turned, they would run into the rows above
+and below. The settings sheet stays portrait.
+
+### The layout
+
+The picture is fitted to the window's width (the limiting side of a
+phone held upright) and never cropped beyond what the photo gets. It sits
+between the quick settings at the top and the lens row, mode bar and
+shutter row at the bottom when it fits there (a 4:3 photo on a 20:9
+screen); a taller one (16:9, video) starts under the top bar and runs
+under the bottom bar, which is half see-through
+(`viewfinder::fit`). The manual controls open over the bottom of the
+picture.
+
+- **Top:** flash (its four choices drop down under it; a long press
+  switches the torch), self-timer, aspect ratio, HDR (where the lens
+  table allows bursts) or 60 fps in video, the settings gear.
+- **Lens row:** one round button per lens and zoom stage
+  (`ViewState::buttons`), the macro lens's flower beside them; the one in
+  use shows the exact zoom. Dragging sideways across it shows the zoom
+  dial (`dial.rs`) in its place, a ruler of zoom values under a marker,
+  stages labeled, with a light detent at each. At the row's ends: the
+  torch (with the macro lens on, for its use as a magnifier) and the
+  adjust button for the manual controls.
+- **Mode bar** (`modebar.rs`): one line, Night (where the lens table
+  allows bursts), Photo, Video; a tap or a swipe chooses, and the line
+  slides so the chosen mode sits in the middle.
+- **Shutter row:** the last photo, the shutter, the camera switch.
+
+The lens changes only when the user picks one (`Options::hold_lens`, the
+default in the app): a pinch, the dial or the mouse wheel crops the
+chosen lens, from its own field of view up to the table's `max_zoom`.
+
+### The flash
+
+The top bar's flash mode (`flash.rs`: auto, on, off, torch) is a setting;
+a `FlashLed` carries it out: the mode as it changes, and each photo
+before and after it is taken (auto fires when the exposure the camera
+chose is past 1/15 s at gain 4). Videos use the torch or nothing. The
+LED driver isn't wired in yet: `flash::Placeholder` logs what it would
+do.
 
 ### Display paths
 
@@ -391,27 +432,41 @@ Automatic by default, with manual control where the camera allows it:
   Continuous, AfMetering Windows, AfWindows), so it keeps following that
   spot without a visible scan; elsewhere it scans once, as in photos.
   Recording starts with one scan. AE/AF lock holds focus with AfPause.
-- **The EV slider** appears beside the focus ring for a few seconds after
-  a tap, -2..+2 EV on top of the metering; the next tap or a lens switch
-  resets it.
+- **The tapped point stays marked.** After the ring has gone, focus
+  (continuous AF on the tapped window) and metering keep following the
+  point, so a small marker stays on it (`ViewState::tap_point`). A tap on
+  the marker gives the whole picture back to focus and metering
+  (`Controller::clear_tap`: AfMetering Auto, matrix metering, no
+  correction for the spot); so does the window coming back to the front
+  (from the photo viewer, say), a lens switch, a mode switch, and every
+  fresh start of the stream.
+- **Exposure correction** is in the manual controls, -2..+2 EV on top of
+  the metering; a tap or a lens switch resets it. The older slider beside
+  the focus ring is a setting ("Exposure slider at the focus point", off
+  by default).
 - **Long press: AE/AF lock.** Exposure is held with AeEnable false where
   the camera offers it (AE keeps its last values), else the exposure time
   and gain the last frame reported become manual values. Focus is held
   with AfPause Immediate where offered, else at the reported lens
   position (AfMode Manual). An "AE/AF lock" chip shows; a tap releases it.
-- **Pro panel** (the Pro toggle beside Photo/Video): shutter
-  (ExposureTimeMode + ExposureTime, within the current mode's frame time),
-  ISO (AnalogueGainMode + AnalogueGain; either can be manual while AE
-  drives the other), white balance and manual focus (AfMode Manual +
-  LensPosition, 0-1), each with an "A" (auto) state. White balance has
-  four presets, Sun, Cloud, Bulb and Tube: on a camera that advertises
-  ColourTemperature (only the ultrawide, 2890-7900 K) they are color
-  temperatures, elsewhere fixed ColourGains [r, b] with AwbEnable false.
-  Chips show auto's live choice from the frame metadata when on auto. ISO
-  is analog gain × the sensor's base ISO (`base_iso` in the lens table:
-  50, an estimate). A histogram of the picture's luma can be shown over
-  the picture. Pro values hold across lens switches, apply to stills and
-  video alike, and reset at each launch unless "Keep Pro settings" is on.
+- **Manual controls** (`manual.rs`, the adjust button beside the lens
+  row): exposure correction, focus (AfMode Manual + LensPosition, from far
+  to near), white balance, shutter (ExposureTimeMode + ExposureTime,
+  within the current mode's frame time) and ISO (AnalogueGainMode +
+  AnalogueGain; either can be manual while AE drives the other). Each is
+  automatic until its slider moves; "Auto" or a long press on its chip
+  gives it back. A value set by hand shows in the accent color with a dot,
+  the adjust button turns the accent color, and while the controls are
+  closed a line over the lens row names the values set by hand (its ×
+  sets all back to auto). White balance is a color temperature on a
+  camera that advertises ColourTemperature, else four presets (Bulb, Tube,
+  Sun, Cloud) as fixed ColourGains [r, b] with AwbEnable false. An
+  automatic value's slider follows what auto chose (dimmed), so taking it
+  over starts there. ISO is analog gain × the sensor's base ISO
+  (`base_iso` in the lens table). A histogram of the picture's luma can
+  be shown over the picture. Manual values hold across lens switches,
+  apply to stills and video alike, and reset at each launch unless "Keep
+  manual settings" is on.
 - **Stills wait for the exposure to settle.** After the switch to the
   still mode, the capture waits for AeState Converged (and the color to
   settle), at most 10 frames; a camera without AeState gets 8 frames.

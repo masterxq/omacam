@@ -316,6 +316,14 @@ pub fn dialog(
         |s, v| s.tap_to_focus = v,
     ));
     adv.add(&switch(
+        "Exposure slider at the focus point",
+        "A tap also shows an exposure slider beside the focus ring",
+        s.tap_ev_slider,
+        &state,
+        &on_change,
+        |s, v| s.tap_ev_slider = v,
+    ));
+    adv.add(&switch(
         "Volume keys take photos",
         "While the camera is in front",
         s.volume_shutter,
@@ -324,7 +332,7 @@ pub fn dialog(
         |s, v| s.volume_shutter = v,
     ));
     adv.add(&switch(
-        "Keep Pro settings",
+        "Keep manual settings",
         "Off: every launch starts fully automatic",
         s.keep_pro,
         &state,
@@ -332,8 +340,17 @@ pub fn dialog(
         |s, v| s.keep_pro = v,
     ));
     adv.add(&switch(
+        "Switch lenses while zooming",
+        "Off: the lens changes only when you pick another one",
+        s.switch_lenses_by_zoom,
+        &state,
+        &on_change,
+        |s, v| s.switch_lenses_by_zoom = v,
+    ));
+    adv.add(&switch(
         "Low-light lens",
-        "In dim light, the main camera shows the telephoto's zoom (not in Pro)",
+        "With lenses switching while zooming: in dim light, the main camera \
+         shows the telephoto's zoom (not with manual controls open)",
         s.low_light,
         &state,
         &on_change,

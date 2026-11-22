@@ -1,12 +1,17 @@
 //! omacam: a phone camera for Omarchy Mobile, shown as "Camera".
 
 mod app;
+mod dial;
 mod exif;
+mod flash;
+mod icons;
 mod journal;
+mod lensrow;
 mod location;
+mod manual;
+mod modebar;
 mod photo;
 mod prefs;
-mod pro;
 mod script;
 mod sensors;
 mod settings;
@@ -44,6 +49,27 @@ pub enum CaptureMode {
     Hdr,
 }
 
+/// The cameras `--fake` pretends to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FakeLenses {
+    /// The Pixel 7 Pro's: ultrawide, main, telephoto, front.
+    Pixel,
+    /// The Moto G60s's: main, front, macro.
+    Lisbon,
+    /// The Moto G60s's and an ultrawide (0.5x) it doesn't have.
+    LisbonUltrawide,
+}
+
+/// How the phone is held, for `--hold`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Hold {
+    Normal,
+    /// Turned a quarter to the left (its left edge up).
+    Left,
+    Right,
+    UpsideDown,
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(name = "omacam", version, about = "Camera for Omarchy Mobile")]
 pub struct Cli {
@@ -79,6 +105,9 @@ pub struct Cli {
     /// Save photos here instead of the Pictures folder's Camera directory.
     #[arg(long)]
     output_dir: Option<PathBuf>,
+    /// The settings file, instead of ~/.config/omacam/settings.toml.
+    #[arg(long, env = "OMACAM_SETTINGS")]
+    settings: Option<PathBuf>,
     /// Send a command to the running omacam and exit (`shutter`).
     #[arg(long, value_name = "COMMAND")]
     remote: Option<String>,
@@ -96,6 +125,31 @@ pub struct Cli {
     /// 60 fps video).
     #[arg(long)]
     fake_fps: Option<f64>,
+    /// With --fake: which cameras to pretend to have (and their lens
+    /// table, unless --lens-table gives one).
+    #[arg(long, value_enum, default_value = "pixel")]
+    fake_lenses: FakeLenses,
+    /// How the phone is held, instead of asking the accelerometer (with
+    /// --fake, the O key turns it a quarter further).
+    #[arg(long, value_enum)]
+    hold: Option<Hold>,
+    /// The window's size, WIDTHxHEIGHT (a phone's screen in logical
+    /// pixels, such as 412x915).
+    #[arg(long, value_parser = parse_size, default_value = "480x1040")]
+    size: (i32, i32),
+}
+
+fn parse_size(s: &str) -> Result<(i32, i32), String> {
+    let (w, h) = s
+        .split_once('x')
+        .ok_or_else(|| format!("{s:?}: WIDTHxHEIGHT"))?;
+    let n = |v: &str| {
+        v.parse::<i32>()
+            .ok()
+            .filter(|v| (100..=8000).contains(v))
+            .ok_or_else(|| format!("{s:?}: WIDTHxHEIGHT, 100 to 8000 each"))
+    };
+    Ok((n(w)?, n(h)?))
 }
 
 /// The built-in lens table for this device, by its device-tree compatible.
@@ -111,6 +165,20 @@ fn builtin_table() -> TableSpec {
 
 impl Cli {
     pub fn lens_table(&self) -> TableSpec {
+        if self.fake && self.lens_table.is_none() {
+            match self.fake_lenses {
+                FakeLenses::Pixel => {}
+                FakeLenses::Lisbon => return TableSpec::lisbon(),
+                FakeLenses::LisbonUltrawide => {
+                    let text = format!(
+                        "{}{}",
+                        omacam_core::lens::LISBON,
+                        omacam_fake::LISBON_ULTRAWIDE
+                    );
+                    return TableSpec::parse(&text).expect("the fake lens table parses");
+                }
+            }
+        }
         let user = gtk::glib::user_config_dir().join("omacam/lenses.toml");
         let path = self
             .lens_table
@@ -148,6 +216,11 @@ pub fn spawn_backend(cli: &Cli, sink: EventSink) -> anyhow::Result<Box<dyn Backe
             omacam_fake::Options {
                 scene_light: cli.fake_light,
                 max_fps: cli.fake_fps,
+                cameras: match cli.fake_lenses {
+                    FakeLenses::Pixel => omacam_fake::cheetah_cameras(),
+                    FakeLenses::Lisbon => omacam_fake::lisbon_cameras(false),
+                    FakeLenses::LisbonUltrawide => omacam_fake::lisbon_cameras(true),
+                },
                 ..omacam_fake::Options::default()
             },
         )));

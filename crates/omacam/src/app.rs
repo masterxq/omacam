@@ -21,25 +21,94 @@ use omacam_core::zoom::ZoomSource;
 use omacam_core::{capture, Controller};
 
 use crate::exif;
+use crate::flash::{FlashLed, FlashMode};
+use crate::lensrow::{LensEvent, LensRow};
+use crate::manual::ManualBar;
+use crate::modebar::ModeBar;
 use crate::photo;
-use crate::settings::Settings;
-use crate::viewfinder::{Decor, Placement, Ring, Viewfinder};
+use crate::settings::{Aspect, Settings, Timer};
+use crate::viewfinder::{Decor, Insets, Placement, Ring, Viewfinder};
 use crate::{CaptureMode, Cli};
 
 const CSS: &str = r#"
 window.omacam, window.omacam viewfinder { background: black; }
-.omacam-controls { padding: 10px 24px 18px 24px; background: black; }
-.zoom-pills { background: rgba(0,0,0,0.45); border-radius: 999px; padding: 4px; }
-.zoom-pill {
+
+/* Over the top: the quick settings. */
+.top-bar { padding: 6px 8px; background: rgba(0,0,0,0.35); }
+.top-button {
+  min-width: 40px; min-height: 40px; padding: 0 6px; border-radius: 999px;
+  background: transparent; color: white; box-shadow: none;
+  font-weight: bold; font-size: 13px;
+}
+.top-button:checked, .top-button.on { color: var(--accent-color); }
+.flash-menu { background: rgba(48,48,48,0.94); border-radius: 18px; padding: 6px; }
+.flash-choice {
+  min-width: 64px; min-height: 54px; padding: 2px; border-radius: 14px;
+  background: transparent; color: white; box-shadow: none; font-size: 11px;
+}
+.flash-choice.active { color: var(--accent-color); background: rgba(255,255,255,0.14); }
+
+/* Over the bottom: the manual controls, the lens row, the modes and the
+   shutter, half see-through where the picture runs under them. */
+.bottom-panel {
+  padding: 6px 12px 16px 12px;
+  background: linear-gradient(to top, rgba(0,0,0,0.6), rgba(0,0,0,0.25));
+}
+.lens-pill { background: rgba(0,0,0,0.45); border-radius: 999px; padding: 3px; }
+.lens-button {
+  min-width: 38px; min-height: 38px; padding: 0; margin: 2px; border-radius: 999px;
+  background: rgba(255,255,255,0.10); color: white; box-shadow: none;
+  font-size: 12px; font-weight: bold;
+}
+.lens-button.stage { background: transparent; }
+.lens-button.active {
+  min-width: 46px; min-height: 46px; margin: 0;
+  background: rgba(255,255,255,0.24); color: var(--accent-color); font-size: 14px;
+}
+.side-button {
   min-width: 44px; min-height: 44px; padding: 0; border-radius: 999px;
-  background: transparent; color: white; font-weight: bold; font-size: 13px;
-  box-shadow: none;
+  background: rgba(0,0,0,0.35); color: white; box-shadow: none;
 }
-.zoom-pill.active {
-  background: rgba(255,255,255,0.18);
-  color: var(--accent-bg-color);
-  font-size: 15px;
+.side-button:checked { color: var(--accent-color); background: rgba(255,255,255,0.18); }
+.side-button.set { color: var(--accent-color); }
+zoomdial { color: var(--accent-color); }
+.zoom-dial { background: rgba(0,0,0,0.45); border-radius: 16px; }
+modebar { min-height: 36px; }
+.mode-item {
+  min-height: 32px; padding: 0 14px; border-radius: 999px;
+  background: transparent; color: rgba(255,255,255,0.75); box-shadow: none;
+  font-weight: bold; font-size: 14px;
 }
+.mode-item.active { color: var(--accent-color); background: rgba(255,255,255,0.14); }
+.manual-editor { background: rgba(0,0,0,0.6); border-radius: 16px; padding: 4px 10px; color: white; }
+.manual-auto {
+  min-height: 32px; padding: 0 10px; border-radius: 999px;
+  background: rgba(255,255,255,0.12); color: white; box-shadow: none;
+  font-size: 12px; font-weight: bold;
+}
+.manual-auto.active { background: var(--accent-bg-color); color: var(--accent-fg-color); }
+scale.manual-slider { color: var(--accent-color); }
+scale.manual-slider.auto { opacity: 0.5; }
+.manual-value { color: white; font-weight: bold; font-feature-settings: "tnum"; }
+.manual-value.set { color: var(--accent-color); }
+.manual-chip {
+  min-height: 44px; padding: 2px; border-radius: 12px;
+  background: rgba(0,0,0,0.5); color: rgba(255,255,255,0.8); box-shadow: none;
+}
+.manual-chip.selected, .manual-chip:checked { background: rgba(255,255,255,0.22); }
+.manual-chip.set .chip-value { color: var(--accent-color); }
+.chip-name { font-size: 10px; opacity: 0.8; }
+.chip-dot { font-size: 7px; color: var(--accent-color); }
+.chip-value { font-size: 12px; font-weight: bold; font-feature-settings: "tnum"; }
+.manual-hint {
+  background: rgba(0,0,0,0.55); color: var(--accent-color); border-radius: 999px;
+  padding: 0 2px 0 12px; font-size: 12px; font-weight: bold;
+}
+.manual-hint button {
+  min-height: 28px; min-width: 28px; padding: 0; border-radius: 999px;
+  background: transparent; box-shadow: none; color: white;
+}
+
 .shutter {
   min-width: 72px; min-height: 72px; padding: 0; margin: 0; border-radius: 999px;
   background: white;
@@ -48,12 +117,7 @@ window.omacam, window.omacam viewfinder { background: black; }
 .shutter:active { background: #d8d8d8; }
 .shutter.record { background: #e5383b; }
 .shutter.recording { background: #e5383b; border-radius: 18px; }
-.mode-switch button {
-  min-height: 32px; padding: 0 16px; border-radius: 999px;
-  background: transparent; color: rgba(255,255,255,0.8); font-weight: bold;
-  box-shadow: none;
-}
-.mode-switch button:checked { background: rgba(255,255,255,0.18); color: var(--accent-bg-color); }
+.shutter.flash { box-shadow: 0 0 0 5px rgba(255,214,79,0.75); }
 .rec-timer {
   background: #e5383b; color: white; font-weight: bold;
   border-radius: 999px; padding: 4px 12px; font-feature-settings: "tnum";
@@ -69,28 +133,10 @@ window.omacam, window.omacam viewfinder { background: black; }
   border-radius: 999px; padding: 6px 14px;
 }
 .zoom-indicator { font-size: 18px; }
-.lens-label { color: rgba(255,255,255,0.85); font-size: 12px; }
 .debug {
   font-family: monospace; font-size: 11px; color: #9f9;
   background: rgba(0,0,0,0.55); padding: 4px 6px; border-radius: 6px;
 }
-scale.zoom-slider trough { min-height: 4px; }
-scale.zoom-slider { color: white; }
-.pro-panel { padding: 0 8px; }
-.pro-chip {
-  min-height: 44px; padding: 2px 4px; border-radius: 12px;
-  background: rgba(0,0,0,0.5); color: rgba(255,255,255,0.85); box-shadow: none;
-}
-.pro-chip.manual, .pro-chip:checked { color: var(--accent-bg-color); }
-.pro-chip-name { font-size: 10px; opacity: 0.75; }
-.pro-chip-value { font-size: 13px; font-weight: bold; font-feature-settings: "tnum"; }
-.pro-editor { background: rgba(0,0,0,0.55); border-radius: 14px; padding: 6px 10px; }
-.pro-auto, .pro-preset {
-  min-height: 36px; min-width: 36px; padding: 0 8px; border-radius: 999px;
-  background: rgba(255,255,255,0.12); color: white; box-shadow: none; font-size: 12px;
-}
-.pro-auto:checked, .pro-preset:checked { background: var(--accent-bg-color); color: var(--accent-fg-color); }
-.pro-value { color: white; font-weight: bold; font-feature-settings: "tnum"; }
 .lock-chip {
   background: var(--accent-bg-color); color: var(--accent-fg-color); font-weight: bold;
   border-radius: 999px; padding: 4px 12px;
@@ -100,12 +146,6 @@ scale.ev-slider { color: #ffd54f; }
   background: rgba(0,0,0,0.6); color: #ffd54f; font-weight: bold; font-size: 12px;
   border-radius: 999px; padding: 4px 12px;
 }
-.fps-toggle {
-  min-height: 32px; min-width: 52px; padding: 0 8px; border-radius: 999px;
-  background: rgba(0,0,0,0.45); color: white; font-weight: bold; font-size: 12px;
-  box-shadow: none;
-}
-.fps-toggle:checked { color: var(--accent-bg-color); }
 
 /* Held sideways, the controls turn in place (the layout stays portrait),
    as phone cameras do. */
@@ -155,26 +195,54 @@ impl Fps {
     }
 }
 
+/// The modes of the mode bar, in its order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiMode {
+    Night,
+    Photo,
+    Video,
+}
+
+const UI_MODES: [UiMode; 3] = [UiMode::Night, UiMode::Photo, UiMode::Video];
+
 struct App {
     cli: Cli,
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     viewfinder: Viewfinder,
-    pills: gtk::Box,
-    pill_buttons: RefCell<Vec<(f64, gtk::Button)>>,
-    slider: gtk::Scale,
-    slider_revealer: gtk::Revealer,
+    /// The quick settings over the top, and the flash's choices under it.
+    top_bar: gtk::Box,
+    flash_button: gtk::Button,
+    flash_menu: gtk::Revealer,
+    flash_choices: Vec<(FlashMode, gtk::Button)>,
+    timer_button: gtk::Button,
+    aspect_button: gtk::Button,
+    /// The lens row, the modes and the shutter row: the bar the picture
+    /// sits above when it fits.
+    bottom_fixed: gtk::Box,
+    lens_row: Rc<LensRow>,
+    mode_bar: ModeBar,
+    ui_mode: Cell<UiMode>,
+    /// The manual controls, and the line naming the values set by hand
+    /// while they are closed.
+    manual: Rc<ManualBar>,
+    manual_revealer: gtk::Revealer,
+    manual_hint: gtk::Box,
+    manual_hint_label: gtk::Label,
     zoom_indicator: gtk::Label,
-    lens_label: gtk::Label,
     status: gtk::Label,
     status_box: gtk::Box,
     shutter: gtk::Button,
     flip: gtk::Button,
-    /// Turns the macro lens on and off, beside the zoom pills.
-    macro_pill: gtk::Button,
     thumb: gtk::Button,
     thumb_picture: gtk::Image,
     debug: gtk::Label,
+    flash_led: Box<dyn FlashLed>,
+    /// The flash mode before the torch was switched on beside the lens
+    /// row, to go back to.
+    before_torch: Cell<FlashMode>,
+    /// The flash fires for the photo being taken.
+    flash_firing: Cell<bool>,
 
     backend: RefCell<Option<Box<dyn Backend>>>,
     controller: RefCell<Option<Controller>>,
@@ -192,9 +260,6 @@ struct App {
     shown_ae: Cell<(Option<i32>, Option<f32>)>,
     fps: RefCell<Fps>,
     pinch_base: Cell<f64>,
-    drag_base: Cell<f64>,
-    drag_claimed: Cell<bool>,
-    setting_slider: Cell<bool>,
     hide_source: RefCell<Option<glib::SourceId>>,
     unfocus_source: RefCell<Option<glib::SourceId>>,
     suspended: Cell<bool>,
@@ -202,10 +267,6 @@ struct App {
     last_error: RefCell<Option<(String, Instant)>>,
     /// The frames of the burst being taken (Night, HDR).
     burst: RefCell<Vec<Picture>>,
-    built_presets: RefCell<Vec<f64>>,
-    pro_toggle: gtk::ToggleButton,
-    pro_panel: RefCell<Option<Rc<crate::pro::ProPanel>>>,
-    picture_bottom: gtk::Box,
     lock_chip: gtk::Label,
     low_light_chip: gtk::Box,
     fps_toggle: gtk::ToggleButton,
@@ -233,10 +294,6 @@ struct App {
     settings_dialog: RefCell<Option<adw::PreferencesDialog>>,
     /// The size, stride and layout of the frames on screen.
     shown_format: Cell<Option<(u32, u32, u32, PixelLayout)>>,
-    mode_night: gtk::ToggleButton,
-    mode_photo: gtk::ToggleButton,
-    mode_video: gtk::ToggleButton,
-    mode_box: gtk::Box,
     gear: gtk::Button,
     rec_label: gtk::Label,
     recording: RefCell<Option<Recording>>,
@@ -425,6 +482,42 @@ fn round_button(icon: &str, tooltip: &str) -> gtk::Button {
     b
 }
 
+fn top_button(icon: Option<&str>, label: Option<&str>, tooltip: &str) -> gtk::Button {
+    let b = gtk::Button::new();
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    if let Some(i) = icon {
+        row.append(&gtk::Image::from_icon_name(i));
+    }
+    let l = gtk::Label::new(label);
+    l.set_visible(label.is_some());
+    row.append(&l);
+    b.set_child(Some(&row));
+    b.add_css_class("top-button");
+    b.add_css_class("turnable");
+    b.set_tooltip_text(Some(tooltip));
+    b.set_valign(gtk::Align::Center);
+    b
+}
+
+/// The label of a button made by [`top_button`].
+fn top_button_label(b: &gtk::Button) -> Option<gtk::Label> {
+    b.child()?.last_child()?.downcast::<gtk::Label>().ok()
+}
+
+/// The icon of a button made by [`top_button`].
+fn top_button_icon(b: &gtk::Button) -> Option<gtk::Image> {
+    b.child()?.first_child()?.downcast::<gtk::Image>().ok()
+}
+
+fn aspect_label(a: Aspect) -> &'static str {
+    match a {
+        Aspect::Full => "Full",
+        Aspect::FourThree => "4:3",
+        Aspect::SixteenNine => "16:9",
+        Aspect::Square => "1:1",
+    }
+}
+
 fn build(gtk_app: &adw::Application, cli: Cli) {
     let display = gdk::Display::default().expect("a display");
     let monitor = crate::theme::follow_omarchy_theme();
@@ -435,12 +528,13 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         &css,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
+    crate::icons::register(&display);
 
     let window = adw::ApplicationWindow::builder()
         .application(gtk_app)
         .title("Camera")
-        .default_width(480)
-        .default_height(1040)
+        .default_width(cli.size.0)
+        .default_height(cli.size.1)
         .build();
     window.add_css_class("omacam");
     // Keep the theme watcher alive with the window.
@@ -448,39 +542,88 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         unsafe_keep(&window, m);
     }
 
+    // The picture takes the whole window; everything else lies over it,
+    // and the picture sits between the bars where it fits.
     let viewfinder = Viewfinder::new();
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&viewfinder));
+    let settings_path = cli.settings.clone().unwrap_or_else(Settings::default_path);
+    let settings = Settings::load(&settings_path);
+    let bursts = cli.lens_table().bursts();
 
-    // Top: lens name and the debug readout.
-    let lens_label = gtk::Label::new(None);
-    lens_label.add_css_class("lens-label");
+    // Top: the quick settings. Flash, timer, aspect ratio, HDR or 60 fps;
+    // the settings gear at the end.
+    let flash_button = top_button(Some(settings.flash.icon()), None, "Flash");
+    let timer_button = top_button(Some("omacam-timer-symbolic"), None, "Self-timer");
+    let aspect_button = top_button(None, Some(aspect_label(settings.aspect)), "Aspect ratio");
+    let hdr_toggle = gtk::ToggleButton::with_label("HDR");
+    hdr_toggle.add_css_class("top-button");
+    hdr_toggle.set_tooltip_text(Some("Merge a burst to keep highlights and shadows"));
+    hdr_toggle.set_visible(false);
+    // Video: 30 or 60 fps, where the lens's mode allows 60.
+    let fps_toggle = gtk::ToggleButton::with_label("60 FPS");
+    fps_toggle.add_css_class("top-button");
+    fps_toggle.set_tooltip_text(Some("Record at 60 frames per second"));
+    fps_toggle.set_visible(false);
+    let gear = top_button(Some("omacam-settings-symbolic"), None, "Settings");
+    let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    top_bar.add_css_class("top-bar");
+    top_bar.set_valign(gtk::Align::Start);
+    for w in [
+        flash_button.upcast_ref::<gtk::Widget>(),
+        timer_button.upcast_ref(),
+        aspect_button.upcast_ref(),
+        hdr_toggle.upcast_ref(),
+        fps_toggle.upcast_ref(),
+    ] {
+        top_bar.append(w);
+    }
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    top_bar.append(&spacer);
+    top_bar.append(&gear);
+    overlay.add_overlay(&top_bar);
+
+    // The flash's four choices, under the top bar when its button is
+    // tapped.
+    let choices = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    choices.add_css_class("flash-menu");
+    let mut flash_choices = Vec::new();
+    for mode in FlashMode::ALL {
+        let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        col.append(&gtk::Image::from_icon_name(mode.icon()));
+        col.append(&gtk::Label::new(Some(mode.label())));
+        let b = gtk::Button::new();
+        b.set_child(Some(&col));
+        b.add_css_class("flash-choice");
+        b.add_css_class("turnable");
+        choices.append(&b);
+        flash_choices.push((mode, b));
+    }
+    let flash_menu = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .child(&choices)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .margin_start(8)
+        .margin_top(56)
+        .build();
+    overlay.add_overlay(&flash_menu);
+
     let debug = gtk::Label::new(None);
     debug.add_css_class("debug");
     debug.set_xalign(0.0);
-    let settings_path = Settings::default_path();
-    let settings = Settings::load(&settings_path);
     debug.set_visible(cli.debug || settings.debug_overlay);
-    let top = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    top.set_valign(gtk::Align::Start);
-    top.set_halign(gtk::Align::Start);
-    top.set_margin_top(12);
-    top.set_margin_start(12);
-    top.append(&debug);
-    overlay.add_overlay(&top);
-    let gear = round_button("emblem-system-symbolic", "Settings");
-    gear.add_css_class("top-button");
-    gear.set_halign(gtk::Align::End);
-    gear.set_valign(gtk::Align::Start);
-    gear.set_margin_top(10);
-    gear.set_margin_end(10);
-    gear.set_size_request(44, 44);
-    overlay.add_overlay(&gear);
+    debug.set_valign(gtk::Align::Start);
+    debug.set_halign(gtk::Align::Start);
+    debug.set_margin_top(60);
+    debug.set_margin_start(12);
+    debug.set_can_target(false);
+    overlay.add_overlay(&debug);
     let rec_label = gtk::Label::new(None);
     rec_label.add_css_class("rec-timer");
     rec_label.set_halign(gtk::Align::Center);
     rec_label.set_valign(gtk::Align::Start);
-    rec_label.set_margin_top(14);
     rec_label.set_visible(false);
     rec_label.set_can_target(false);
     overlay.add_overlay(&rec_label);
@@ -505,109 +648,24 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     status_box.set_can_target(false);
     overlay.add_overlay(&status_box);
 
-    // Bottom: slider, zoom pills, then thumbnail / shutter / flip.
-    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
-    slider.set_draw_value(false);
-    slider.add_css_class("zoom-slider");
-    slider.set_size_request(320, -1);
-    let slider_revealer = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::Crossfade)
-        .child(&slider)
-        .halign(gtk::Align::Center)
-        .build();
-    let pills = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    pills.add_css_class("zoom-pills");
-    pills.set_halign(gtk::Align::Center);
-    let macro_pill = gtk::Button::with_label("Macro");
-    macro_pill.add_css_class("zoom-pill");
-    macro_pill.add_css_class("turnable");
-    macro_pill.set_tooltip_text(Some("Macro lens: sharp a few centimeters away"));
-    macro_pill.set_visible(false);
-
-    let thumb_picture = gtk::Image::from_icon_name("image-x-generic-symbolic");
-    thumb_picture.set_pixel_size(22);
-    let thumb = gtk::Button::new();
-    thumb.set_child(Some(&thumb_picture));
-    thumb.add_css_class("round-button");
-    thumb.add_css_class("thumb");
-    thumb.set_overflow(gtk::Overflow::Hidden);
-    thumb.set_tooltip_text(Some("Last photo"));
-    thumb.set_sensitive(false);
-    let shutter = gtk::Button::new();
-    shutter.add_css_class("shutter");
-    shutter.set_tooltip_text(Some("Take a photo"));
-    let flip = round_button("camera-switch-symbolic", "Switch camera");
-    // Fixed-size circles: never stretched by the row, whatever the window.
-    for (b, size) in [(&thumb, 56), (&shutter, 72), (&flip, 56)] {
-        b.set_size_request(size, size);
-        b.set_halign(gtk::Align::Center);
-        b.set_valign(gtk::Align::Center);
-        b.set_hexpand(false);
-        b.set_vexpand(false);
-    }
-    let row = gtk::CenterBox::new();
-    row.set_start_widget(Some(&thumb));
-    row.set_center_widget(Some(&shutter));
-    row.set_end_widget(Some(&flip));
-    row.set_vexpand(false);
-
-    // Over the bottom of the picture: the lens name and the slider, which
-    // come and go without moving anything.
-    let picture_bottom = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    picture_bottom.set_valign(gtk::Align::End);
-    // Full width, for the Pro panel; the label and slider center
-    // themselves.
-    picture_bottom.set_halign(gtk::Align::Fill);
-    picture_bottom.set_margin_bottom(8);
-    lens_label.set_halign(gtk::Align::Center);
-    picture_bottom.append(&slider_revealer);
-    picture_bottom.append(&lens_label);
-    overlay.add_overlay(&picture_bottom);
-
-    // Over the top of the picture: the AE/AF lock chip; beside the focus
-    // ring, the EV slider (placed when shown).
+    // Over the top of the picture: the AE/AF lock, low light and burst
+    // chips; beside the focus ring, the EV slider (placed when shown).
     let lock_chip = gtk::Label::new(Some("AE/AF lock"));
     lock_chip.add_css_class("lock-chip");
-    lock_chip.set_halign(gtk::Align::Center);
-    lock_chip.set_valign(gtk::Align::Start);
-    lock_chip.set_margin_top(50);
     lock_chip.set_visible(false);
     lock_chip.set_can_target(false);
     overlay.add_overlay(&lock_chip);
     // Low light: the main camera stands in for the telephoto.
     let low_light_chip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     low_light_chip.add_css_class("note-chip");
-    low_light_chip.append(&gtk::Image::from_icon_name("weather-clear-night-symbolic"));
+    low_light_chip.append(&gtk::Image::from_icon_name("omacam-night-symbolic"));
     low_light_chip.append(&gtk::Label::new(Some("Low light: main camera")));
     low_light_chip.set_tooltip_text(Some(
         "Too dark for the telephoto: the main camera shows this zoom",
     ));
-    low_light_chip.set_halign(gtk::Align::Center);
-    low_light_chip.set_valign(gtk::Align::Start);
-    low_light_chip.set_margin_top(86);
     low_light_chip.set_visible(false);
     low_light_chip.set_can_target(false);
     overlay.add_overlay(&low_light_chip);
-    // Video: 30 or 60 fps, where the lens's mode allows 60.
-    let fps_toggle = gtk::ToggleButton::with_label("60 FPS");
-    fps_toggle.add_css_class("fps-toggle");
-    fps_toggle.set_tooltip_text(Some("Record at 60 frames per second"));
-    fps_toggle.set_halign(gtk::Align::End);
-    fps_toggle.set_valign(gtk::Align::Start);
-    fps_toggle.set_margin_top(16);
-    fps_toggle.set_margin_end(64);
-    fps_toggle.set_visible(false);
-    overlay.add_overlay(&fps_toggle);
-    // Photo: HDR, in the same place (the two never show together).
-    let hdr_toggle = gtk::ToggleButton::with_label("HDR");
-    hdr_toggle.add_css_class("fps-toggle");
-    hdr_toggle.set_tooltip_text(Some("Merge a burst to keep highlights and shadows"));
-    hdr_toggle.set_halign(gtk::Align::End);
-    hdr_toggle.set_valign(gtk::Align::Start);
-    hdr_toggle.set_margin_top(16);
-    hdr_toggle.set_margin_end(64);
-    hdr_toggle.set_visible(false);
-    overlay.add_overlay(&hdr_toggle);
     let burst_label = gtk::Label::new(None);
     let burst_spinner = gtk::Spinner::new();
     burst_spinner.set_spinning(true);
@@ -617,7 +675,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     burst_chip.append(&burst_label);
     burst_chip.set_halign(gtk::Align::Center);
     burst_chip.set_valign(gtk::Align::Start);
-    burst_chip.set_margin_top(14);
+    burst_chip.set_margin_top(64);
     burst_chip.set_visible(false);
     burst_chip.set_can_target(false);
     overlay.add_overlay(&burst_chip);
@@ -632,72 +690,125 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     ev_slider.set_visible(false);
     overlay.add_overlay(&ev_slider);
 
-    // Below the picture: the zoom buttons and the shutter row, in a bar of
-    // their own, so the picture is letterboxed above them.
-    let controls = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    controls.add_css_class("omacam-controls");
-    controls.set_vexpand(false);
-    // Night / Photo / Video.
-    let mode_night = gtk::ToggleButton::with_label("Night");
-    mode_night.set_tooltip_text(Some("A burst merged into one clean photo: hold still"));
-    let mode_photo = gtk::ToggleButton::with_label("Photo");
-    let mode_video = gtk::ToggleButton::with_label("Video");
-    mode_night.set_group(Some(&mode_photo));
-    mode_video.set_group(Some(&mode_photo));
-    mode_photo.set_active(true);
-    let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    mode_box.add_css_class("mode-switch");
-    mode_box.set_halign(gtk::Align::Center);
-    // Where the camera merges frames of its own for each photo, the app's
-    // bursts can't work: no Night mode (and no HDR chip, `refresh`).
-    let bursts = cli.lens_table().bursts();
-    mode_night.set_visible(bursts);
-    mode_box.append(&mode_night);
-    mode_box.append(&mode_photo);
-    mode_box.append(&mode_video);
-    let pro_toggle = gtk::ToggleButton::with_label("Pro");
-    pro_toggle.set_tooltip_text(Some("Shutter, ISO, white balance and focus"));
-    mode_box.append(&pro_toggle);
-    if omacam_record::init().is_err() {
-        mode_video.set_sensitive(false);
-        mode_video.set_tooltip_text(Some("GStreamer didn't start"));
+    // Bottom: the manual controls (when open) over the lens row, the mode
+    // bar and the shutter row.
+    let thumb_picture = gtk::Image::from_icon_name("omacam-gallery-symbolic");
+    thumb_picture.set_pixel_size(22);
+    let thumb = gtk::Button::new();
+    thumb.set_child(Some(&thumb_picture));
+    thumb.add_css_class("round-button");
+    thumb.add_css_class("thumb");
+    thumb.set_overflow(gtk::Overflow::Hidden);
+    thumb.set_tooltip_text(Some("Last photo"));
+    thumb.set_sensitive(false);
+    let shutter = gtk::Button::new();
+    shutter.add_css_class("shutter");
+    shutter.set_tooltip_text(Some("Take a photo"));
+    let flip = round_button("omacam-flip-symbolic", "Switch camera");
+    // Fixed-size circles: never stretched by the row, whatever the window.
+    for (b, size) in [(&thumb, 56), (&shutter, 72), (&flip, 56)] {
+        b.set_size_request(size, size);
+        b.set_halign(gtk::Align::Center);
+        b.set_valign(gtk::Align::Center);
+        b.set_hexpand(false);
+        b.set_vexpand(false);
     }
-    controls.append(&pills);
-    controls.append(&mode_box);
-    controls.append(&row);
+    let row = gtk::CenterBox::new();
+    row.set_start_widget(Some(&thumb));
+    row.set_center_widget(Some(&shutter));
+    row.set_end_widget(Some(&flip));
+    row.set_vexpand(false);
+    row.set_margin_start(12);
+    row.set_margin_end(12);
 
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    overlay.set_vexpand(true);
-    page.append(&overlay);
-    page.append(&controls);
+    let mode_bar = ModeBar::new(&["Night", "Photo", "Video"]);
+    mode_bar.set_item_visible(0, bursts);
+    mode_bar.set_selected(1);
+    if omacam_record::init().is_err() {
+        mode_bar.set_item_visible(2, false);
+        tracing::warn!("GStreamer didn't start: no video mode");
+    }
+
+    let (ltx, lrx) = async_channel::unbounded::<LensEvent>();
+    let lens_row = LensRow::new(move |e| {
+        let _ = ltx.try_send(e);
+    });
+    let bottom_fixed = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    bottom_fixed.append(&lens_row.root);
+    bottom_fixed.append(&mode_bar);
+    bottom_fixed.append(&row);
+
+    let (mtx, mrx) = async_channel::unbounded::<crate::manual::Action>();
+    let manual = ManualBar::new(move |a| {
+        let _ = mtx.try_send(a);
+    });
+    let manual_revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideUp)
+        .child(&manual.root)
+        .build();
+    let manual_hint_label = gtk::Label::new(None);
+    manual_hint_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let hint_reset = gtk::Button::from_icon_name("window-close-symbolic");
+    hint_reset.set_tooltip_text(Some("All back to automatic"));
+    let manual_hint = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    manual_hint.add_css_class("manual-hint");
+    manual_hint.append(&manual_hint_label);
+    manual_hint.append(&hint_reset);
+    manual_hint.set_halign(gtk::Align::Center);
+    manual_hint.set_visible(false);
+
+    let bottom_panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    bottom_panel.add_css_class("bottom-panel");
+    bottom_panel.set_valign(gtk::Align::End);
+    bottom_panel.append(&manual_revealer);
+    bottom_panel.append(&manual_hint);
+    bottom_panel.append(&bottom_fixed);
+    overlay.add_overlay(&bottom_panel);
 
     let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&page));
+    toasts.set_child(Some(&overlay));
     window.set_content(Some(&toasts));
 
     let (tx, rx) = async_channel::unbounded::<Msg>();
-    let held = Rc::new(Cell::new(DeviceOrientation::Normal));
+    let held = Rc::new(Cell::new(match cli.hold {
+        Some(crate::Hold::Left) => DeviceOrientation::LeftUp,
+        Some(crate::Hold::Right) => DeviceOrientation::RightUp,
+        Some(crate::Hold::UpsideDown) => DeviceOrientation::BottomUp,
+        _ => DeviceOrientation::Normal,
+    }));
     let has_gyro = crate::sensors::gyro::available();
     tracing::info!(has_gyro, "gyroscope");
+    let flash_mode = settings.flash;
     let app = Rc::new(App {
         cli,
         window: window.clone(),
         toasts,
         viewfinder,
-        pills,
-        pill_buttons: RefCell::new(Vec::new()),
-        slider,
-        slider_revealer,
+        top_bar,
+        flash_button,
+        flash_menu,
+        flash_choices,
+        timer_button,
+        aspect_button,
+        bottom_fixed,
+        lens_row,
+        mode_bar,
+        ui_mode: Cell::new(UiMode::Photo),
+        manual,
+        manual_revealer,
+        manual_hint,
+        manual_hint_label,
         zoom_indicator,
-        lens_label,
         status,
         status_box,
         shutter,
         flip,
-        macro_pill,
         thumb,
         thumb_picture,
         debug,
+        flash_led: Box::new(crate::flash::Placeholder),
+        before_torch: Cell::new(FlashMode::Off),
+        flash_firing: Cell::new(false),
         backend: RefCell::new(None),
         controller: RefCell::new(None),
         frame_slot: Arc::new(Mutex::new(None)),
@@ -713,19 +824,12 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
             value: 0.0,
         }),
         pinch_base: Cell::new(1.0),
-        drag_base: Cell::new(0.0),
-        drag_claimed: Cell::new(false),
-        setting_slider: Cell::new(false),
         hide_source: RefCell::new(None),
         unfocus_source: RefCell::new(None),
         suspended: Cell::new(false),
         last_photo: RefCell::new(None),
         last_error: RefCell::new(None),
         burst: RefCell::new(Vec::new()),
-        built_presets: RefCell::new(Vec::new()),
-        pro_toggle: pro_toggle.clone(),
-        pro_panel: RefCell::new(None),
-        picture_bottom: picture_bottom.clone(),
         lock_chip,
         low_light_chip,
         fps_toggle: fps_toggle.clone(),
@@ -746,10 +850,6 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         countdown_left: Cell::new(0),
         settings_dialog: RefCell::new(None),
         shown_format: Cell::new(None),
-        mode_night,
-        mode_photo,
-        mode_video,
-        mode_box,
         gear: gear.clone(),
         rec_label,
         recording: RefCell::new(None),
@@ -761,7 +861,9 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         bursts,
         locator: RefCell::new(None),
     });
-    {
+    // How the phone is held: the accelerometer, unless the command line
+    // says (or the fake cameras run: the O key turns the phone then).
+    if app.cli.hold.is_none() && !app.cli.fake {
         let a = Rc::downgrade(&app);
         let sensor = crate::sensors::Accelerometer::claim(held.clone(), move |_| {
             if let Some(a) = a.upgrade() {
@@ -778,12 +880,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
                 return;
             }
             let fps = if b.is_active() { 60 } else { 30 };
-            let mut s = a.settings.borrow().clone();
-            s.video_fps = fps;
-            if let Err(e) = s.save(&a.settings_path) {
-                a.error(&format!("Settings not saved: {e}"));
-            }
-            *a.settings.borrow_mut() = s;
+            a.change_settings(|s| s.video_fps = fps);
             if let Some(out) = a.with_controller(|c| c.set_video_fps(fps)) {
                 a.apply(out);
             }
@@ -796,12 +893,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
             if a.setting_hdr.get() {
                 return;
             }
-            let mut s = a.settings.borrow().clone();
-            s.hdr = b.is_active();
-            if let Err(e) = s.save(&a.settings_path) {
-                a.error(&format!("Settings not saved: {e}"));
-            }
-            *a.settings.borrow_mut() = s;
+            a.change_settings(|s| s.hdr = b.is_active());
             a.push_capture_mode();
         });
     }
@@ -813,7 +905,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
                 "no bursts on this camera (lens table): single photos instead"
             );
         }
-        CaptureMode::Night => app.mode_night.set_active(true),
+        CaptureMode::Night => app.set_ui_mode(UiMode::Night),
         CaptureMode::Hdr => app.settings.borrow_mut().hdr = true,
         CaptureMode::Full | CaptureMode::Quick => {}
     }
@@ -824,7 +916,6 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     for w in [
         app.thumb.upcast_ref::<gtk::Widget>(),
         app.flip.upcast_ref(),
-        app.gear.upcast_ref(),
         app.lock_chip.upcast_ref(),
         app.low_light_chip.upcast_ref(),
         app.fps_toggle.upcast_ref(),
@@ -838,11 +929,20 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     }
     app.turn_controls();
     app.location_setting_changed();
+    app.flash_led.set_mode(flash_mode);
     {
         let a = Rc::downgrade(&app);
         gear.connect_clicked(move |_| {
             if let Some(a) = a.upgrade() {
                 a.open_settings();
+            }
+        });
+    }
+    {
+        let a = Rc::downgrade(&app);
+        hint_reset.connect_clicked(move |_| {
+            if let Some(a) = a.upgrade() {
+                a.manual_action(crate::manual::Action::AllAuto);
             }
         });
     }
@@ -855,6 +955,20 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {
             a.handle(msg);
+        }
+    });
+    let a = Rc::downgrade(&app);
+    glib::spawn_future_local(async move {
+        while let Ok(e) = lrx.recv().await {
+            let Some(a) = a.upgrade() else { break };
+            a.lens_event(e);
+        }
+    });
+    let a = Rc::downgrade(&app);
+    glib::spawn_future_local(async move {
+        while let Ok(action) = mrx.recv().await {
+            let Some(a) = a.upgrade() else { break };
+            a.manual_action(action);
         }
     });
     let a = Rc::downgrade(&app);
@@ -881,6 +995,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
 
 async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
     use crate::script::Step;
+    use omacam_core::backend::{Awb, Setting};
     for step in steps {
         tracing::info!(?step, "script");
         match step {
@@ -890,8 +1005,15 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 app.zoom_to(z, ZoomSource::Gesture);
                 app.zoom_released();
             }
+            Step::Lens(z) => app.lens_event(LensEvent::Button(z)),
+            Step::Dial(z) => {
+                app.lens_row.show_dial();
+                app.lens_event(LensEvent::Drag(z));
+                app.lens_event(LensEvent::Released);
+                app.lens_row.hide_dial_later();
+            }
             Step::Flip => app.flip.emit_clicked(),
-            Step::Macro => app.macro_pill.emit_clicked(),
+            Step::Macro => app.lens_event(LensEvent::Macro),
             Step::Shutter => app.shutter.emit_clicked(),
             Step::Shot(path) => match app.shot_after_paint(path.clone()).await {
                 Ok(()) => tracing::info!(path = %path.display(), "window saved"),
@@ -912,38 +1034,77 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 }
             }
             Step::Mode(m) => match m.as_str() {
-                "video" => app.mode_video.set_active(true),
+                "video" => app.set_ui_mode(UiMode::Video),
                 "night" if !app.bursts => {
                     tracing::info!("no Night mode on this camera (lens table): photo mode instead");
-                    app.mode_photo.set_active(true);
+                    app.set_ui_mode(UiMode::Photo);
                 }
-                "night" => app.mode_night.set_active(true),
-                _ => app.mode_photo.set_active(true),
+                "night" => app.set_ui_mode(UiMode::Night),
+                _ => app.set_ui_mode(UiMode::Photo),
             },
             Step::Hdr(true) if !app.bursts => {
                 tracing::info!("no HDR on this camera (lens table): single photos instead");
             }
             Step::Hdr(on) => app.hdr_toggle.set_active(on),
             Step::Tap(u, v) => app.tap_at(u, v),
-            Step::Pro(on) => app.pro_toggle.set_active(on),
+            Step::Pro(on) => app.set_manual_open(on),
             Step::ProEdit(which) => {
-                use crate::pro::Kind;
+                use crate::manual::Kind;
                 let kind = match which.as_str() {
-                    "shutter" => Kind::Shutter,
-                    "iso" => Kind::Iso,
-                    "wb" => Kind::WhiteBalance,
-                    _ => Kind::Focus,
+                    "ev" => Some(Kind::Ev),
+                    "shutter" => Some(Kind::Shutter),
+                    "iso" => Some(Kind::Iso),
+                    "wb" => Some(Kind::WhiteBalance),
+                    "focus" => Some(Kind::Focus),
+                    _ => None,
                 };
-                if let Some(p) = app.pro_panel.borrow().as_ref() {
-                    p.select(kind);
-                }
+                app.manual.select(kind);
                 app.refresh();
             }
-            Step::ProShutter(us) => app.pro_action(crate::pro::Action::Shutter(if us == 0 {
-                omacam_core::backend::Setting::Auto
+            Step::ProShutter(us) => app.manual_action(crate::manual::Action::Shutter(if us == 0 {
+                Setting::Auto
             } else {
-                omacam_core::backend::Setting::Manual(us as i32)
+                Setting::Manual(us as i32)
             })),
+            Step::Focus(p) => app.manual_action(crate::manual::Action::Focus(match p {
+                Some(p) => Setting::Manual(p as f32),
+                None => Setting::Auto,
+            })),
+            Step::Iso(i) => app.manual_action(crate::manual::Action::Iso(match i {
+                Some(i) => Setting::Manual(i),
+                None => Setting::Auto,
+            })),
+            Step::Wb(k) => app.manual_action(crate::manual::Action::WhiteBalance(match k {
+                Some(k) => Setting::Manual(Awb::Kelvin(k)),
+                None => Setting::Auto,
+            })),
+            Step::Histogram(on) => app.manual.set_histogram(on),
+            Step::Flash(m) => app.set_flash(match m.as_str() {
+                "auto" => FlashMode::Auto,
+                "on" => FlashMode::On,
+                "torch" => FlashMode::Torch,
+                _ => FlashMode::Off,
+            }),
+            Step::FlashMenu => app.flash_menu.set_reveal_child(true),
+            Step::Aspect(a) => {
+                let aspect = match a.as_str() {
+                    "4:3" => Aspect::FourThree,
+                    "16:9" => Aspect::SixteenNine,
+                    "1:1" => Aspect::Square,
+                    _ => Aspect::Full,
+                };
+                app.change_settings(|s| s.aspect = aspect);
+                app.refresh();
+            }
+            Step::Timer(t) => {
+                let timer = match t {
+                    3 => Timer::Three,
+                    10 => Timer::Ten,
+                    _ => Timer::Off,
+                };
+                app.change_settings(|s| s.timer = timer);
+                app.refresh();
+            }
             Step::Lock => {
                 if let Some(out) = app.with_controller(|c| c.lock(Instant::now())) {
                     app.apply(out);
@@ -1128,7 +1289,7 @@ fn mean_luma(frame: &Frame) -> Option<f64> {
     (n > 0).then(|| sum / n as f64)
 }
 
-fn format_zoom(z: f64) -> String {
+pub(crate) fn format_zoom(z: f64) -> String {
     let r = (z * 10.0).round() / 10.0;
     if r < 1.0 {
         format!("{r:.1}×").trim_start_matches('0').to_string()
@@ -1139,7 +1300,8 @@ fn format_zoom(z: f64) -> String {
     }
 }
 
-fn preset_label(p: f64) -> String {
+/// A zoom stage's button label: ".5", "1", "2", "5".
+pub(crate) fn stage_label(p: f64) -> String {
     if p < 1.0 {
         // One decimal: the full ultrawide (0.45x) reads ".5", as on stock.
         format!("{:.1}", (p * 10.0).round() / 10.0)
@@ -1230,6 +1392,7 @@ impl App {
                 }
                 Output::Show(frame) => self.show(frame),
                 Output::Picture(p) => {
+                    self.flash_done();
                     if self.settings.borrow().shutter_sound {
                         play_shutter_sound();
                     }
@@ -1242,7 +1405,10 @@ impl App {
                     }
                     burst.push(*p);
                 }
-                Output::BurstDone => self.merge_burst(),
+                Output::BurstDone => {
+                    self.flash_done();
+                    self.merge_burst()
+                }
                 Output::Error(msg) => self.error(&msg),
             }
         }
@@ -1262,6 +1428,7 @@ impl App {
                     transfer_exposure: self.cli.exposure_hints,
                     tap_to_focus: self.settings.borrow().tap_to_focus,
                     low_light: self.settings.borrow().low_light,
+                    hold_lens: !self.settings.borrow().switch_lenses_by_zoom,
                     video_fps: self.settings.borrow().video_fps,
                     raw_merge: !self.cli.no_raw_merge,
                     ..Options::default()
@@ -1378,9 +1545,15 @@ impl App {
                     tracing::info!(ms = gap.as_millis() as u64, "viewfinder waited for a frame");
                 }
             }
-            self.shown_ae
-                .set((frame.meta.exposure_us, frame.meta.analog_gain));
         }
+        // The exposure the camera chose, for the auto flash (and the log).
+        self.shown_ae.set((
+            frame.meta.exposure_us,
+            frame
+                .meta
+                .analog_gain
+                .map(|g| g * frame.meta.digital_gain.unwrap_or(1.0)),
+        ));
         if let FrameData::Shared(px) = &frame.data {
             *self.last_pixels.borrow_mut() = Some((
                 px.clone(),
@@ -1539,7 +1712,7 @@ impl App {
         let frames = std::mem::take(&mut *self.burst.borrow_mut());
         // The burst was taken in the mode still selected: the mode switch
         // is off while the camera takes it.
-        let hdr = !self.mode_night.is_active();
+        let hdr = self.ui_mode.get() != UiMode::Night;
         self.merging.set(Some(frames.len()));
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -1553,7 +1726,7 @@ impl App {
     /// The photo capture the controls ask for: a Night or HDR burst, or the
     /// command line's single frame. No burst where the lens table has none.
     fn capture_mode(&self) -> capture::Mode {
-        if self.bursts && self.mode_night.is_active() {
+        if self.bursts && self.ui_mode.get() == UiMode::Night {
             capture::Mode::Burst(capture::BurstSpec::NIGHT)
         } else if self.bursts && self.settings.borrow().hdr {
             capture::Mode::Burst(capture::BurstSpec::HDR)
@@ -1592,45 +1765,27 @@ impl App {
         let Some(view) = self.controller.borrow().as_ref().map(|c| c.view()) else {
             return;
         };
-        if *self.built_presets.borrow() != view.presets {
-            self.build_pills(&view.presets);
-        }
-        // The active pill: the highest preset at or below the zoom; it
-        // shows the exact zoom.
-        let active = view
-            .presets
-            .iter()
-            .rposition(|&p| view.zoom + 1e-6 >= p)
-            .unwrap_or(0);
-        for (i, (p, b)) in self.pill_buttons.borrow().iter().enumerate() {
-            if i == active {
-                b.add_css_class("active");
-                b.set_label(&format_zoom(view.zoom));
-            } else {
-                b.remove_css_class("active");
-                b.set_label(&preset_label(*p));
-            }
-        }
-        self.lens_label.set_label(&view.lens_name);
+        let video = view.mode == omacam_core::controller::Mode::Video;
+        let busy = view.capturing || self.merging.get().is_some();
+        self.lens_row.update(
+            &view.buttons,
+            view.zoom,
+            view.zoom_floor,
+            view.max_zoom,
+            view.can_macro && !view.recording,
+            view.macro_on,
+            !view.capturing,
+        );
         self.flip.set_visible(view.can_flip);
-        self.flip.set_sensitive(!view.capturing);
-        self.macro_pill.set_visible(view.can_macro);
-        self.macro_pill
-            .set_sensitive(!view.capturing && !view.recording);
-        if view.macro_on {
-            self.macro_pill.add_css_class("active");
-        } else {
-            self.macro_pill.remove_css_class("active");
-        }
+        self.flip.set_sensitive(!view.capturing && !view.recording);
         if view.capturing {
             self.shutter.add_css_class("busy");
         } else {
             self.shutter.remove_css_class("busy");
         }
-        self.shutter.set_sensitive(
-            !view.capturing && self.merging.get().is_none() && (!view.switching || view.recording),
-        );
-        let video = view.mode == omacam_core::controller::Mode::Video;
+        self.shutter
+            .set_sensitive(!busy && (!view.switching || view.recording));
+        let night = self.ui_mode.get() == UiMode::Night;
         if video {
             self.shutter.add_css_class("record");
             self.shutter.set_tooltip_text(Some(if view.recording {
@@ -1640,31 +1795,29 @@ impl App {
             }));
         } else {
             self.shutter.remove_css_class("record");
-            self.shutter
-                .set_tooltip_text(Some(if self.mode_night.is_active() {
-                    "Take a Night photo"
-                } else {
-                    "Take a photo"
-                }));
+            self.shutter.set_tooltip_text(Some(if night {
+                "Take a Night photo"
+            } else {
+                "Take a photo"
+            }));
         }
         if view.recording {
             self.shutter.add_css_class("recording");
         } else {
             self.shutter.remove_css_class("recording");
         }
-        self.mode_box
+        self.mode_bar
             .set_sensitive(!view.recording && !view.capturing);
-        if self.mode_video.is_active() != video {
-            if video {
-                self.mode_video.set_active(true);
-            } else {
-                self.mode_photo.set_active(true);
-            }
+        // The controller's mode wins (a recording or a photo may have
+        // held a change back).
+        let shown = self.ui_mode.get();
+        if (shown == UiMode::Video) != video {
+            let m = if video { UiMode::Video } else { UiMode::Photo };
+            self.ui_mode.set(m);
+            self.mode_bar
+                .set_selected(UI_MODES.iter().position(|x| *x == m).unwrap_or(1));
         }
         self.gear.set_sensitive(!view.recording);
-        if view.recording {
-            self.flip.set_sensitive(false);
-        }
         if let Some(r) = self.recording.borrow().as_ref() {
             // Every lens's view follows the zoom; the recorded camera's
             // goes to the recorder, the others' wait for a switch.
@@ -1693,37 +1846,39 @@ impl App {
             ));
             self.rec_label.set_visible(true);
         }
-        if !self.setting_slider.get() {
-            let pos = self
-                .controller
-                .borrow()
-                .as_ref()
-                .map(|c| c.slider_position())
-                .unwrap_or(0.0);
-            self.setting_slider.set(true);
-            self.slider.set_value(pos);
-            self.setting_slider.set(false);
-        }
         // Zoom a frozen frame with the fingers while a lens starts.
         if let Some(cam) = self.shown_camera.borrow().as_ref() {
             self.viewfinder.set_placement(self.placement_for(cam));
         }
         let settings = self.settings.borrow().clone();
-        let ring = view.focus.map(|f| Ring {
-            u: f.u,
-            v: f.v,
-            color: match f.status {
-                FocusStatus::Scanning => gdk::RGBA::new(1.0, 1.0, 1.0, 0.9),
-                FocusStatus::Focused => gdk::RGBA::new(1.0, 0.84, 0.31, 1.0),
-                FocusStatus::Failed => gdk::RGBA::new(1.0, 0.42, 0.42, 1.0),
-                FocusStatus::FixedFocus | FocusStatus::Unavailable => {
-                    gdk::RGBA::new(1.0, 1.0, 1.0, 0.4)
-                }
-                FocusStatus::Following => gdk::RGBA::new(1.0, 0.84, 0.31, 0.8),
-            },
-        });
+        // The focus ring while it scans and holds; afterwards a small
+        // marker where focus and metering still look, until given up.
+        let ring = view
+            .focus
+            .map(|f| Ring {
+                u: f.u,
+                v: f.v,
+                color: match f.status {
+                    FocusStatus::Scanning => gdk::RGBA::new(1.0, 1.0, 1.0, 0.9),
+                    FocusStatus::Focused => gdk::RGBA::new(1.0, 0.84, 0.31, 1.0),
+                    FocusStatus::Failed => gdk::RGBA::new(1.0, 0.42, 0.42, 1.0),
+                    FocusStatus::FixedFocus | FocusStatus::Unavailable => {
+                        gdk::RGBA::new(1.0, 1.0, 1.0, 0.4)
+                    }
+                    FocusStatus::Following => gdk::RGBA::new(1.0, 0.84, 0.31, 0.8),
+                },
+                marker: false,
+            })
+            .or_else(|| {
+                view.tap_point.map(|(u, v)| Ring {
+                    u,
+                    v,
+                    color: gdk::RGBA::new(1.0, 0.84, 0.31, 0.85),
+                    marker: true,
+                })
+            });
         // Video records 16:9, upright 9:16: show what goes in the file.
-        let aspect = if view.mode == omacam_core::controller::Mode::Video {
+        let aspect = if video {
             Some(9.0 / 16.0)
         } else {
             settings.aspect.portrait_ratio()
@@ -1756,37 +1911,13 @@ impl App {
         } else if self.countdown.borrow().is_none() && self.hide_source.borrow().is_none() {
             self.zoom_indicator.set_visible(false);
         }
-        // Exposure: the lock chip, the EV slider beside the ring, the Pro
-        // panel.
+        // Exposure: the lock chip, the EV slider beside the ring (where
+        // the settings keep it), the manual controls.
         let ex = &view.exposure;
         self.lock_chip.set_visible(ex.locked);
         self.low_light_chip.set_visible(view.low_light);
-        if self.controls_turn.get() != 0 {
-            self.place_banners();
-        }
-        let video_mode = view.mode == omacam_core::controller::Mode::Video;
-        self.fps_toggle
-            .set_visible(video_mode && view.can_60fps && !view.recording);
-        if self.fps_toggle.is_active() != (view.video_fps >= 60) {
-            self.setting_fps.set(true);
-            self.fps_toggle.set_active(view.video_fps >= 60);
-            self.setting_fps.set(false);
-        }
-        self.hdr_toggle.set_visible(
-            self.bursts
-                && !video_mode
-                && !self.mode_night.is_active()
-                && !self.pro_toggle.is_active(),
-        );
-        let hdr = self.settings.borrow().hdr;
-        if self.hdr_toggle.is_active() != hdr {
-            self.setting_hdr.set(true);
-            self.hdr_toggle.set_active(hdr);
-            self.setting_hdr.set(false);
-        }
-        // A burst: hold still while it's taken, then the merge. The merge
-        // starts while the preview is still coming back, which counts as
-        // capturing, so it wins.
+        self.place_banners();
+        self.refresh_top_bar(&view);
         let bursting = view.capturing && matches!(self.capture_mode(), capture::Mode::Burst(_));
         if let Some(n) = self.merging.get() {
             self.burst_label.set_label(&format!("Merging {n} frames…"));
@@ -1795,7 +1926,8 @@ impl App {
         }
         self.burst_chip
             .set_visible(bursting || self.merging.get().is_some());
-        let ev_on = ex.caps.ev.is_some()
+        let ev_on = settings.tap_ev_slider
+            && ex.caps.ev.is_some()
             && self
                 .ev_shown_until
                 .get()
@@ -1815,8 +1947,33 @@ impl App {
             self.setting_ev.set(false);
         }
         self.ev_slider.set_visible(ev_on && anchor.is_some());
-        if let Some(p) = self.pro_panel.borrow().as_ref() {
-            p.update(ex);
+        self.manual.update(ex);
+        let open = self.manual_revealer.reveals_child();
+        let set = crate::manual::any_set(ex);
+        let adjust = &self.lens_row.adjust;
+        if adjust.is_active() != open {
+            adjust.set_active(open);
+        }
+        if set {
+            adjust.add_css_class("set");
+        } else {
+            adjust.remove_css_class("set");
+        }
+        // Night bursts take their own exposure: no manual values then.
+        adjust.set_sensitive(!night);
+        match crate::manual::summary(ex).filter(|_| !open) {
+            Some(text) => {
+                self.manual_hint_label.set_label(&format!("● {text}"));
+                self.manual_hint.set_visible(true);
+            }
+            None => self.manual_hint.set_visible(false),
+        }
+        // The torch beside the lens row, with the macro lens on.
+        let torch = &self.lens_row.torch;
+        torch.set_visible(view.macro_on && self.flash_led.available());
+        let lit = settings.flash == FlashMode::Torch;
+        if torch.is_active() != lit {
+            torch.set_active(lit);
         }
         self.debug.set_visible(self.debug_enabled());
         if self.debug_enabled() {
@@ -1839,35 +1996,61 @@ impl App {
         }
     }
 
-    fn build_pills(self: &Rc<Self>, presets: &[f64]) {
-        while let Some(c) = self.pills.first_child() {
-            self.pills.remove(&c);
+    /// The quick settings: what each shows, and which belong to the mode.
+    fn refresh_top_bar(&self, view: &omacam_core::controller::ViewState) {
+        let settings = self.settings.borrow().clone();
+        let video = view.mode == omacam_core::controller::Mode::Video;
+        let night = self.ui_mode.get() == UiMode::Night;
+        let flash = if video {
+            settings.flash.for_video()
+        } else {
+            settings.flash
+        };
+        self.flash_button.set_visible(self.flash_led.available());
+        if let Some(i) = top_button_icon(&self.flash_button) {
+            i.set_icon_name(Some(flash.icon()));
         }
-        let mut buttons = Vec::new();
-        for &p in presets {
-            let b = gtk::Button::with_label(&preset_label(p));
-            b.add_css_class("zoom-pill");
-            b.add_css_class("turnable");
-            b.set_tooltip_text(Some(&format_zoom(p)));
-            let a = Rc::downgrade(self);
-            b.connect_clicked(move |_| {
-                if let Some(a) = a.upgrade() {
-                    a.zoom_to(p, ZoomSource::Preset);
-                }
-            });
-            self.pills.append(&b);
-            buttons.push((p, b));
+        if flash == FlashMode::Off {
+            self.flash_button.remove_css_class("on");
+        } else {
+            self.flash_button.add_css_class("on");
         }
-        self.pills.append(&self.macro_pill);
-        *self.pill_buttons.borrow_mut() = buttons;
-        *self.built_presets.borrow_mut() = presets.to_vec();
-        // Slider marks at the presets.
-        self.slider.clear_marks();
-        if let Some(c) = self.controller.borrow().as_ref() {
-            for &p in presets {
-                self.slider
-                    .add_mark(c.slider_for(p), gtk::PositionType::Bottom, None);
+        for (mode, b) in &self.flash_choices {
+            if *mode == flash {
+                b.add_css_class("active");
+            } else {
+                b.remove_css_class("active");
             }
+            // Videos have no photo to flash for.
+            b.set_visible(!video || matches!(mode, FlashMode::Off | FlashMode::Torch));
+        }
+        self.timer_button.set_visible(!video);
+        if let Some(l) = top_button_label(&self.timer_button) {
+            let s = settings.timer.seconds();
+            l.set_label(&format!("{s}s"));
+            l.set_visible(s > 0);
+        }
+        if settings.timer == Timer::Off {
+            self.timer_button.remove_css_class("on");
+        } else {
+            self.timer_button.add_css_class("on");
+        }
+        self.aspect_button.set_visible(!video);
+        if let Some(l) = top_button_label(&self.aspect_button) {
+            l.set_label(aspect_label(settings.aspect));
+        }
+        self.fps_toggle
+            .set_visible(video && view.can_60fps && !view.recording);
+        if self.fps_toggle.is_active() != (view.video_fps >= 60) {
+            self.setting_fps.set(true);
+            self.fps_toggle.set_active(view.video_fps >= 60);
+            self.setting_fps.set(false);
+        }
+        self.hdr_toggle.set_visible(self.bursts && !video && !night);
+        if self.hdr_toggle.is_active() != settings.hdr {
+            self.setting_hdr.set(true);
+            self.hdr_toggle.set_active(settings.hdr);
+            self.setting_hdr.set(false);
         }
     }
 
@@ -1885,7 +2068,7 @@ impl App {
         }
     }
 
-    /// Show the zoom readout and the slider for a moment.
+    /// Show the zoom readout for a moment.
     fn flash_zoom(self: &Rc<Self>) {
         let zoom = self
             .controller
@@ -1895,7 +2078,6 @@ impl App {
             .unwrap_or(1.0);
         self.zoom_indicator.set_label(&format_zoom(zoom));
         self.zoom_indicator.set_visible(true);
-        self.slider_revealer.set_reveal_child(true);
         if let Some(id) = self.hide_source.borrow_mut().take() {
             id.remove();
         }
@@ -1904,14 +2086,108 @@ impl App {
             if let Some(a) = a.upgrade() {
                 a.hide_source.borrow_mut().take();
                 a.zoom_indicator.set_visible(false);
-                a.slider_revealer.set_reveal_child(false);
             }
         });
         *self.hide_source.borrow_mut() = Some(id);
     }
 
+    /// The lens row: a button, the macro lens, the dial.
+    fn lens_event(self: &Rc<Self>, e: LensEvent) {
+        let now = Instant::now();
+        match e {
+            LensEvent::Button(z) => {
+                if let Some(out) = self.with_controller(|c| c.press_zoom_button(z, now)) {
+                    self.apply(out);
+                }
+                self.flash_zoom();
+            }
+            LensEvent::Macro => {
+                if let Some(out) = self.with_controller(|c| c.toggle_macro(now)) {
+                    self.apply(out);
+                }
+            }
+            LensEvent::Drag(z) => self.zoom_to(z, ZoomSource::Gesture),
+            LensEvent::Released => self.zoom_released(),
+        }
+    }
+
+    /// Choose a mode as the mode bar would.
+    fn set_ui_mode(self: &Rc<Self>, mode: UiMode) {
+        if let Some(i) = UI_MODES.iter().position(|m| *m == mode) {
+            self.mode_bar.set_selected(i);
+        }
+        self.mode_chosen(mode);
+    }
+
+    /// The mode bar chose a mode.
+    fn mode_chosen(self: &Rc<Self>, mode: UiMode) {
+        let before = self.ui_mode.replace(mode);
+        if mode == UiMode::Night && before != UiMode::Night {
+            // A Night burst takes its own exposure: manual values and the
+            // controls for them go.
+            self.set_manual_open(false);
+        }
+        let cmode = if mode == UiMode::Video {
+            omacam_core::controller::Mode::Video
+        } else {
+            omacam_core::controller::Mode::Photo
+        };
+        if let Some(out) = self.with_controller(|c| c.set_mode(cmode, Instant::now())) {
+            self.apply(out);
+        }
+        // The torch stays as it is; the flash for photos has nothing to
+        // do in a video.
+        self.flash_led.set_mode(self.effective_flash());
+        self.push_capture_mode();
+    }
+
+    /// The flash mode in force: the setting, or for videos only the torch.
+    fn effective_flash(&self) -> FlashMode {
+        let f = self.settings.borrow().flash;
+        if self.ui_mode.get() == UiMode::Video {
+            f.for_video()
+        } else {
+            f
+        }
+    }
+
+    fn set_flash(self: &Rc<Self>, mode: FlashMode) {
+        let before = self.settings.borrow().flash;
+        if mode == FlashMode::Torch && before != FlashMode::Torch {
+            self.before_torch.set(before);
+        }
+        self.change_settings(|s| s.flash = mode);
+        self.flash_led.set_mode(self.effective_flash());
+        self.flash_menu.set_reveal_child(false);
+        self.refresh();
+    }
+
+    /// Change the settings and save them.
+    fn change_settings(&self, f: impl FnOnce(&mut Settings)) {
+        let mut s = self.settings.borrow().clone();
+        f(&mut s);
+        if let Err(e) = s.save(&self.settings_path) {
+            self.error(&format!("Settings not saved: {e}"));
+        }
+        *self.settings.borrow_mut() = s;
+    }
+
+    /// Open or close the manual controls.
+    fn set_manual_open(self: &Rc<Self>, open: bool) {
+        self.manual_revealer.set_reveal_child(open);
+        if !open {
+            self.manual.select(None);
+        }
+        // While they're open the lens is the one chosen (no low-light
+        // stand-in).
+        if let Some(out) = self.with_controller(|c| c.set_pro(open, Instant::now())) {
+            self.apply(out);
+        }
+        self.refresh();
+    }
+
     fn connect_input(self: &Rc<Self>) {
-        // Pinch anywhere on the viewfinder.
+        // Pinch anywhere on the viewfinder; it rests a moment at 1x.
         let pinch = gtk::GestureZoom::new();
         let a = Rc::downgrade(self);
         pinch.connect_begin(move |_, _| {
@@ -1928,7 +2204,8 @@ impl App {
         let a = Rc::downgrade(self);
         pinch.connect_scale_changed(move |_, s| {
             if let Some(a) = a.upgrade() {
-                a.zoom_to(a.pinch_base.get() * s, ZoomSource::Gesture);
+                let z = crate::dial::snap(a.pinch_base.get() * s, &[1.0]);
+                a.zoom_to(z, ZoomSource::Gesture);
             }
         });
         let a = Rc::downgrade(self);
@@ -1938,70 +2215,25 @@ impl App {
             }
         });
         self.viewfinder.add_controller(pinch);
-
-        // Drag sideways across the pills to zoom smoothly, like the slider.
-        let drag = gtk::GestureDrag::new();
-        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+        // A mouse wheel zooms too (a laptop has no pinch on its screen).
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         let a = Rc::downgrade(self);
-        drag.connect_drag_begin(move |_, _, _| {
-            if let Some(a) = a.upgrade() {
-                let pos = a
-                    .controller
-                    .borrow()
-                    .as_ref()
-                    .map(|c| c.slider_position())
-                    .unwrap_or(0.0);
-                a.drag_base.set(pos);
-                a.drag_claimed.set(false);
-            }
-        });
-        let a = Rc::downgrade(self);
-        drag.connect_drag_update(move |g, dx, _| {
-            let Some(a) = a.upgrade() else { return };
-            if !a.drag_claimed.get() {
-                if dx.abs() < 12.0 {
-                    return;
-                }
-                g.set_state(gtk::EventSequenceState::Claimed);
-                a.drag_claimed.set(true);
-            }
-            let pos = (a.drag_base.get() + dx / 360.0).clamp(0.0, 1.0);
-            let zoom = a
+        scroll.connect_scroll(move |_, _, dy| {
+            let Some(a) = a.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let z = a
                 .controller
                 .borrow()
                 .as_ref()
-                .map(|c| c.zoom_for_slider(pos));
-            if let Some(z) = zoom {
-                a.zoom_to(z, ZoomSource::Gesture);
-            }
+                .map(|c| c.view().zoom)
+                .unwrap_or(1.0);
+            let z = crate::dial::snap(z * 2f64.powf(-dy * 0.1), &[1.0]);
+            a.zoom_to(z, ZoomSource::Gesture);
+            a.zoom_released();
+            glib::Propagation::Stop
         });
-        let a = Rc::downgrade(self);
-        drag.connect_drag_end(move |_, _, _| {
-            if let Some(a) = a.upgrade() {
-                if a.drag_claimed.replace(false) {
-                    a.zoom_released();
-                }
-            }
-        });
-        self.pills.add_controller(drag);
-
-        let a = Rc::downgrade(self);
-        self.slider.connect_value_changed(move |s| {
-            let Some(a) = a.upgrade() else { return };
-            if a.setting_slider.get() {
-                return;
-            }
-            let zoom = a
-                .controller
-                .borrow()
-                .as_ref()
-                .map(|c| c.zoom_for_slider(s.value()));
-            if let Some(z) = zoom {
-                a.setting_slider.set(true);
-                a.zoom_to(z, ZoomSource::Gesture);
-                a.setting_slider.set(false);
-            }
-        });
+        self.viewfinder.add_controller(scroll);
 
         let a = Rc::downgrade(self);
         self.shutter.connect_clicked(move |_| {
@@ -2010,48 +2242,102 @@ impl App {
             }
         });
         let a = Rc::downgrade(self);
-        self.pro_toggle.connect_toggled(move |b| {
+        self.mode_bar.connect_selected(move |i| {
             if let Some(a) = a.upgrade() {
-                // Pro's manual values and a Night burst's own exposure
-                // don't mix: Pro takes single photos.
-                if b.is_active() && a.mode_night.is_active() {
-                    a.mode_photo.set_active(true);
-                }
-                a.set_pro(b.is_active());
-                a.push_capture_mode();
+                a.mode_chosen(UI_MODES[i.min(UI_MODES.len() - 1)]);
             }
         });
         let a = Rc::downgrade(self);
-        self.mode_night.connect_toggled(move |b| {
-            let Some(a) = a.upgrade() else { return };
-            if b.is_active() && a.pro_toggle.is_active() {
-                a.pro_toggle.set_active(false);
+        self.lens_row.adjust.connect_clicked(move |b| {
+            if let Some(a) = a.upgrade() {
+                a.set_manual_open(b.is_active());
             }
-            a.push_capture_mode();
         });
         let a = Rc::downgrade(self);
-        self.mode_video.connect_toggled(move |b| {
+        self.lens_row.torch.connect_clicked(move |b| {
             let Some(a) = a.upgrade() else { return };
-            let mode = if b.is_active() {
-                omacam_core::controller::Mode::Video
+            if b.is_active() {
+                a.set_flash(FlashMode::Torch);
             } else {
-                omacam_core::controller::Mode::Photo
-            };
-            if let Some(out) = a.with_controller(|c| c.set_mode(mode, Instant::now())) {
-                a.apply(out);
+                a.set_flash(a.before_torch.get());
             }
+        });
+        // The quick settings.
+        let a = Rc::downgrade(self);
+        self.flash_button.connect_clicked(move |_| {
+            if let Some(a) = a.upgrade() {
+                let open = a.flash_menu.reveals_child();
+                a.flash_menu.set_reveal_child(!open);
+            }
+        });
+        // A long press on the flash button switches the torch.
+        let press = gtk::GestureLongPress::new();
+        let a = Rc::downgrade(self);
+        press.connect_pressed(move |g, _, _| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            let Some(a) = a.upgrade() else { return };
+            if a.settings.borrow().flash == FlashMode::Torch {
+                a.set_flash(a.before_torch.get());
+            } else {
+                a.set_flash(FlashMode::Torch);
+            }
+        });
+        self.flash_button.add_controller(press);
+        for (mode, b) in &self.flash_choices {
+            let (a, mode) = (Rc::downgrade(self), *mode);
+            b.connect_clicked(move |_| {
+                if let Some(a) = a.upgrade() {
+                    a.set_flash(mode);
+                }
+            });
+        }
+        let a = Rc::downgrade(self);
+        self.timer_button.connect_clicked(move |_| {
+            let Some(a) = a.upgrade() else { return };
+            let next = match a.settings.borrow().timer {
+                Timer::Off => Timer::Three,
+                Timer::Three => Timer::Ten,
+                Timer::Ten => Timer::Off,
+            };
+            a.change_settings(|s| s.timer = next);
+            a.refresh();
+        });
+        let a = Rc::downgrade(self);
+        self.aspect_button.connect_clicked(move |_| {
+            let Some(a) = a.upgrade() else { return };
+            let all = Aspect::ALL;
+            let now = a.settings.borrow().aspect;
+            let i = all.iter().position(|x| *x == now).unwrap_or(0);
+            let next = all[(i + 1) % all.len()];
+            a.change_settings(|s| s.aspect = next);
             a.refresh();
         });
 
-        // Tap the picture to focus there.
+        // Tap the picture to focus and meter there; a tap on the marker
+        // of the point in force gives it up.
         let tap = gtk::GestureClick::new();
         let a = Rc::downgrade(self);
-        tap.connect_released(move |g, n, x, y| {
+        tap.connect_released(move |_, n, x, y| {
             let Some(a) = a.upgrade() else { return };
             if n != 1 {
                 return;
             }
-            let _ = g;
+            if a.flash_menu.reveals_child() {
+                a.flash_menu.set_reveal_child(false);
+                return;
+            }
+            let marker = a
+                .controller
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.view().tap_point)
+                .and_then(|(u, v)| a.viewfinder.widget_point(u, v));
+            if let Some((mx, my)) = marker {
+                if (mx as f64 - x).hypot(my as f64 - y) < 40.0 {
+                    a.clear_tap();
+                    return;
+                }
+            }
             let Some((u, v)) = a.viewfinder.picture_point(x, y) else {
                 return;
             };
@@ -2073,7 +2359,7 @@ impl App {
         });
         self.viewfinder.add_controller(press);
 
-        // The EV slider beside the focus ring.
+        // The EV slider beside the focus ring (where the settings keep it).
         let a = Rc::downgrade(self);
         self.ev_slider.connect_value_changed(move |s| {
             let Some(a) = a.upgrade() else { return };
@@ -2088,7 +2374,8 @@ impl App {
 
         // Volume keys take a photo, when they reach the app at all: the
         // phone's shell binds them for the system volume, and hands them
-        // over through `omacam --remote shutter` instead.
+        // over through `omacam --remote shutter` instead. With the fake
+        // cameras, O turns the phone a quarter (as if held sideways).
         let keys = gtk::EventControllerKey::new();
         let a = Rc::downgrade(self);
         keys.connect_key_pressed(move |_, key, _, _| {
@@ -2100,6 +2387,17 @@ impl App {
                 a.press_shutter();
                 return glib::Propagation::Stop;
             }
+            if a.cli.fake && matches!(key, gdk::Key::o | gdk::Key::O) {
+                a.held.set(match a.held.get() {
+                    DeviceOrientation::Normal => DeviceOrientation::LeftUp,
+                    DeviceOrientation::LeftUp => DeviceOrientation::BottomUp,
+                    DeviceOrientation::BottomUp => DeviceOrientation::RightUp,
+                    _ => DeviceOrientation::Normal,
+                });
+                tracing::info!(held = ?a.held.get(), "held (O key)");
+                a.turn_controls();
+                return glib::Propagation::Stop;
+            }
             glib::Propagation::Proceed
         });
         self.window.add_controller(keys);
@@ -2107,14 +2405,6 @@ impl App {
         self.flip.connect_clicked(move |_| {
             if let Some(a) = a.upgrade() {
                 if let Some(out) = a.with_controller(|c| c.flip(Instant::now())) {
-                    a.apply(out);
-                }
-            }
-        });
-        let a = Rc::downgrade(self);
-        self.macro_pill.connect_clicked(move |_| {
-            if let Some(a) = a.upgrade() {
-                if let Some(out) = a.with_controller(|c| c.toggle_macro(Instant::now())) {
                     a.apply(out);
                 }
             }
@@ -2151,6 +2441,9 @@ impl App {
                 if !w.is_suspended() {
                     a.set_suspended(false);
                 }
+                // Back in front (from the photo viewer, say): focus and
+                // metering over the whole picture again, as shown.
+                a.clear_tap();
             } else {
                 let weak = Rc::downgrade(&a);
                 let id = glib::timeout_add_local_once(UNFOCUSED_RELEASE, move || {
@@ -2163,6 +2456,13 @@ impl App {
                 *a.unfocus_source.borrow_mut() = Some(id);
             }
         });
+    }
+
+    /// Give up the tapped point: focus and metering over the whole picture.
+    fn clear_tap(self: &Rc<Self>) {
+        if let Some(out) = self.with_controller(|c| c.clear_tap()) {
+            self.apply(out);
+        }
     }
 
     fn set_suspended(self: &Rc<Self>, suspended: bool) {
@@ -2186,6 +2486,7 @@ impl App {
     }
 
     fn tick(self: &Rc<Self>) {
+        self.place_picture();
         if let Some(out) = self.with_controller(|c| c.tick(Instant::now())) {
             let focus = self.controller.borrow().as_ref().is_some_and(|c| {
                 c.view().focus.is_some() || self.viewfinder.decor().ring.is_some()
@@ -2198,14 +2499,33 @@ impl App {
         }
     }
 
+    /// The picture between the top bar and the bottom bar (the lens row,
+    /// modes and shutter; the manual controls lie over the picture).
+    fn place_picture(&self) {
+        let vf = &self.viewfinder;
+        let top = self
+            .top_bar
+            .compute_bounds(vf)
+            .map(|b| b.y() + b.height())
+            .unwrap_or(0.0);
+        let bottom = self
+            .bottom_fixed
+            .compute_bounds(vf)
+            .map(|b| vf.height() as f32 - b.y())
+            .unwrap_or(0.0);
+        vf.set_insets(Insets {
+            top: top.max(0.0),
+            bottom: bottom.max(0.0),
+        });
+    }
+
     /// Turn the controls for how the phone is held (the layout stays
     /// portrait; each control turns in place).
     ///
-    /// Icons, zoom buttons, chips and toasts turn; the words of the mode
-    /// switch and the lens name stay level, since turned they'd run into
-    /// the rows above and below. The banners over the top of the picture
-    /// (recording time, AE/AF lock, low light) move to the edge that is
-    /// up, along it.
+    /// Icons, lens buttons, chips and toasts turn; the words of the mode
+    /// bar stay level, since turned they'd run into the rows above and
+    /// below. The banners over the top of the picture (recording time,
+    /// AE/AF lock, low light) move to the edge that is up, along it.
     fn turn_controls(&self) {
         let turn = self.held.get().degrees();
         let old = self.controls_turn.replace(turn);
@@ -2222,6 +2542,8 @@ impl App {
     /// their text, so this runs again as they change).
     fn place_banners(&self) {
         let turn = self.controls_turn.get();
+        // Below the top bar when upright.
+        let top = self.viewfinder.insets().top.max(52.0) as i32;
         let banners: [(&gtk::Widget, i32); 3] = [
             (self.rec_label.upcast_ref(), 14),
             (self.lock_chip.upcast_ref(), 50),
@@ -2250,7 +2572,7 @@ impl App {
                 _ => {
                     w.set_halign(gtk::Align::Center);
                     w.set_valign(gtk::Align::Start);
-                    w.set_margin_top(inset);
+                    w.set_margin_top(top + inset - 6);
                 }
             }
         }
@@ -2600,8 +2922,33 @@ impl App {
     }
 
     fn take_photo(self: &Rc<Self>) {
-        if let Some(out) = self.with_controller(|c| c.shutter(Instant::now())) {
+        // The flash: always, or (auto) when the camera's exposure says the
+        // scene is dark.
+        let (t, g) = self.shown_ae.get();
+        let dark = crate::flash::is_dark(t, g);
+        let fires = self.effective_flash().fires(dark);
+        let out = self.with_controller(|c| c.shutter(Instant::now()));
+        if let Some(out) = out {
+            let started = !out.is_empty()
+                || self
+                    .controller
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|c| c.view().capturing);
+            if fires && started {
+                self.flash_firing.set(true);
+                self.shutter.add_css_class("flash");
+                self.flash_led.photo_starts();
+            }
             self.apply(out);
+        }
+    }
+
+    /// The photo's frame is in: the flash goes back to the mode's state.
+    fn flash_done(&self) {
+        if self.flash_firing.replace(false) {
+            self.shutter.remove_css_class("flash");
+            self.flash_led.photo_done();
         }
     }
 
@@ -2680,9 +3027,11 @@ impl App {
         })));
     }
 
-    fn pro_action(self: &Rc<Self>, action: crate::pro::Action) {
-        use crate::pro::Action;
+    /// The manual controls: a value set by hand or given back to auto.
+    fn manual_action(self: &Rc<Self>, action: crate::manual::Action) {
+        use crate::manual::Action;
         let out = self.with_controller(|c| match action {
+            Action::Ev(ev) => c.set_ev(ev),
             Action::Shutter(s) => c.set_shutter(s),
             Action::Iso(s) => c.set_iso(s),
             Action::WhiteBalance(s) => c.set_white_balance(s),
@@ -2699,26 +3048,6 @@ impl App {
         self.save_pro();
     }
 
-    fn set_pro(self: &Rc<Self>, on: bool) {
-        if on && self.pro_panel.borrow().is_none() {
-            let a = Rc::downgrade(self);
-            let panel = crate::pro::ProPanel::new(move |action| {
-                if let Some(a) = a.upgrade() {
-                    a.pro_action(action);
-                }
-            });
-            self.picture_bottom.prepend(&panel.root);
-            *self.pro_panel.borrow_mut() = Some(panel);
-        }
-        if let Some(p) = self.pro_panel.borrow().as_ref() {
-            p.root.set_visible(on);
-        }
-        if let Some(out) = self.with_controller(|c| c.set_pro(on, Instant::now())) {
-            self.apply(out);
-        }
-        self.refresh();
-    }
-
     fn open_settings(self: &Rc<Self>) {
         let a = Rc::downgrade(self);
         let dialog = crate::prefs::dialog(&self.settings.borrow(), move |s| {
@@ -2731,6 +3060,7 @@ impl App {
             let now = Instant::now();
             let out = a.with_controller(|c| {
                 let mut out = c.set_low_light(s.low_light, now);
+                out.extend(c.set_hold_lens(!s.switch_lenses_by_zoom, now));
                 out.extend(c.set_video_fps(s.video_fps));
                 out
             });
@@ -2824,6 +3154,7 @@ impl App {
             crate::viewfinder::draw(
                 &snapshot,
                 (w, h),
+                self.viewfinder.insets(),
                 self.viewfinder.texture().as_ref(),
                 self.viewfinder.placement(),
                 &self.viewfinder.decor(),

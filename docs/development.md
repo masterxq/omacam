@@ -75,6 +75,13 @@ ssh phone 'cat > /usr/local/bin/omacam && chmod 755 /usr/local/bin/omacam' \
 - **`scripts/ui-shots.sh`** takes screenshots of the UI on synthetic
   frames at 480x1040 in a headless Weston inside a container (never on
   your own desktop), into `target/ui-shots/`.
+- **On a laptop:** `omacam --fake --fake-lenses lisbon --size 412x915`
+  shows the Moto G60s's cameras (main, front, macro; `lisbon-ultrawide`
+  adds an ultrawide, `pixel` gives the Pixel 7 Pro's) in a phone-sized
+  window. `--fake-light 0.03` is a dim room, `--hold left` a phone held
+  sideways (the O key turns it further), `--settings FILE` keeps the
+  settings away from `~/.config`. The fake test card's checkered target
+  blurs as manual focus moves away from where auto focus puts it.
 
 ### Logs
 
@@ -102,9 +109,13 @@ rather than taking it).
      flip; wait 3; flip; wait 3; shutter; wait 4; quit"
   ```
 
-  Steps: `wait SECONDS`, `zoom Z` (a preset button), `pinch Z`, `flip`,
-  `macro` (the macro button), `shutter`, `tap U V` (a tap on the picture), `settings PAGE`
-  (photo, video, advanced), `close-settings`, `shot PATH` and `quit`. After each step the app logs a `state`
+  Steps: `wait SECONDS`, `zoom Z` (a preset), `pinch Z`, `lens Z` (the
+  lens row's button), `dial Z` (the zoom dial), `flip`, `macro` (the macro
+  button), `shutter`, `tap U V` (a tap on the picture), `settings PAGE`
+  (photo, video, advanced), `close-settings`, `mode`, `manual on|off`,
+  `manual-edit ev|focus|wb|shutter|iso`, `focus P|auto`, `iso N|auto`,
+  `wb K|auto`, `flash auto|on|off|torch`, `flash-menu`, `aspect`, `timer`,
+  `hold`, `shot PATH` and `quit` (the full list is in `script.rs`). After each step the app logs a `state`
   line: lens, zoom, frame size, frame rate, the last switch time. `shot`
   renders the window to a PNG itself; with the panel off, when the
   compositor draws nothing, it renders the viewfinder alone.

@@ -6,8 +6,9 @@
 //! preview mode that covers less of it (the main camera's 16:9) is drawn
 //! at its true size inside it, so every lens frames the scene alike and a
 //! lens switch doesn't jump. The picture is fitted inside the widget (the
-//! whole of it shows, as the photo will) and centered in the part above
-//! the controls when it fits there.
+//! whole of it shows, as the photo will: on a phone held upright it takes
+//! the whole width) and placed between the bars at the top and the bottom
+//! when it fits there ([`fit`]); where it doesn't, the bars lie over it.
 //!
 //! When the frames start coming from another camera (a lens switch, a
 //! flip), the last frame of the old one fades out over the new one
@@ -74,9 +75,21 @@ impl Placement {
     }
 }
 
+/// Bars over the top and the bottom of the viewfinder (the quick
+/// settings, and the lens row, modes and shutter), in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Insets {
+    pub top: f32,
+    pub bottom: f32,
+}
+
 /// Where a frame of `frame` size (after rotation) lands in a widget of
-/// `widget` size with `inset` pixels of controls at the bottom.
-pub fn fit(frame: (f32, f32), widget: (f32, f32), inset: f32) -> graphene::Rect {
+/// `widget` size with bars over its top and bottom. The frame is as large
+/// as the widget allows (it fills the limiting side); it sits centered
+/// between the bars when it fits there, else just below the top bar with
+/// the bottom bar over it, else centered in the widget with both bars
+/// over it.
+pub fn fit(frame: (f32, f32), widget: (f32, f32), insets: Insets) -> graphene::Rect {
     let (fw, fh) = frame;
     let (w, h) = widget;
     if fw <= 0.0 || fh <= 0.0 || w <= 0.0 || h <= 0.0 {
@@ -85,10 +98,14 @@ pub fn fit(frame: (f32, f32), widget: (f32, f32), inset: f32) -> graphene::Rect 
     let s = (w / fw).min(h / fh);
     let (dw, dh) = (fw * s, fh * s);
     let x = (w - dw) / 2.0;
-    let above = (h - inset).max(0.0);
-    // Too tall for the space above the controls: start at the top, and
-    // let the controls cover its bottom.
-    let y = if dh <= above { (above - dh) / 2.0 } else { 0.0 };
+    let between = (h - insets.top - insets.bottom).max(0.0);
+    let y = if dh <= between {
+        insets.top + (between - dh) / 2.0
+    } else if dh <= h - insets.top {
+        insets.top
+    } else {
+        (h - dh) / 2.0
+    };
     graphene::Rect::new(x, y, dw, dh)
 }
 
@@ -120,6 +137,7 @@ mod imp {
         pub decor: RefCell<Decor>,
         pub fading: RefCell<Option<Fading>>,
         pub fade_tick: RefCell<Option<gtk::TickCallbackId>>,
+        pub insets: Cell<Insets>,
     }
 
     #[glib::object_subclass]
@@ -145,6 +163,7 @@ mod imp {
             draw(
                 snapshot,
                 (widget.width() as f32, widget.height() as f32),
+                self.insets.get(),
                 self.texture.borrow().as_ref(),
                 self.placement.get(),
                 &self.decor.borrow(),
@@ -159,6 +178,7 @@ mod imp {
 pub fn draw(
     snapshot: &gtk::Snapshot,
     size: (f32, f32),
+    insets: Insets,
     texture: Option<&gdk::Texture>,
     p: Placement,
     decor: &Decor,
@@ -171,7 +191,7 @@ pub fn draw(
     };
     let (_, picture) = p.sizes((tex.width() as f32, tex.height() as f32));
     let shown = crop_to_aspect(picture, decor.aspect);
-    let rect = fit(shown, (w, h), 0.0);
+    let rect = fit(shown, (w, h), insets);
     snapshot.push_clip(&rect);
     // The picture's area, a shade off black: where the frame's mode
     // doesn't reach (the main camera's 16:9 near 1x), the photo still
@@ -203,7 +223,7 @@ pub fn draw(
     snapshot.pop();
     if let Some(bins) = decor.histogram.as_ref().filter(|b| !b.is_empty()) {
         let (hw, hh) = (120.0f32, 48.0f32);
-        let (x0, y0) = (rect.x() + 10.0, rect.y() + 40.0);
+        let (x0, y0) = (rect.x() + 10.0, rect.y().max(insets.top) + 10.0);
         snapshot.append_color(
             &gdk::RGBA::new(0.0, 0.0, 0.0, 0.45),
             &graphene::Rect::new(x0, y0, hw, hh),
@@ -224,10 +244,21 @@ pub fn draw(
             rect.x() + rect.width() * ur as f32,
             rect.y() + rect.height() * vr as f32,
         );
-        let r = 34.0;
+        let (r, width) = if ring.marker {
+            (12.0, 2.0)
+        } else {
+            (34.0, 2.5)
+        };
         let bounds = graphene::Rect::new(cx - r, cy - r, 2.0 * r, 2.0 * r);
         let rounded = gsk::RoundedRect::from_rect(bounds, r);
-        snapshot.append_border(&rounded, &[2.5; 4], &[ring.color; 4]);
+        snapshot.append_border(&rounded, &[width; 4], &[ring.color; 4]);
+        if ring.marker {
+            // A dot in the middle: the point itself.
+            let d = graphene::Rect::new(cx - 2.0, cy - 2.0, 4.0, 4.0);
+            snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(d, 2.0));
+            snapshot.append_color(&ring.color, &d);
+            snapshot.pop();
+        }
     }
 }
 
@@ -288,6 +319,9 @@ pub struct Ring {
     pub u: f64,
     pub v: f64,
     pub color: gdk::RGBA,
+    /// The small marker of a point that focus and metering still follow
+    /// after the ring has gone, instead of the ring.
+    pub marker: bool,
 }
 
 /// The largest centered part of an upright frame with the given aspect
@@ -319,11 +353,12 @@ pub fn widget_to_picture(
     x: f32,
     y: f32,
     widget: (f32, f32),
+    insets: Insets,
     upright: (f32, f32),
     aspect: Option<f64>,
 ) -> Option<(f64, f64)> {
     let shown = crop_to_aspect(upright, aspect);
-    let rect = fit(shown, widget, 0.0);
+    let rect = fit(shown, widget, insets);
     if rect.width() <= 0.0
         || x < rect.x()
         || y < rect.y()
@@ -360,6 +395,32 @@ impl Viewfinder {
             .property("hexpand", true)
             .property("vexpand", true)
             .build()
+    }
+
+    /// The bars over the top and the bottom: the picture goes between
+    /// them when it fits.
+    pub fn set_insets(&self, insets: Insets) {
+        if self.imp().insets.replace(insets) != insets {
+            self.queue_draw();
+        }
+    }
+
+    pub fn insets(&self) -> Insets {
+        self.imp().insets.get()
+    }
+
+    /// Where the picture is drawn now, in widget coordinates.
+    pub fn picture_rect(&self) -> Option<graphene::Rect> {
+        let tex = self.texture()?;
+        let (_, picture) = self
+            .placement()
+            .sizes((tex.width() as f32, tex.height() as f32));
+        let shown = crop_to_aspect(picture, self.decor().aspect);
+        Some(fit(
+            shown,
+            (self.width() as f32, self.height() as f32),
+            self.insets(),
+        ))
     }
 
     /// Show a new frame.
@@ -436,7 +497,11 @@ impl Viewfinder {
         let p = self.placement();
         let (_, picture) = p.sizes((tex.width() as f32, tex.height() as f32));
         let shown = crop_to_aspect(picture, self.decor().aspect);
-        let rect = fit(shown, (self.width() as f32, self.height() as f32), 0.0);
+        let rect = fit(
+            shown,
+            (self.width() as f32, self.height() as f32),
+            self.insets(),
+        );
         let (su, sv) = picture_to_shown(u, v, picture, shown);
         Some((
             rect.x() + rect.width() * su as f32,
@@ -453,6 +518,7 @@ impl Viewfinder {
             x as f32,
             y as f32,
             (self.width() as f32, self.height() as f32),
+            self.insets(),
             picture,
             self.decor().aspect,
         )
@@ -472,7 +538,7 @@ mod tests {
     fn portrait_16_9_frame_fills_the_width_and_tops_out() {
         // The main camera's 2016x1136 preview turned upright, on a 480x1040
         // phone with 220 px of controls.
-        let r = fit((1136.0, 2016.0), (480.0, 1040.0), 220.0);
+        let r = fit((1136.0, 2016.0), (480.0, 1040.0), bottom(220.0));
         assert!((r.width() - 480.0).abs() < 0.01);
         assert!((r.height() - 851.83).abs() < 0.1);
         assert_eq!(r.y(), 0.0, "taller than the space above the controls");
@@ -480,14 +546,14 @@ mod tests {
 
     #[test]
     fn portrait_4_3_frame_centers_above_the_controls() {
-        let r = fit((1512.0, 2016.0), (480.0, 1040.0), 220.0);
+        let r = fit((1512.0, 2016.0), (480.0, 1040.0), bottom(220.0));
         assert!((r.height() - 640.0).abs() < 0.01);
         assert!((r.y() - 90.0).abs() < 0.01);
     }
 
     #[test]
     fn landscape_window_letterboxes_sideways() {
-        let r = fit((1136.0, 2016.0), (1920.0, 1080.0), 0.0);
+        let r = fit((1136.0, 2016.0), (1920.0, 1080.0), Insets::default());
         assert!((r.height() - 1080.0).abs() < 0.01);
         assert!(r.x() > 0.0);
     }
@@ -521,7 +587,7 @@ mod tests {
                 } else {
                     (pw, ph)
                 };
-                let r = fit(upright, widget, 0.0);
+                let r = fit(upright, widget, Insets::default());
                 let fills =
                     (r.width() - widget.0).abs() < 0.01 || (r.height() - widget.1).abs() < 0.01;
                 assert!(fills, "{} at {z}: {:?}", lens.name, r);
@@ -576,7 +642,7 @@ mod tests {
             };
             let pv = lens.preview.unwrap();
             let (_, picture) = p.sizes((pv.width as f32, pv.height as f32));
-            let r = fit(picture, widget, 0.0);
+            let r = fit(picture, widget, Insets::default());
             assert!(
                 (picture.0 / picture.1 - 0.75).abs() < 0.01,
                 "{id}: {picture:?}"
@@ -638,22 +704,25 @@ mod tests {
         let widget = (456.0, 730.0);
         // The center is the center.
         let shown = crop_to_aspect(up, Some(1.0));
-        let r = fit(shown, widget, 0.0);
+        let none = Insets::default();
+        let r = fit(shown, widget, none);
         let c = widget_to_picture(
             r.x() + r.width() / 2.0,
             r.y() + r.height() / 2.0,
             widget,
+            none,
             up,
             Some(1.0),
         )
         .unwrap();
         assert!((c.0 - 0.5).abs() < 1e-6 && (c.1 - 0.5).abs() < 1e-6);
         // The top edge of a square crop is well inside the whole picture.
-        let top = widget_to_picture(r.x() + 1.0, r.y(), widget, up, Some(1.0)).unwrap();
+        let top = widget_to_picture(r.x() + 1.0, r.y(), widget, none, up, Some(1.0)).unwrap();
         assert!(top.1 > 0.2 && top.1 < 0.25, "{top:?}");
         // Off the picture: nothing.
         assert!(
-            widget_to_picture(1.0, r.y() - 5.0, widget, up, Some(1.0)).is_none() || r.y() < 5.0
+            widget_to_picture(1.0, r.y() - 5.0, widget, none, up, Some(1.0)).is_none()
+                || r.y() < 5.0
         );
         // And back.
         let (u, v) = picture_to_shown(top.0, top.1, up, shown);
@@ -662,6 +731,36 @@ mod tests {
 
     #[test]
     fn empty_sizes_give_an_empty_rect() {
-        assert_eq!(fit((0.0, 10.0), (480.0, 1040.0), 0.0).width(), 0.0);
+        assert_eq!(
+            fit((0.0, 10.0), (480.0, 1040.0), Insets::default()).width(),
+            0.0
+        );
+    }
+
+    fn bottom(px: f32) -> Insets {
+        Insets {
+            top: 0.0,
+            bottom: px,
+        }
+    }
+
+    /// On the Moto G60s's screen (412x915 logical), a 4:3 picture takes
+    /// the whole width between the bars; a 9:16 video runs under the
+    /// bottom bar; a 9:20 picture fills the screen under both.
+    #[test]
+    fn the_picture_takes_the_whole_width_and_the_bars_go_over_it_when_needed() {
+        let screen = (412.0, 915.0);
+        let bars = Insets {
+            top: 56.0,
+            bottom: 220.0,
+        };
+        let r = fit((3.0, 4.0), screen, bars);
+        assert!((r.width() - 412.0).abs() < 0.01);
+        assert!(r.y() >= 56.0 && r.y() + r.height() <= 915.0 - 220.0 + 0.01);
+        let r = fit((9.0, 16.0), screen, bars);
+        assert!((r.width() - 412.0).abs() < 0.01);
+        assert_eq!(r.y(), 56.0, "under the top bar, the bottom bar over it");
+        let r = fit((9.0, 20.0), screen, bars);
+        assert!((r.y() - (915.0 - r.height()) / 2.0).abs() < 0.01);
     }
 }

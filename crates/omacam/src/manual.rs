@@ -1,13 +1,17 @@
-//! The Pro panel: shutter, ISO, white balance and manual focus, each with
-//! an Auto ("A") state, over the bottom of the picture.
+//! The manual controls: one bar that the adjust button opens over the
+//! bottom of the picture, with a chip per value (exposure correction,
+//! focus, white balance, shutter time, ISO) and a histogram switch.
 //!
-//! A chip per control shows its value: the manual one in the accent
-//! color, or auto's current choice (from the frame metadata) dimmed. A
-//! chip whose control the camera doesn't offer is grayed out, with a
-//! tooltip saying so (libcamera 0.7.2-4.8 offers none of them; they light
-//! up as libcamera does). Tapping a chip opens its editor: an "A" button
-//! and a slider over the values the camera allows, or the white-balance
-//! presets.
+//! Everything is automatic until the user sets a value: a tap on a chip
+//! opens its slider, and moving the slider takes that one value over by
+//! hand; the others stay automatic. A value set by hand shows in the
+//! accent color with a dot beside its name, and the adjust button carries
+//! the same dot while the bar is closed. "Auto" beside the slider gives
+//! that value back to the camera. While a value is automatic its slider
+//! follows what the camera chose (dimmed), so taking it over starts there.
+//!
+//! A chip whose control the camera doesn't offer is grayed out, with a
+//! tooltip saying so.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -21,15 +25,61 @@ use omacam_core::exposure_control::{format_shutter, iso, iso_stops, shutter_stop
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    Ev,
+    Focus,
+    WhiteBalance,
     Shutter,
     Iso,
-    WhiteBalance,
-    Focus,
 }
 
-/// What the user did in the panel.
+impl Kind {
+    pub const ALL: [Kind; 5] = [
+        Kind::Ev,
+        Kind::Focus,
+        Kind::WhiteBalance,
+        Kind::Shutter,
+        Kind::Iso,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Ev => "Exposure",
+            Kind::Focus => "Focus",
+            Kind::WhiteBalance => "WB",
+            Kind::Shutter => "Shutter",
+            Kind::Iso => "ISO",
+        }
+    }
+
+    /// Whether the camera offers the control.
+    fn offered(self, view: &ExposureView) -> bool {
+        let caps = &view.caps;
+        match self {
+            Kind::Ev => caps.ev.is_some(),
+            Kind::Focus => caps.lens_position.is_some(),
+            Kind::WhiteBalance => caps.white_balance(),
+            Kind::Shutter => caps.manual_shutter(),
+            Kind::Iso => caps.manual_gain(),
+        }
+    }
+
+    /// Whether the user set the value by hand.
+    pub fn is_set(self, view: &ExposureView) -> bool {
+        match self {
+            Kind::Ev => view.ev_user.abs() > 0.01,
+            Kind::Focus => !view.pro.lens.is_auto(),
+            Kind::WhiteBalance => !view.pro.white_balance.is_auto(),
+            Kind::Shutter => !view.pro.shutter.is_auto(),
+            Kind::Iso => !view.pro.gain.is_auto(),
+        }
+    }
+}
+
+/// What the user did in the bar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Action {
+    /// Exposure correction, EV (0 is automatic).
+    Ev(f32),
     Shutter(Setting<i32>),
     Iso(Setting<u32>),
     WhiteBalance(Setting<Awb>),
@@ -40,379 +90,572 @@ pub enum Action {
 
 const NOT_OFFERED: &str = "This camera doesn't offer it (yet)";
 
-pub struct ProPanel {
+/// Exposure correction range shown, EV.
+const EV_RANGE: f32 = 2.0;
+
+/// The white balance presets from warm to cold, for a camera that takes
+/// no color temperature.
+const WB_ORDER: [AwbPreset; 4] = [
+    AwbPreset::Incandescent,
+    AwbPreset::Fluorescent,
+    AwbPreset::Daylight,
+    AwbPreset::Cloudy,
+];
+
+fn preset_name(p: AwbPreset) -> &'static str {
+    match p {
+        AwbPreset::Daylight => "Sun",
+        AwbPreset::Cloudy => "Cloud",
+        AwbPreset::Incandescent => "Bulb",
+        AwbPreset::Fluorescent => "Tube",
+    }
+}
+
+/// A lens position as words: a distance where the range is in dioptres
+/// (libcamera's unit: 0 is infinity, 10 is 10 cm), else a share of the
+/// travel from far to near.
+pub fn format_focus(pos: f32, range: (f32, f32)) -> String {
+    if pos <= range.0 + 0.005 {
+        return "∞".into();
+    }
+    if range.1 > 1.5 {
+        let m = 1.0 / pos.max(0.01);
+        if m < 1.0 {
+            format!("{:.0} cm", m * 100.0)
+        } else {
+            format!("{m:.1} m")
+        }
+    } else {
+        let share = (pos - range.0) / (range.1 - range.0).max(1e-3);
+        format!("{:.0} %", share * 100.0)
+    }
+}
+
+fn format_ev(ev: f32) -> String {
+    if ev.abs() < 0.05 {
+        "±0".into()
+    } else {
+        format!("{ev:+.1}")
+    }
+}
+
+fn format_wb(w: Awb) -> String {
+    match w {
+        Awb::Preset(p) => preset_name(p).into(),
+        Awb::Kelvin(k) => format!("{k} K"),
+        Awb::Gains(_) => "Manual".into(),
+    }
+}
+
+/// The chip's text for a value: what was set by hand, or what auto chose.
+fn value_text(kind: Kind, view: &ExposureView) -> String {
+    let range = view.caps.lens_position.unwrap_or((0.0, 1.0));
+    match kind {
+        Kind::Ev => format_ev(view.ev_user),
+        Kind::Focus => match view.pro.lens.manual() {
+            Some(p) => format_focus(p, range),
+            None => "Auto".into(),
+        },
+        Kind::WhiteBalance => match view.pro.white_balance.manual() {
+            Some(w) => format_wb(w),
+            None => "Auto".into(),
+        },
+        Kind::Shutter => match view.pro.shutter.manual() {
+            Some(t) => format_shutter(t),
+            None => view
+                .shutter_us
+                .map(format_shutter)
+                .unwrap_or_else(|| "Auto".into()),
+        },
+        Kind::Iso => match view.pro.gain.manual() {
+            Some(g) => iso(g as f64, view.base_iso).to_string(),
+            None => view
+                .iso
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "Auto".into()),
+        },
+    }
+}
+
+/// The values set by hand, as one short line ("Focus 25 cm · ISO 400"),
+/// for the hint shown while the bar is closed; None when all are auto.
+pub fn summary(view: &ExposureView) -> Option<String> {
+    let parts: Vec<String> = Kind::ALL
+        .iter()
+        .filter(|k| k.offered(view) && k.is_set(view))
+        .map(|k| format!("{} {}", k.name(), value_text(*k, view)))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Whether any value is set by hand.
+pub fn any_set(view: &ExposureView) -> bool {
+    Kind::ALL.iter().any(|k| k.offered(view) && k.is_set(view))
+}
+
+/// One slider: its positions and what they stand for.
+enum Scale {
+    /// Continuous between two values.
+    Range(f64, f64),
+    /// A list of values: the slider moves by whole steps.
+    Steps(usize),
+}
+
+struct Chip {
+    kind: Kind,
+    button: gtk::Button,
+    dot: gtk::Label,
+    value: gtk::Label,
+}
+
+pub struct ManualBar {
     pub root: gtk::Box,
-    chips: Vec<(Kind, gtk::Button, gtk::Label, gtk::Label)>,
+    chips: Vec<Chip>,
     histogram: gtk::ToggleButton,
     editor: gtk::Box,
+    auto: gtk::Button,
+    slider: gtk::Scale,
+    slider_value: gtk::Label,
+    start_icon: gtk::Image,
+    end_icon: gtk::Image,
     selected: Cell<Option<Kind>>,
-    /// The view the open editor was built for.
-    built_for: RefCell<Option<ExposureView>>,
+    /// The view the slider was last set from.
+    view: RefCell<Option<ExposureView>>,
+    /// The slider's own values: what each step stands for.
+    shutters: RefCell<Vec<i32>>,
+    isos: RefCell<Vec<u32>>,
     on_action: Rc<dyn Fn(Action)>,
-    /// True while one of the panel's own controls reports a change: the
-    /// update that follows mustn't rebuild the editor under the finger.
-    emitting: Rc<Cell<bool>>,
+    /// True while the bar sets its own slider: no action goes out.
+    setting: Cell<bool>,
 }
 
-fn chip(name: &str) -> (gtk::Button, gtk::Label, gtk::Label) {
-    let title = gtk::Label::new(Some(name));
-    title.add_css_class("pro-chip-name");
-    let value = gtk::Label::new(Some("A"));
-    value.add_css_class("pro-chip-value");
-    let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    b.append(&title);
-    b.append(&value);
-    let button = gtk::Button::new();
-    button.set_child(Some(&b));
-    button.add_css_class("pro-chip");
-    button.add_css_class("turnable");
-    (button, title, value)
-}
-
-impl ProPanel {
-    pub fn new(on_action: impl Fn(Action) + 'static) -> Rc<ProPanel> {
+impl ManualBar {
+    pub fn new(on_action: impl Fn(Action) + 'static) -> Rc<ManualBar> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        root.add_css_class("pro-panel");
+        root.add_css_class("manual-bar");
         root.set_hexpand(true);
+
         let editor = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        editor.add_css_class("pro-editor");
+        editor.add_css_class("manual-editor");
         editor.set_visible(false);
+        let auto = gtk::Button::with_label("Auto");
+        auto.add_css_class("manual-auto");
+        auto.set_tooltip_text(Some("Back to automatic"));
+        auto.set_valign(gtk::Align::Center);
+        let start_icon = gtk::Image::new();
+        let end_icon = gtk::Image::new();
+        for i in [&start_icon, &end_icon] {
+            i.add_css_class("turnable");
+            i.set_pixel_size(16);
+        }
+        let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+        slider.set_hexpand(true);
+        slider.set_draw_value(false);
+        slider.add_css_class("manual-slider");
+        let slider_value = gtk::Label::new(None);
+        slider_value.add_css_class("manual-value");
+        slider_value.add_css_class("turnable");
+        slider_value.set_width_chars(6);
+        editor.append(&auto);
+        editor.append(&start_icon);
+        editor.append(&slider);
+        editor.append(&end_icon);
+        editor.append(&slider_value);
+
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         row.set_homogeneous(true);
         let mut chips = Vec::new();
-        for (kind, name) in [
-            (Kind::Shutter, "Shutter"),
-            (Kind::Iso, "ISO"),
-            (Kind::WhiteBalance, "WB"),
-            (Kind::Focus, "Focus"),
-        ] {
-            let (button, title, value) = chip(name);
+        for kind in Kind::ALL {
+            let name = gtk::Label::new(Some(kind.name()));
+            name.add_css_class("chip-name");
+            let dot = gtk::Label::new(Some("●"));
+            dot.add_css_class("chip-dot");
+            dot.set_visible(false);
+            let top = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+            top.set_halign(gtk::Align::Center);
+            top.append(&dot);
+            top.append(&name);
+            let value = gtk::Label::new(Some("Auto"));
+            value.add_css_class("chip-value");
+            value.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            b.append(&top);
+            b.append(&value);
+            let button = gtk::Button::new();
+            button.set_child(Some(&b));
+            button.add_css_class("manual-chip");
+            button.add_css_class("turnable");
             row.append(&button);
-            chips.push((kind, button, title, value));
+            chips.push(Chip {
+                kind,
+                button,
+                dot,
+                value,
+            });
         }
-        let histogram = gtk::ToggleButton::with_label("Hist");
+        let histogram = gtk::ToggleButton::new();
+        histogram.set_icon_name("omacam-histogram-symbolic");
         histogram.set_tooltip_text(Some("Histogram"));
-        histogram.add_css_class("pro-chip");
+        histogram.add_css_class("manual-chip");
         histogram.add_css_class("turnable");
         row.append(&histogram);
         root.append(&editor);
         root.append(&row);
-        let emitting = Rc::new(Cell::new(false));
-        let flag = emitting.clone();
-        let panel = Rc::new(ProPanel {
+
+        let bar = Rc::new(ManualBar {
             root,
             chips,
             histogram,
             editor,
+            auto,
+            slider,
+            slider_value,
+            start_icon,
+            end_icon,
             selected: Cell::new(None),
-            built_for: RefCell::new(None),
-            on_action: Rc::new(move |a| {
-                flag.set(true);
-                on_action(a);
-                flag.set(false);
-            }),
-            emitting,
+            view: RefCell::new(None),
+            shutters: RefCell::new(Vec::new()),
+            isos: RefCell::new(Vec::new()),
+            on_action: Rc::new(on_action),
+            setting: Cell::new(false),
         });
-        for (kind, button, _, _) in &panel.chips {
-            let (p, kind) = (Rc::downgrade(&panel), *kind);
-            button.connect_clicked(move |_| {
-                if let Some(p) = p.upgrade() {
-                    let now = if p.selected.get() == Some(kind) {
-                        None
-                    } else {
-                        Some(kind)
-                    };
-                    p.selected.set(now);
-                    p.built_for.borrow_mut().take();
-                    p.rebuild_editor();
+        for chip in &bar.chips {
+            let (b, kind) = (Rc::downgrade(&bar), chip.kind);
+            chip.button.connect_clicked(move |_| {
+                if let Some(b) = b.upgrade() {
+                    let now = (b.selected.get() != Some(kind)).then_some(kind);
+                    b.select(now);
                 }
             });
+            // A long press gives the value back to auto.
+            let press = gtk::GestureLongPress::new();
+            let (b, kind) = (Rc::downgrade(&bar), chip.kind);
+            press.connect_pressed(move |g, _, _| {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                if let Some(b) = b.upgrade() {
+                    b.to_auto(kind);
+                }
+            });
+            chip.button.add_controller(press);
         }
-        let p = Rc::downgrade(&panel);
-        panel.histogram.connect_toggled(move |b| {
-            if let Some(p) = p.upgrade() {
-                (p.on_action)(Action::Histogram(b.is_active()));
+        let b = Rc::downgrade(&bar);
+        bar.histogram.connect_toggled(move |t| {
+            if let Some(b) = b.upgrade() {
+                (b.on_action)(Action::Histogram(t.is_active()));
             }
         });
-        panel
+        let b = Rc::downgrade(&bar);
+        bar.auto.connect_clicked(move |_| {
+            if let Some(b) = b.upgrade() {
+                if let Some(kind) = b.selected.get() {
+                    b.to_auto(kind);
+                }
+            }
+        });
+        let b = Rc::downgrade(&bar);
+        bar.slider.connect_value_changed(move |s| {
+            let Some(b) = b.upgrade() else { return };
+            if !b.setting.get() {
+                b.slider_moved(s.value());
+            }
+        });
+        bar
     }
 
-    /// Open the editor of one control (the test script uses this).
-    pub fn select(&self, kind: Kind) {
-        self.selected.set(Some(kind));
-        self.built_for.borrow_mut().take();
+    /// Open one value's slider, or close it (None).
+    pub fn select(&self, kind: Option<Kind>) {
+        self.selected.set(kind);
+        for c in &self.chips {
+            if Some(c.kind) == kind {
+                c.button.add_css_class("selected");
+            } else {
+                c.button.remove_css_class("selected");
+            }
+        }
+        self.build_editor();
     }
 
-    /// Bring the chips (and, when the camera changed, the editor) up to
-    /// date.
+    fn to_auto(&self, kind: Kind) {
+        (self.on_action)(match kind {
+            Kind::Ev => Action::Ev(0.0),
+            Kind::Focus => Action::Focus(Setting::Auto),
+            Kind::WhiteBalance => Action::WhiteBalance(Setting::Auto),
+            Kind::Shutter => Action::Shutter(Setting::Auto),
+            Kind::Iso => Action::Iso(Setting::Auto),
+        });
+    }
+
+    /// Bring the chips and the open slider up to date.
     pub fn update(&self, view: &ExposureView) {
-        let caps = &view.caps;
-        for (kind, button, _, value) in &self.chips {
-            let (offered, manual, text) = match kind {
-                Kind::Shutter => (
-                    caps.manual_shutter(),
-                    view.pro.shutter.manual().map(format_shutter),
-                    view.shutter_us.map(format_shutter),
-                ),
-                Kind::Iso => (
-                    caps.manual_gain(),
-                    view.pro
-                        .gain
-                        .manual()
-                        .map(|g| iso(g as f64, view.base_iso).to_string()),
-                    view.iso.map(|i| i.to_string()),
-                ),
-                Kind::WhiteBalance => (
-                    caps.white_balance(),
-                    view.pro.white_balance.manual().map(|w| match w {
-                        Awb::Preset(p) => match p {
-                            AwbPreset::Daylight => "Sun",
-                            AwbPreset::Cloudy => "Cloud",
-                            AwbPreset::Incandescent => "Bulb",
-                            AwbPreset::Fluorescent => "Tube",
-                        }
-                        .to_string(),
-                        Awb::Kelvin(k) => format!("{k} K"),
-                        Awb::Gains(_) => "Manual".into(),
-                    }),
-                    None,
-                ),
-                Kind::Focus => (
-                    caps.lens_position.is_some(),
-                    view.pro.lens.manual().map(|p| format!("{p:.1}")),
-                    view.lens_position.map(|p| format!("{p:.1}")),
-                ),
-            };
-            button.set_sensitive(offered);
-            button.set_tooltip_text((!offered).then_some(NOT_OFFERED));
-            match (offered, manual) {
-                (true, Some(m)) => {
-                    value.set_label(&m);
-                    button.add_css_class("manual");
-                }
-                _ => {
-                    // Auto: show what auto chose, when the camera says.
-                    value.set_label(&match text {
-                        Some(t) if offered => format!("A {t}"),
-                        _ => "A".into(),
-                    });
-                    button.remove_css_class("manual");
-                }
+        for c in &self.chips {
+            let offered = c.kind.offered(view);
+            let set = offered && c.kind.is_set(view);
+            c.button.set_sensitive(offered);
+            c.button.set_tooltip_text((!offered).then_some(NOT_OFFERED));
+            c.value.set_label(&if offered {
+                value_text(c.kind, view)
+            } else {
+                "–".into()
+            });
+            c.dot.set_visible(set);
+            if set {
+                c.button.add_css_class("set");
+            } else {
+                c.button.remove_css_class("set");
             }
         }
-        // Rebuild for another camera, or when the values changed from
-        // outside the editor ("All auto", a lens switch, a script).
-        let changed = self.built_for.borrow().as_ref().is_none_or(|b| {
-            b.caps != view.caps
-                || b.base_iso != view.base_iso
-                || (b.pro != view.pro && !self.emitting.get())
-        });
-        if changed {
-            *self.built_for.borrow_mut() = Some(view.clone());
-            self.rebuild_editor();
-        } else if let Some(b) = self.built_for.borrow_mut().as_mut() {
-            b.pro = view.pro;
+        let rebuild = self
+            .view
+            .borrow()
+            .as_ref()
+            .is_none_or(|v| v.caps != view.caps || v.base_iso != view.base_iso);
+        self.view.replace(Some(view.clone()));
+        if rebuild {
+            self.build_editor();
+        } else {
+            self.set_slider_from_view();
         }
     }
 
-    fn rebuild_editor(&self) {
-        while let Some(c) = self.editor.first_child() {
-            self.editor.remove(&c);
-        }
+    /// The open value's slider: its range, end icons and position.
+    fn build_editor(&self) {
         let Some(kind) = self.selected.get() else {
             self.editor.set_visible(false);
             return;
         };
-        let Some(view) = self.built_for.borrow().clone() else {
+        let Some(view) = self.view.borrow().clone() else {
             self.editor.set_visible(false);
             return;
         };
-        let act = self.on_action.clone();
-        let auto = gtk::ToggleButton::with_label("A");
-        auto.add_css_class("pro-auto");
-        auto.set_tooltip_text(Some("Automatic"));
-        match kind {
+        if !kind.offered(&view) {
+            self.editor.set_visible(false);
+            return;
+        }
+        let caps = &view.caps;
+        let scale = match kind {
+            Kind::Ev => {
+                let (lo, hi) = caps.ev.unwrap_or((-EV_RANGE, EV_RANGE));
+                Scale::Range(lo.max(-EV_RANGE) as f64, hi.min(EV_RANGE) as f64)
+            }
+            Kind::Focus => {
+                let (lo, hi) = caps.lens_position.unwrap_or((0.0, 1.0));
+                Scale::Range(lo as f64, hi as f64)
+            }
+            Kind::WhiteBalance => match caps.color_temperature {
+                Some((lo, hi)) => Scale::Range(lo as f64, hi as f64),
+                None => Scale::Steps(WB_ORDER.len()),
+            },
             Kind::Shutter => {
-                let stops = view
-                    .caps
-                    .exposure_time
-                    .map(shutter_stops)
-                    .unwrap_or_default();
-                self.slider_editor(
-                    &auto,
-                    stops.clone(),
-                    view.pro.shutter.manual(),
-                    move |i| {
-                        act(Action::Shutter(match i {
-                            Some(i) => Setting::Manual(stops[i]),
-                            None => Setting::Auto,
-                        }))
-                    },
-                    format_shutter,
-                );
+                let stops = caps.exposure_time.map(shutter_stops).unwrap_or_default();
+                let n = stops.len();
+                self.shutters.replace(stops);
+                Scale::Steps(n)
             }
             Kind::Iso => {
-                let stops = view
-                    .caps
+                let stops = caps
                     .gain
                     .map(|g| iso_stops(view.base_iso, g))
                     .unwrap_or_default();
-                let current = view.pro.gain.manual().map(|g| iso(g as f64, view.base_iso));
-                self.slider_editor(
-                    &auto,
-                    stops.clone(),
-                    current,
-                    move |i| {
-                        act(Action::Iso(match i {
-                            Some(i) => Setting::Manual(stops[i]),
-                            None => Setting::Auto,
-                        }))
-                    },
-                    |v| format!("ISO {v}"),
-                );
+                let n = stops.len();
+                self.isos.replace(stops);
+                Scale::Steps(n)
             }
-            Kind::Focus => {
-                let (lo, hi) = view.caps.lens_position.unwrap_or((0.0, 1.0));
-                let scale = gtk::Scale::with_range(
-                    gtk::Orientation::Horizontal,
-                    lo as f64,
-                    hi as f64,
-                    (hi - lo) as f64 / 100.0,
-                );
-                scale.set_hexpand(true);
-                scale.set_draw_value(false);
-                scale.set_value(view.pro.lens.manual().unwrap_or(lo) as f64);
-                scale.set_tooltip_text(Some("Far ← → near"));
-                auto.set_active(view.pro.lens.is_auto());
-                let a2 = act.clone();
-                let s2 = scale.clone();
-                auto.connect_toggled(move |b| {
-                    if b.is_active() {
-                        a2(Action::Focus(Setting::Auto));
-                    } else {
-                        a2(Action::Focus(Setting::Manual(s2.value() as f32)));
-                    }
-                });
-                let auto2 = auto.clone();
-                scale.connect_value_changed(move |s| {
-                    auto2.set_active(false);
-                    act(Action::Focus(Setting::Manual(s.value() as f32)));
-                });
-                self.editor.append(&auto);
-                self.editor.append(&scale);
+        };
+        self.setting.set(true);
+        self.slider.clear_marks();
+        match scale {
+            Scale::Range(lo, hi) => {
+                self.slider.set_range(lo, hi.max(lo + 1e-3));
+                let step = match kind {
+                    Kind::Ev => 1.0 / 3.0,
+                    Kind::WhiteBalance => 100.0,
+                    _ => (hi - lo) / 200.0,
+                };
+                self.slider.set_increments(step, step * 3.0);
+                self.slider
+                    .set_round_digits(if kind == Kind::Ev { 2 } else { 3 });
             }
-            Kind::WhiteBalance => {
-                auto.set_active(view.pro.white_balance.is_auto());
-                let group_leader = auto.clone();
-                let a2 = act.clone();
-                auto.connect_toggled(move |b| {
-                    if b.is_active() {
-                        a2(Action::WhiteBalance(Setting::Auto));
-                    }
-                });
-                self.editor.append(&auto);
-                // Four equal presets in their own homogeneous row, with
-                // short labels: at the phone's 480 px logical width the
-                // long names pushed the last chip off the right edge.
-                let presets = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                presets.set_homogeneous(true);
-                presets.set_hexpand(true);
-                for preset in AwbPreset::ALL {
-                    let short = match preset {
-                        AwbPreset::Daylight => "Sun",
-                        AwbPreset::Cloudy => "Cloud",
-                        AwbPreset::Incandescent => "Bulb",
-                        AwbPreset::Fluorescent => "Tube",
-                    };
-                    let b = gtk::ToggleButton::with_label(short);
-                    b.set_tooltip_text(Some(preset.label()));
-                    b.set_hexpand(true);
-                    b.add_css_class("pro-preset");
-                    b.set_group(Some(&group_leader));
-                    b.set_active(view.pro.white_balance == Setting::Manual(Awb::Preset(preset)));
-                    let a3 = act.clone();
-                    b.connect_toggled(move |b| {
-                        if b.is_active() {
-                            a3(Action::WhiteBalance(Setting::Manual(Awb::Preset(preset))));
-                        }
-                    });
-                    presets.append(&b);
+            Scale::Steps(n) => {
+                self.slider.set_range(0.0, (n.max(2) - 1) as f64);
+                self.slider.set_increments(1.0, 1.0);
+                self.slider.set_round_digits(0);
+            }
+        }
+        match kind {
+            Kind::Ev => self.slider.add_mark(0.0, gtk::PositionType::Bottom, None),
+            Kind::WhiteBalance if caps.color_temperature.is_some() => {
+                for p in WB_ORDER {
+                    self.slider
+                        .add_mark(p.kelvin() as f64, gtk::PositionType::Bottom, None);
                 }
-                self.editor.append(&presets);
             }
+            _ => {}
         }
-        let reset = gtk::Button::with_label("All auto");
-        reset.add_css_class("pro-preset");
-        let a4 = self.on_action.clone();
-        reset.connect_clicked(move |_| a4(Action::AllAuto));
-        if kind != Kind::WhiteBalance {
-            self.editor.append(&reset);
-        }
+        let (start, end) = match kind {
+            Kind::Focus => ("omacam-far-symbolic", "omacam-macro-symbolic"),
+            Kind::Ev => ("", "omacam-exposure-symbolic"),
+            _ => ("", ""),
+        };
+        self.start_icon.set_icon_name(Some(start));
+        self.start_icon.set_visible(!start.is_empty());
+        self.end_icon.set_icon_name(Some(end));
+        self.end_icon.set_visible(!end.is_empty());
+        self.setting.set(false);
         self.editor.set_visible(true);
+        self.set_slider_from_view();
     }
 
-    /// An "A" button and a slider over `stops`.
-    fn slider_editor<T: Copy + PartialEq + PartialOrd + 'static>(
-        &self,
-        auto: &gtk::ToggleButton,
-        stops: Vec<T>,
-        current: Option<T>,
-        apply: impl Fn(Option<usize>) + 'static,
-        show: impl Fn(T) -> String + 'static,
-    ) {
-        let n = stops.len().max(1);
-        let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, (n - 1) as f64, 1.0);
-        scale.set_hexpand(true);
-        scale.set_draw_value(false);
-        scale.set_round_digits(0);
-        let index = current
-            .and_then(|c| stops.iter().position(|s| *s >= c))
-            .unwrap_or(n / 2);
-        scale.set_value(index as f64);
-        let label = gtk::Label::new(None);
-        label.add_css_class("pro-value");
-        label.set_width_chars(7);
-        let show = Rc::new(show);
-        if let Some(v) = stops.get(index) {
-            label.set_label(&if current.is_some() {
-                show(*v)
-            } else {
-                "Auto".into()
-            });
-        }
-        auto.set_active(current.is_none());
-        let apply = Rc::new(apply);
-        let (a2, s2, l2, st2, sh2) = (
-            apply.clone(),
-            scale.clone(),
-            label.clone(),
-            stops.clone(),
-            show.clone(),
-        );
-        auto.connect_toggled(move |b| {
-            if b.is_active() {
-                l2.set_label("Auto");
-                a2(None);
-            } else {
-                let i = (s2.value().round() as usize).min(st2.len().saturating_sub(1));
-                if let Some(v) = st2.get(i) {
-                    l2.set_label(&sh2(*v));
+    /// Put the slider where the value is: the one set by hand, or what
+    /// auto chose (dimmed).
+    fn set_slider_from_view(&self) {
+        let (Some(kind), Some(view)) = (self.selected.get(), self.view.borrow().clone()) else {
+            return;
+        };
+        let set = kind.is_set(&view);
+        let range = view.caps.lens_position.unwrap_or((0.0, 1.0));
+        let nearest = |len: usize, dist: &dyn Fn(usize) -> f64| {
+            (0..len).min_by(|a, b| dist(*a).total_cmp(&dist(*b)))
+        };
+        let (pos, text) = match kind {
+            Kind::Ev => (Some(view.ev_user as f64), format_ev(view.ev_user)),
+            Kind::Focus => {
+                let p = view.pro.lens.manual().or(view.lens_position);
+                (
+                    p.map(|p| p as f64),
+                    p.map(|p| format_focus(p, range))
+                        .unwrap_or_else(|| "Auto".into()),
+                )
+            }
+            Kind::WhiteBalance => match (view.caps.color_temperature, view.pro.white_balance) {
+                (Some(_), Setting::Manual(Awb::Kelvin(k))) => (Some(k as f64), format!("{k} K")),
+                (Some(_), Setting::Manual(Awb::Preset(p))) => {
+                    (Some(p.kelvin() as f64), preset_name(p).into())
                 }
-                a2(Some(i));
+                (Some(_), _) => (Some(5500.0), "Auto".into()),
+                (None, Setting::Manual(Awb::Preset(p))) => (
+                    WB_ORDER.iter().position(|q| *q == p).map(|i| i as f64),
+                    preset_name(p).into(),
+                ),
+                (None, _) => (Some(2.0), "Auto".into()),
+            },
+            Kind::Shutter => {
+                let stops = self.shutters.borrow();
+                let t = view.pro.shutter.manual().or(view.shutter_us);
+                let i = t.and_then(|t| {
+                    nearest(stops.len(), &|i| (stops[i] as f64 / t as f64).ln().abs())
+                });
+                (
+                    i.map(|i| i as f64),
+                    t.map(format_shutter).unwrap_or_else(|| "Auto".into()),
+                )
             }
-        });
-        let auto2 = auto.clone();
-        let l3 = label.clone();
-        scale.connect_value_changed(move |s| {
-            let i = (s.value().round() as usize).min(stops.len().saturating_sub(1));
-            if let Some(v) = stops.get(i) {
-                l3.set_label(&show(*v));
+            Kind::Iso => {
+                let stops = self.isos.borrow();
+                let v = view
+                    .pro
+                    .gain
+                    .manual()
+                    .map(|g| iso(g as f64, view.base_iso))
+                    .or(view.iso);
+                let i = v.and_then(|v| {
+                    nearest(stops.len(), &|i| (stops[i] as f64 / v as f64).ln().abs())
+                });
+                (
+                    i.map(|i| i as f64),
+                    v.map(|v| v.to_string()).unwrap_or_else(|| "Auto".into()),
+                )
             }
-            auto2.set_active(false);
-            apply(Some(i));
-        });
-        self.editor.append(auto);
-        self.editor.append(&scale);
-        self.editor.append(&label);
+        };
+        self.setting.set(true);
+        if let Some(p) = pos {
+            self.slider.set_value(p);
+        }
+        self.setting.set(false);
+        self.slider_value.set_label(&text);
+        if set {
+            self.slider.remove_css_class("auto");
+            self.slider_value.add_css_class("set");
+            self.auto.remove_css_class("active");
+        } else {
+            self.slider.add_css_class("auto");
+            self.slider_value.remove_css_class("set");
+            self.auto.add_css_class("active");
+        }
+    }
+
+    /// The user moved the slider: that value is now set by hand.
+    fn slider_moved(&self, v: f64) {
+        let Some(kind) = self.selected.get() else {
+            return;
+        };
+        let has_kelvin = self
+            .view
+            .borrow()
+            .as_ref()
+            .is_some_and(|v| v.caps.color_temperature.is_some());
+        let step = v.round().max(0.0) as usize;
+        let action = match kind {
+            Kind::Ev => Action::Ev(((v * 3.0).round() / 3.0) as f32),
+            Kind::Focus => Action::Focus(Setting::Manual(v as f32)),
+            Kind::WhiteBalance if has_kelvin => Action::WhiteBalance(Setting::Manual(Awb::Kelvin(
+                ((v / 100.0).round() * 100.0) as u32,
+            ))),
+            Kind::WhiteBalance => {
+                let p = WB_ORDER[step.min(WB_ORDER.len() - 1)];
+                Action::WhiteBalance(Setting::Manual(Awb::Preset(p)))
+            }
+            Kind::Shutter => match self.shutters.borrow().get(step) {
+                Some(t) => Action::Shutter(Setting::Manual(*t)),
+                None => return,
+            },
+            Kind::Iso => match self.isos.borrow().get(step) {
+                Some(i) => Action::Iso(Setting::Manual(*i)),
+                None => return,
+            },
+        };
+        (self.on_action)(action);
+    }
+
+    /// Turn the histogram switch (the script's way in).
+    pub fn set_histogram(&self, on: bool) {
+        self.histogram.set_active(on);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_reads_as_a_distance_or_a_share() {
+        assert_eq!(format_focus(0.0, (0.0, 10.0)), "∞");
+        assert_eq!(format_focus(4.0, (0.0, 10.0)), "25 cm");
+        assert_eq!(format_focus(0.5, (0.0, 10.0)), "2.0 m");
+        assert_eq!(format_focus(0.42, (0.0, 1.0)), "42 %");
+    }
+
+    #[test]
+    fn the_summary_names_only_values_set_by_hand() {
+        let mut view = ExposureView {
+            caps: omacam_core::backend::Caps {
+                lens_position: Some((0.0, 10.0)),
+                exposure_time: Some((100, 66_666)),
+                gain: Some((1.0, 16.0)),
+                manual_exposure: true,
+                ev: Some((-8.0, 8.0)),
+                ..Default::default()
+            },
+            base_iso: 100.0,
+            iso: Some(800),
+            ..Default::default()
+        };
+        assert_eq!(summary(&view), None);
+        assert!(!any_set(&view));
+        view.pro.lens = Setting::Manual(4.0);
+        view.pro.gain = Setting::Manual(4.0);
+        assert_eq!(summary(&view).as_deref(), Some("Focus 25 cm · ISO 400"));
+        view.ev_user = 0.7;
+        assert!(summary(&view).unwrap().starts_with("Exposure +0.7"));
+        assert!(any_set(&view));
     }
 }

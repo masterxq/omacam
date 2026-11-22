@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::flash::FlashMode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Aspect {
@@ -219,6 +221,16 @@ pub struct Settings {
     pub stabilization: bool,
     /// Photos are HDR bursts, merged and tone mapped (the HDR chip).
     pub hdr: bool,
+    /// The flash for photos (the torch isn't kept: every launch starts
+    /// with it off).
+    pub flash: FlashMode,
+    /// Zooming past a lens's range switches to the next lens, and in dim
+    /// light the main camera stands in for the telephoto. Off (the
+    /// default), the lens changes only when the user picks another one.
+    pub switch_lenses_by_zoom: bool,
+    /// A tap shows an exposure slider beside the focus ring for a few
+    /// seconds (off: exposure correction is in the manual controls).
+    pub tap_ev_slider: bool,
 }
 
 impl Default for Settings {
@@ -243,6 +255,9 @@ impl Default for Settings {
             video_fps: 30,
             stabilization: true,
             hdr: false,
+            flash: FlashMode::Off,
+            switch_lenses_by_zoom: false,
+            tap_ev_slider: false,
         }
     }
 }
@@ -285,6 +300,9 @@ impl Settings {
     fn sanitized(mut self) -> Settings {
         self.jpeg_quality = self.jpeg_quality.clamp(50, 100);
         self.video_fps = if self.video_fps >= 60 { 60 } else { 30 };
+        if self.flash == FlashMode::Torch {
+            self.flash = FlashMode::Off;
+        }
         if self
             .save_dir
             .as_ref()
@@ -345,6 +363,8 @@ mod tests {
         assert!(s.low_light, "the low-light lens on");
         assert_eq!(s.video_fps, 30);
         assert!(s.stabilization);
+        assert_eq!(s.flash, FlashMode::Off);
+        assert!(!s.switch_lenses_by_zoom, "the lens changes only by hand");
     }
 
     #[test]
@@ -381,6 +401,9 @@ mod tests {
             video_fps: 60,
             stabilization: false,
             hdr: true,
+            flash: FlashMode::Auto,
+            switch_lenses_by_zoom: true,
+            tap_ev_slider: true,
         };
         s.save(&p).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
@@ -403,8 +426,13 @@ mod tests {
     #[test]
     fn out_of_range_values_are_clamped() {
         let p = tmp("clamp");
-        std::fs::write(&p, "jpeg_quality = 10\nsave_dir = \"\"\nvideo_fps = 45\n").unwrap();
+        std::fs::write(
+            &p,
+            "jpeg_quality = 10\nsave_dir = \"\"\nvideo_fps = 45\nflash = \"torch\"\n",
+        )
+        .unwrap();
         let s = Settings::load(&p);
+        assert_eq!(s.flash, FlashMode::Off, "the torch isn't kept");
         assert_eq!(s.jpeg_quality, 50);
         assert_eq!(s.video_fps, 30, "only 30 or 60");
         assert_eq!(s.save_dir, None);
