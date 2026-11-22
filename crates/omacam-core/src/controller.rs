@@ -44,6 +44,10 @@ pub struct Options {
     /// Merge Night and HDR bursts from the raw frames, where the camera
     /// gives them; otherwise from the processed ones.
     pub raw_merge: bool,
+    /// Hold the lens the user chose: zooming crops it and never switches
+    /// to another camera, only the lens buttons do (no low-light stand-in
+    /// either). Off, the zoom picks the lens ([`crate::zoom`]).
+    pub hold_lens: bool,
 }
 
 impl Default for Options {
@@ -57,6 +61,7 @@ impl Default for Options {
             low_light: true,
             video_fps: 30,
             raw_merge: true,
+            hold_lens: false,
         }
     }
 }
@@ -121,6 +126,21 @@ pub struct ExposureView {
     pub lens_position: Option<f32>,
 }
 
+/// A button of the lens row: a lens, or a zoom stage of one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoomButton {
+    /// The zoom a tap goes to.
+    pub zoom: f64,
+    /// The lens that shows it (an index into the lens table).
+    pub lens: usize,
+    pub role: Role,
+    /// The lens's own button (its widest); false for a stage that crops it.
+    pub native: bool,
+    /// The button of the chosen lens with the highest zoom at or below the
+    /// current zoom (none while the macro lens is on).
+    pub active: bool,
+}
+
 /// The state the controls show.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewState {
@@ -128,7 +148,13 @@ pub struct ViewState {
     pub zoom: f64,
     pub min_zoom: f64,
     pub max_zoom: f64,
+    /// The lowest zoom a gesture reaches now: the chosen lens's own view
+    /// while the lens is held ([`Options::hold_lens`]), else `min_zoom`.
+    pub zoom_floor: f64,
     pub presets: Vec<f64>,
+    /// The lens row of the side the app looks to (the back's ladder while
+    /// the macro lens is on, too).
+    pub buttons: Vec<ZoomButton>,
     /// The lens that is wanted for the current zoom.
     pub lens_role: Option<Role>,
     pub lens_name: String,
@@ -154,6 +180,24 @@ pub struct ViewState {
     pub can_60fps: bool,
     /// The frame rate video mode asks for now (30 or 60).
     pub video_fps: u32,
+}
+
+/// The presets within a ladder's range; the ".5" button is the widest
+/// lens's whole view (0.45x on the Pixel 7 Pro), as stock's is, not a crop
+/// of it.
+fn preset_values(presets: &[f64], min_zoom: f64, max_zoom: f64) -> Vec<f64> {
+    presets
+        .iter()
+        .copied()
+        .filter(|&p| p >= min_zoom - 0.06 && p <= max_zoom)
+        .map(|p| {
+            if p < 1.0 && p - min_zoom < 0.1 {
+                min_zoom
+            } else {
+                p
+            }
+        })
+        .collect()
 }
 
 struct Side {
@@ -259,9 +303,15 @@ pub struct Controller {
 impl Controller {
     pub fn new(spec: &TableSpec, cameras: &[CameraInfo], opts: Options) -> Controller {
         let table = spec.resolve(cameras);
-        let back = Side::new(&table, Facing::Back);
-        let front = Side::new(&table, Facing::Front);
-        let macro_side = Side::macro_lens(&table);
+        let mut back = Side::new(&table, Facing::Back);
+        let mut front = Side::new(&table, Facing::Front);
+        let mut macro_side = Side::macro_lens(&table);
+        for s in [&mut back, &mut front, &mut macro_side]
+            .into_iter()
+            .flatten()
+        {
+            s.planner.set_hold_lens(opts.hold_lens);
+        }
         // The back camera, unless there's only a front one.
         let facing = if back.is_some() || front.is_none() {
             Facing::Back
@@ -326,6 +376,13 @@ impl Controller {
         self.back = Side::new(&table, Facing::Back);
         self.front = Side::new(&table, Facing::Front);
         self.macro_side = Side::macro_lens(&table);
+        let hold = self.opts.hold_lens;
+        for s in [&mut self.back, &mut self.front, &mut self.macro_side]
+            .into_iter()
+            .flatten()
+        {
+            s.planner.set_hold_lens(hold);
+        }
         self.macro_on &= self.macro_side.is_some();
         self.table = table;
         let table = &self.table;
@@ -380,25 +437,15 @@ impl Controller {
             Facing::Back => &BACK_PRESETS[..],
             Facing::Front => &FRONT_PRESETS[..],
         };
+        let zoom_floor = side.map(|s| s.planner.floor()).unwrap_or(min_zoom);
         ViewState {
             facing: self.facing,
             zoom,
             min_zoom,
             max_zoom,
-            presets: presets
-                .iter()
-                .copied()
-                .filter(|&p| p >= min_zoom - 0.06 && p <= max_zoom)
-                // The ".5" button is the widest lens's whole view (0.45x on
-                // the Pixel 7 Pro), as stock's is, not a crop of it.
-                .map(|p| {
-                    if p < 1.0 && p - min_zoom < 0.1 {
-                        min_zoom
-                    } else {
-                        p
-                    }
-                })
-                .collect(),
+            zoom_floor,
+            presets: preset_values(presets, min_zoom, max_zoom),
+            buttons: self.zoom_buttons(),
             lens_role: lens.map(|l| l.role),
             lens_name: lens.map(|l| l.name.clone()).unwrap_or_default(),
             switching: self.switch.is_switching(),
@@ -415,6 +462,52 @@ impl Controller {
             can_60fps: self.can_60fps(),
             video_fps: self.opts.video_fps,
         }
+    }
+
+    /// The lens row: the presets of the side's ladder, each shown by the
+    /// lens the ladder gives it, and every lens no preset lands on at its
+    /// own factor, so each lens has a button.
+    fn zoom_buttons(&self) -> Vec<ZoomButton> {
+        let (side, presets) = match self.facing {
+            Facing::Back => (self.back.as_ref(), &BACK_PRESETS[..]),
+            Facing::Front => (self.front.as_ref(), &FRONT_PRESETS[..]),
+        };
+        let Some(side) = side else {
+            return Vec::new();
+        };
+        let ladder = side.planner.ladder();
+        let mut zooms = preset_values(presets, ladder.min(), ladder.max());
+        for step in 0..ladder.len() {
+            if !zooms.iter().any(|&z| ladder.natural(z) == step) {
+                zooms.push(ladder.factor(step));
+            }
+        }
+        zooms.sort_by(f64::total_cmp);
+        let mut buttons: Vec<ZoomButton> = Vec::new();
+        for z in zooms {
+            let step = ladder.natural(z);
+            let lens = side.lenses[step];
+            buttons.push(ZoomButton {
+                zoom: z,
+                lens,
+                role: side.roles[step],
+                native: !buttons.iter().any(|b| b.lens == lens),
+                active: false,
+            });
+        }
+        let chosen = side.planned();
+        let shown = self.facing == Facing::Front || !self.macro_on;
+        if shown {
+            let zoom = side.planner.zoom();
+            let active = buttons
+                .iter()
+                .rposition(|b| b.lens == chosen && b.zoom <= zoom + 1e-6)
+                .or_else(|| buttons.iter().position(|b| b.lens == chosen));
+            if let Some(i) = active {
+                buttons[i].active = true;
+            }
+        }
+        buttons
     }
 
     /// The streaming camera's mode allows 60 fps.
@@ -682,6 +775,47 @@ impl Controller {
         out
     }
 
+    /// A button of the lens row: its lens at its zoom, leaving the macro
+    /// lens if that is on.
+    pub fn press_zoom_button(&mut self, zoom: f64, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        if self.capture.is_busy() {
+            return out;
+        }
+        let left_macro = self.facing == Facing::Back && self.macro_on && !self.recording;
+        if left_macro {
+            self.macro_on = false;
+            self.focus.reset();
+            self.last_meta = None;
+        }
+        let changed = self
+            .side_mut()
+            .and_then(|s| s.planner.set(zoom, ZoomSource::Preset, now));
+        if changed.is_some() || left_macro {
+            self.request_preview(now, &mut out);
+        }
+        out
+    }
+
+    /// Hold the chosen lens while zooming, or let the zoom pick it
+    /// ([`Options::hold_lens`]).
+    pub fn set_hold_lens(&mut self, on: bool, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        self.opts.hold_lens = on;
+        let mut changed = false;
+        for s in [&mut self.back, &mut self.front, &mut self.macro_side]
+            .into_iter()
+            .flatten()
+        {
+            changed |= s.planner.set_hold_lens(on).is_some();
+        }
+        if changed {
+            self.request_preview(now, &mut out);
+        }
+        self.apply_low_light(now, &mut out);
+        out
+    }
+
     /// A pinch or slider drag ended.
     pub fn zoom_released(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
@@ -763,7 +897,8 @@ impl Controller {
     /// settings and the Pro panel, and switch lenses if that changes
     /// which camera streams.
     fn apply_low_light(&mut self, now: Instant, out: &mut Vec<Output>) {
-        let want = self.opts.low_light && !self.pro && self.low_light.is_dim();
+        let want =
+            self.opts.low_light && !self.opts.hold_lens && !self.pro && self.low_light.is_dim();
         let Some(back) = self.back.as_mut() else {
             return;
         };
@@ -2293,6 +2428,86 @@ still = [2592, 1940]
         )
         .unwrap();
         Controller::new(&spec, &cams, Options::default())
+    }
+
+    #[test]
+    fn the_lens_row_has_a_button_for_each_lens_and_marks_the_chosen_one() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        let row = |c: &Controller| {
+            c.view()
+                .buttons
+                .iter()
+                .map(|b| (b.zoom, b.role, b.native, b.active))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            row(&c),
+            vec![
+                (0.45, Role::Ultrawide, true, false),
+                (1.0, Role::Main, true, true),
+                (2.0, Role::Main, false, false),
+                (5.0, Role::Tele, true, false),
+            ]
+        );
+        c.set_zoom(3.0, ZoomSource::Preset, now);
+        assert!(row(&c)[2].3, "the 2 stage shows 3x");
+    }
+
+    #[test]
+    fn a_held_lens_never_switches_while_zooming() {
+        let now = Instant::now();
+        let opts = Options {
+            hold_lens: true,
+            ..Options::default()
+        };
+        let mut c = Controller::new(&spec(), &cameras(), opts);
+        open(&mut c, now);
+        // A pinch to 8x stays on the main camera, settled or released.
+        assert!(commands(&c.set_zoom(8.0, ZoomSource::Gesture, now)).is_empty());
+        assert!(commands(&c.tick(now + Duration::from_secs(1))).is_empty());
+        assert!(commands(&c.zoom_released(now + Duration::from_secs(1))).is_empty());
+        assert_eq!(c.view().zoom, 8.0);
+        assert_eq!(c.view().lens_role, Some(Role::Main));
+        // Nor below its own view.
+        c.set_zoom(0.5, ZoomSource::Gesture, now);
+        assert_eq!((c.view().zoom, c.view().zoom_floor), (1.0, 1.0));
+        // The ultrawide's button chooses it; zooming then crops it.
+        let (_, cam, _) = start_of(&c.press_zoom_button(0.45, now));
+        assert_eq!(cam, "uw");
+        assert!(commands(&c.set_zoom(2.5, ZoomSource::Gesture, now)).is_empty());
+        let v = c.view();
+        assert_eq!((v.lens_role, v.zoom_floor), (Some(Role::Ultrawide), 0.45));
+        assert!(v.buttons[0].active, "the .5 button shows 2.5x");
+        assert!((c.transform("uw").unwrap().scale - 2.5 / 0.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_held_lens_has_no_low_light_stand_in() {
+        let now = Instant::now();
+        let mut c = Controller::new(&spec(), &cameras(), Options::default());
+        open(&mut c, now);
+        c.press_zoom_button(5.0, now);
+        c.back.as_mut().unwrap().fallback = true;
+        assert!(c.view().low_light);
+        c.set_hold_lens(true, now);
+        assert!(!c.view().low_light);
+        assert_eq!(c.view().lens_role, Some(Role::Tele));
+    }
+
+    #[test]
+    fn a_lens_button_leaves_the_macro_lens() {
+        let now = Instant::now();
+        let mut c = macro_controller();
+        open(&mut c, now);
+        let (g, _, _) = start_of(&c.toggle_macro(now));
+        c.on_event(started(g, "macro"), now);
+        assert!(c.view().macro_on);
+        assert!(c.view().buttons.iter().all(|b| !b.active));
+        let (_, cam, _) = start_of(&c.press_zoom_button(1.0, now));
+        assert_eq!(cam, "main");
+        assert!(!c.view().macro_on);
     }
 
     #[test]

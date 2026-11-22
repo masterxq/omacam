@@ -11,6 +11,10 @@
 //!
 //! A pinch or a slider drag switches only after the zoom has stayed still
 //! for [`SETTLE`]; a preset button switches at once and without hysteresis.
+//!
+//! A planner may instead hold the lens the user chose
+//! ([`ZoomPlanner::set_hold_lens`]): then a gesture zooms within that lens
+//! only, from its own factor up, and only a button picks another lens.
 
 use std::time::{Duration, Instant};
 
@@ -128,6 +132,8 @@ pub struct ZoomPlanner {
     target: usize,
     /// When a gesture last moved the zoom, while its lens choice waits.
     pending_since: Option<Instant>,
+    /// Gestures zoom within the chosen lens and never change it.
+    hold_lens: bool,
 }
 
 impl ZoomPlanner {
@@ -139,6 +145,32 @@ impl ZoomPlanner {
             zoom,
             target,
             pending_since: None,
+            hold_lens: false,
+        }
+    }
+
+    /// Hold the chosen lens (true) or let gestures pick the lens for the
+    /// zoom (false). Returns the new target step when it changes now: a
+    /// gesture still settling decides at once.
+    pub fn set_hold_lens(&mut self, on: bool) -> Option<usize> {
+        self.hold_lens = on;
+        if self.pending_since.take().is_some() {
+            return self.retarget(self.ladder.sticky(self.zoom, self.target));
+        }
+        None
+    }
+
+    pub fn holds_lens(&self) -> bool {
+        self.hold_lens
+    }
+
+    /// The lowest zoom a gesture reaches now: the chosen lens's own
+    /// factor while the lens is held, else the widest lens's.
+    pub fn floor(&self) -> f64 {
+        if self.hold_lens {
+            self.ladder.factor(self.target)
+        } else {
+            self.ladder.min()
         }
     }
 
@@ -166,6 +198,12 @@ impl ZoomPlanner {
             ZoomSource::Preset => {
                 self.pending_since = None;
                 self.retarget(self.ladder.natural(self.zoom))
+            }
+            ZoomSource::Gesture if self.hold_lens => {
+                // Within the chosen lens: never below its own view.
+                self.zoom = self.zoom.max(self.ladder.factor(self.target));
+                self.pending_since = None;
+                None
             }
             ZoomSource::Gesture => {
                 self.pending_since = Some(now);
@@ -360,6 +398,39 @@ mod tests {
             p.next_tick(t0 + Duration::from_millis(50)),
             Some(Duration::from_millis(100))
         );
+    }
+
+    #[test]
+    fn a_held_lens_zooms_digitally_and_only_buttons_change_it() {
+        let t0 = Instant::now();
+        let mut p = ZoomPlanner::new(cheetah(), 1.0);
+        p.set_hold_lens(true);
+        // A pinch past the tele's factor stays on the main camera.
+        assert_eq!(p.set(8.0, ZoomSource::Gesture, t0), None);
+        assert_eq!(p.tick(t0 + Duration::from_secs(1)), None);
+        assert_eq!(p.release(t0 + Duration::from_secs(1)), None);
+        assert_eq!((p.target(), p.zoom()), (MAIN, 8.0));
+        // Nor below its own view: the main camera can't show 0.6x.
+        p.set(0.6, ZoomSource::Gesture, t0);
+        assert_eq!((p.target(), p.zoom()), (MAIN, 1.0));
+        assert_eq!(p.floor(), 1.0);
+        // A button picks the lens.
+        assert_eq!(p.set(0.5, ZoomSource::Preset, t0), Some(UW));
+        assert_eq!(p.floor(), 0.45);
+        // The ultrawide crops up to the top of the ladder.
+        p.set(3.0, ZoomSource::Gesture, t0);
+        assert_eq!((p.target(), p.zoom()), (UW, 3.0));
+        assert!((p.ladder().scale(3.0, UW) - 3.0 / 0.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn letting_go_of_the_lens_decides_a_settling_gesture() {
+        let t0 = Instant::now();
+        let mut p = ZoomPlanner::new(cheetah(), 1.0);
+        p.set(6.0, ZoomSource::Gesture, t0);
+        assert_eq!(p.set_hold_lens(true), Some(TELE));
+        assert!(!p.is_settling());
+        assert_eq!(p.set_hold_lens(false), None);
     }
 
     #[test]
