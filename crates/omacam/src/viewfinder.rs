@@ -389,11 +389,13 @@ fn draw_frame(
     }
     snapshot.rotate(p.rotation as f32);
     let (dw, dh) = (tw * s, th * s);
-    snapshot.append_scaled_texture(
-        tex,
-        gsk::ScalingFilter::Linear,
-        &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh),
-    );
+    // A plain texture node: the renderer samples the frame once per
+    // screen pixel, through the turn and the scale. Not a texture scale
+    // node: under a turn or a scale other than 1 (a phone's screen) GTK
+    // draws one into an offscreen at its size in logical pixels first and
+    // scales that up, which shows the picture at a third of the screen's
+    // resolution on a 2.6x screen.
+    snapshot.append_texture(tex, &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh));
     snapshot.restore();
 }
 
