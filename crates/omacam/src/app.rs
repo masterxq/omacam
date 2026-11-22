@@ -65,6 +65,11 @@ window.omacam, window.omacam viewfinder { background: black; }
   min-width: 46px; min-height: 46px; margin: 0;
   background: rgba(255,255,255,0.24); color: var(--accent-color); font-size: 14px;
 }
+.lens-choice {
+  min-width: 44px; min-height: 44px; padding: 0; border-radius: 999px;
+  background: rgba(0,0,0,0.45); color: white; box-shadow: inset 0 0 0 2px rgba(255,255,255,0.85);
+}
+.lens-choice:disabled { opacity: 0.5; }
 .side-button {
   min-width: 44px; min-height: 44px; padding: 0; border-radius: 999px;
   background: rgba(0,0,0,0.35); color: white; box-shadow: none;
@@ -217,10 +222,17 @@ struct App {
     flash_choices: Vec<(FlashMode, gtk::Button)>,
     timer_button: gtk::Button,
     aspect_button: gtk::Button,
+    aspect_menu: gtk::Revealer,
+    aspect_choices: Vec<(Aspect, gtk::Button)>,
     /// The lens row, the modes and the shutter row: the bar the picture
     /// sits above when it fits.
     bottom_fixed: gtk::Box,
     lens_row: Rc<LensRow>,
+    /// The lens shown last (its name shows over the picture when it
+    /// changes).
+    shown_role: Cell<Option<Role>>,
+    /// The window is in front (focused, not hidden).
+    front: Cell<bool>,
     mode_bar: ModeBar,
     ui_mode: Cell<UiMode>,
     /// The manual controls, and the line naming the values set by hand
@@ -633,6 +645,27 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         .margin_top(56)
         .build();
     overlay.add_overlay(&flash_menu);
+    // The aspect ratios, under the top bar when its button is tapped.
+    let choices = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    choices.add_css_class("flash-menu");
+    let mut aspect_choices = Vec::new();
+    for a in Aspect::ALL {
+        let b = gtk::Button::with_label(aspect_label(a));
+        b.add_css_class("flash-choice");
+        b.add_css_class("aspect-choice");
+        b.add_css_class("turnable");
+        choices.append(&b);
+        aspect_choices.push((a, b));
+    }
+    let aspect_menu = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .child(&choices)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .margin_start(8)
+        .margin_top(56)
+        .build();
+    overlay.add_overlay(&aspect_menu);
 
     let debug = gtk::Label::new(None);
     debug.add_css_class("debug");
@@ -791,6 +824,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     bottom_panel.set_valign(gtk::Align::End);
     bottom_panel.append(&manual_revealer);
     bottom_panel.append(&manual_hint);
+    bottom_panel.append(&lens_row.menu);
     bottom_panel.append(&bottom_fixed);
     overlay.add_overlay(&bottom_panel);
 
@@ -818,8 +852,12 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         flash_choices,
         timer_button,
         aspect_button,
+        aspect_menu,
+        aspect_choices,
         bottom_fixed,
         lens_row,
+        shown_role: Cell::new(None),
+        front: Cell::new(true),
         mode_bar,
         ui_mode: Cell::new(UiMode::Photo),
         manual,
@@ -834,7 +872,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         thumb,
         thumb_picture,
         debug,
-        before_torch: Cell::new(FlashMode::Off),
+        before_torch: Cell::new(FlashMode::Auto),
         backend: RefCell::new(None),
         controller: RefCell::new(None),
         frame_slot: Arc::new(Mutex::new(None)),
@@ -1031,7 +1069,7 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 app.zoom_to(z, ZoomSource::Gesture);
                 app.zoom_released();
             }
-            Step::Lens(z) => app.lens_event(LensEvent::Button(z)),
+            Step::Lens(z) => app.lens_event(LensEvent::Stage(z)),
             Step::Dial(z) => {
                 app.lens_row.show_dial();
                 app.lens_event(LensEvent::Drag(z));
@@ -1039,7 +1077,18 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
                 app.lens_row.hide_dial_later();
             }
             Step::Flip => app.flip.emit_clicked(),
-            Step::Macro => app.lens_event(LensEvent::Macro),
+            Step::Macro => {
+                let on = app
+                    .controller
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|c| c.view().macro_on);
+                app.lens_row
+                    .choose(if on { Role::Main } else { Role::Macro });
+            }
+            Step::Camera(role) => app.lens_row.choose(role),
+            Step::LensMenu => app.lens_row.menu.set_reveal_child(true),
+            Step::AspectMenu => app.open_menu(&app.aspect_menu, &app.aspect_button),
             Step::Shutter => app.shutter.emit_clicked(),
             Step::Shot(path) => match app.shot_after_paint(path.clone()).await {
                 Ok(()) => tracing::info!(path = %path.display(), "window saved"),
@@ -1106,7 +1155,7 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
             })),
             Step::Histogram(on) => app.manual.set_histogram(on),
             Step::Flash(mode) => app.set_flash(mode),
-            Step::FlashMenu => app.flash_menu.set_reveal_child(true),
+            Step::FlashMenu => app.open_menu(&app.flash_menu, &app.flash_button),
             Step::Aspect(a) => {
                 let aspect = match a.as_str() {
                     "4:3" => Aspect::FourThree,
@@ -1324,12 +1373,12 @@ pub(crate) fn format_zoom(z: f64) -> String {
 /// A zoom stage's button label: ".5", "1", "2", "5".
 pub(crate) fn stage_label(p: f64) -> String {
     if p < 1.0 {
-        // One decimal: the full ultrawide (0.45x) reads ".5", as on stock.
-        format!("{:.1}", (p * 10.0).round() / 10.0)
+        // One decimal: the full ultrawide (0.45x) reads ".5×", as on stock.
+        format!("{:.1}×", (p * 10.0).round() / 10.0)
             .trim_start_matches('0')
             .to_string()
     } else {
-        format!("{}", p.round() as i64)
+        format!("{}×", p.round() as i64)
     }
 }
 
@@ -1465,18 +1514,13 @@ impl App {
                 let out = if first {
                     let mut c = Controller::new(&self.cli.lens_table(), &cameras, opts);
                     c.set_facing(self.cli.start_facing());
-                    let settings = self.settings.borrow().clone();
-                    if settings.keep_pro {
-                        App::restore_pro(&mut c, &settings.pro);
-                    }
                     if let Some(z) = self.cli.zoom {
                         c.set_zoom(z, ZoomSource::Preset, now);
                     }
-                    let out = if self.suspended.get() {
-                        Vec::new()
-                    } else {
-                        c.resume(now)
-                    };
+                    let mut out = c.set_foreground(self.front.get());
+                    if !self.suspended.get() {
+                        out.extend(c.resume(now));
+                    }
                     *self.controller.borrow_mut() = Some(c);
                     out
                 } else {
@@ -1791,15 +1835,15 @@ impl App {
         };
         let video = view.mode == omacam_core::controller::Mode::Video;
         let busy = view.capturing || self.merging.get().is_some();
-        self.lens_row.update(
-            &view.buttons,
-            view.zoom,
-            view.zoom_floor,
-            view.max_zoom,
-            view.can_macro && !view.recording,
-            view.macro_on,
-            !view.capturing,
-        );
+        self.lens_row
+            .update(&view, !view.capturing, !view.capturing);
+        // A new lens: its name over the picture for a moment.
+        if let Some(role) = view.lens_role {
+            let before = self.shown_role.replace(Some(role));
+            if before.is_some_and(|b| b != role) {
+                self.flash_note(crate::lensrow::lens_name(role));
+            }
+        }
         self.flip.set_visible(view.can_flip);
         self.flip.set_sensitive(!view.capturing && !view.recording);
         if view.capturing {
@@ -1875,30 +1919,33 @@ impl App {
             self.viewfinder.set_placement(self.placement_for(cam));
         }
         let settings = self.settings.borrow().clone();
-        // The focus ring while it scans and holds; afterwards a small
-        // marker where focus and metering still look, until given up.
+        // The focus mark while it scans, a little smaller once sharp;
+        // afterwards a small, fainter one where focus and metering still
+        // look, until given up. Light corners with a dark edge, so they
+        // show on any picture and leave the subject free.
+        let white = |a| gdk::RGBA::new(1.0, 1.0, 1.0, a);
         let ring = view
             .focus
-            .map(|f| Ring {
-                u: f.u,
-                v: f.v,
-                color: match f.status {
-                    FocusStatus::Scanning => gdk::RGBA::new(1.0, 1.0, 1.0, 0.9),
-                    FocusStatus::Focused => gdk::RGBA::new(1.0, 0.84, 0.31, 1.0),
-                    FocusStatus::Failed => gdk::RGBA::new(1.0, 0.42, 0.42, 1.0),
-                    FocusStatus::FixedFocus | FocusStatus::Unavailable => {
-                        gdk::RGBA::new(1.0, 1.0, 1.0, 0.4)
-                    }
-                    FocusStatus::Following => gdk::RGBA::new(1.0, 0.84, 0.31, 0.8),
-                },
-                marker: false,
+            .map(|f| {
+                let (half, color) = match f.status {
+                    FocusStatus::Scanning => (36.0, white(0.95)),
+                    FocusStatus::Focused | FocusStatus::Following => (30.0, white(0.95)),
+                    FocusStatus::Failed => (36.0, gdk::RGBA::new(1.0, 0.55, 0.5, 0.95)),
+                    FocusStatus::FixedFocus | FocusStatus::Unavailable => (36.0, white(0.5)),
+                };
+                Ring {
+                    u: f.u,
+                    v: f.v,
+                    half,
+                    color,
+                }
             })
             .or_else(|| {
                 view.tap_point.map(|(u, v)| Ring {
                     u,
                     v,
-                    color: gdk::RGBA::new(1.0, 0.84, 0.31, 0.85),
-                    marker: true,
+                    half: 16.0,
+                    color: white(0.6),
                 })
             });
         // Video records 16:9, upright 9:16: show what goes in the file.
@@ -2075,6 +2122,16 @@ impl App {
             self.timer_button.add_css_class("on");
         }
         self.aspect_button.set_visible(!video);
+        if video {
+            self.aspect_menu.set_reveal_child(false);
+        }
+        for (a, b) in &self.aspect_choices {
+            if *a == settings.aspect {
+                b.add_css_class("active");
+            } else {
+                b.remove_css_class("active");
+            }
+        }
         if let Some(l) = top_button_label(&self.aspect_button) {
             l.set_label(aspect_label(settings.aspect));
         }
@@ -2115,7 +2172,13 @@ impl App {
             .as_ref()
             .map(|c| c.view().zoom)
             .unwrap_or(1.0);
-        self.zoom_indicator.set_label(&format_zoom(zoom));
+        self.flash_note(&format_zoom(zoom));
+    }
+
+    /// Show a word over the middle of the picture for a moment (the zoom,
+    /// a lens's name).
+    fn flash_note(self: &Rc<Self>, text: &str) {
+        self.zoom_indicator.set_label(text);
         self.zoom_indicator.set_visible(true);
         if let Some(id) = self.hide_source.borrow_mut().take() {
             id.remove();
@@ -2130,18 +2193,37 @@ impl App {
         *self.hide_source.borrow_mut() = Some(id);
     }
 
-    /// The lens row: a button, the macro lens, the dial.
+    /// Open a menu of the top bar under its button, closing the others.
+    fn open_menu(&self, menu: &gtk::Revealer, button: &gtk::Button) {
+        self.close_menus();
+        if let Some(b) = button.compute_bounds(&self.viewfinder) {
+            menu.set_margin_start((b.x() as i32 - 6).max(8));
+        }
+        menu.set_reveal_child(true);
+    }
+
+    /// Close the menus over the picture; whether one was open.
+    fn close_menus(&self) -> bool {
+        let menus = [&self.flash_menu, &self.aspect_menu, &self.lens_row.menu];
+        let open = menus.iter().any(|m| m.reveals_child());
+        for m in menus {
+            m.set_reveal_child(false);
+        }
+        open
+    }
+
+    /// The lens row: a stage, a lens from the menu, the dial.
     fn lens_event(self: &Rc<Self>, e: LensEvent) {
         let now = Instant::now();
         match e {
-            LensEvent::Button(z) => {
-                if let Some(out) = self.with_controller(|c| c.press_zoom_button(z, now)) {
+            LensEvent::Stage(z) => {
+                if let Some(out) = self.with_controller(|c| c.press_stage(z, now)) {
                     self.apply(out);
                 }
                 self.flash_zoom();
             }
-            LensEvent::Macro => {
-                if let Some(out) = self.with_controller(|c| c.toggle_macro(now)) {
+            LensEvent::Lens(lens) => {
+                if let Some(out) = self.with_controller(|c| c.choose_lens(lens, now)) {
                     self.apply(out);
                 }
             }
@@ -2177,26 +2259,16 @@ impl App {
         self.push_capture_mode();
     }
 
-    /// The flash mode, from the menu, a long press or a script. The
-    /// torch isn't kept: the setting keeps the mode it was switched on
-    /// from, so the app never starts with the light on.
+    /// The flash mode, from the menu, a long press or a script; for this
+    /// run only (every launch starts at auto).
     fn set_flash(self: &Rc<Self>, mode: FlashMode) {
-        let before = self.settings.borrow().flash;
         let now = self
             .controller
             .borrow()
             .as_ref()
-            .map_or(before, |c| c.flash_mode());
+            .map_or(self.settings.borrow().flash, |c| c.flash_mode());
         if mode == FlashMode::Torch && now != FlashMode::Torch {
             self.before_torch.set(now);
-        }
-        let kept = if mode == FlashMode::Torch {
-            self.before_torch.get()
-        } else {
-            mode
-        };
-        if kept != before {
-            self.change_settings(|s| s.flash = kept);
         }
         self.flash_menu.set_reveal_child(false);
         match self.with_controller(|c| c.set_flash_mode(mode)) {
@@ -2300,8 +2372,11 @@ impl App {
         let a = Rc::downgrade(self);
         self.flash_button.connect_clicked(move |_| {
             if let Some(a) = a.upgrade() {
-                let open = a.flash_menu.reveals_child();
-                a.flash_menu.set_reveal_child(!open);
+                if a.flash_menu.reveals_child() {
+                    a.flash_menu.set_reveal_child(false);
+                } else {
+                    a.open_menu(&a.flash_menu, &a.flash_button);
+                }
             }
         });
         // A long press on the flash button switches the torch.
@@ -2340,13 +2415,21 @@ impl App {
         let a = Rc::downgrade(self);
         self.aspect_button.connect_clicked(move |_| {
             let Some(a) = a.upgrade() else { return };
-            let all = Aspect::ALL;
-            let now = a.settings.borrow().aspect;
-            let i = all.iter().position(|x| *x == now).unwrap_or(0);
-            let next = all[(i + 1) % all.len()];
-            a.change_settings(|s| s.aspect = next);
-            a.refresh();
+            if a.aspect_menu.reveals_child() {
+                a.aspect_menu.set_reveal_child(false);
+            } else {
+                a.open_menu(&a.aspect_menu, &a.aspect_button);
+            }
         });
+        for (aspect, b) in &self.aspect_choices {
+            let (a, aspect) = (Rc::downgrade(self), *aspect);
+            b.connect_clicked(move |_| {
+                let Some(a) = a.upgrade() else { return };
+                a.aspect_menu.set_reveal_child(false);
+                a.change_settings(|s| s.aspect = aspect);
+                a.refresh();
+            });
+        }
 
         // Tap the picture to focus and meter there; a tap on the marker
         // of the point in force gives it up.
@@ -2357,8 +2440,7 @@ impl App {
             if n != 1 {
                 return;
             }
-            if a.flash_menu.reveals_child() {
-                a.flash_menu.set_reveal_child(false);
+            if a.close_menus() {
                 return;
             }
             let marker = a
@@ -2463,6 +2545,7 @@ impl App {
         self.window.connect_suspended_notify(move |w| {
             if let Some(a) = a.upgrade() {
                 tracing::info!(suspended = w.is_suspended(), "window state");
+                a.set_front(w.is_active() && !w.is_suspended());
                 a.set_suspended(w.is_suspended());
             }
         });
@@ -2472,6 +2555,9 @@ impl App {
             if let Some(id) = a.unfocus_source.borrow_mut().take() {
                 id.remove();
             }
+            // The flash LED goes out at once out of the front; the
+            // cameras only after a while.
+            a.set_front(w.is_active() && !w.is_suspended());
             if w.is_active() {
                 if !w.is_suspended() {
                     a.set_suspended(false);
@@ -2491,6 +2577,16 @@ impl App {
                 *a.unfocus_source.borrow_mut() = Some(id);
             }
         });
+    }
+
+    /// The window is in front or not (the flash LED is lit only in front).
+    fn set_front(self: &Rc<Self>, front: bool) {
+        self.front.set(front);
+        if let Some(out) = self.with_controller(|c| c.set_foreground(front)) {
+            if !out.is_empty() {
+                self.apply(out);
+            }
+        }
     }
 
     /// Give up the tapped point: focus and metering over the whole picture.
@@ -2984,59 +3080,6 @@ impl App {
         Some(region_luma(&px, x, y, 0.04))
     }
 
-    /// Save the Pro values, when the setting keeps them.
-    fn save_pro(&self) {
-        use crate::settings::{SavedPro, SavedWb};
-        use omacam_core::backend::{Awb, AwbPreset};
-        let Some(view) = self.controller.borrow().as_ref().map(|c| c.view().exposure) else {
-            return;
-        };
-        let mut s = self.settings.borrow_mut();
-        if !s.keep_pro {
-            return;
-        }
-        s.pro = SavedPro {
-            shutter_us: view.pro.shutter.manual(),
-            iso: view
-                .pro
-                .gain
-                .manual()
-                .map(|g| omacam_core::exposure_control::iso(g as f64, view.base_iso)),
-            white_balance: view.pro.white_balance.manual().and_then(|w| match w {
-                Awb::Preset(AwbPreset::Daylight) => Some(SavedWb::Daylight),
-                Awb::Preset(AwbPreset::Cloudy) => Some(SavedWb::Cloudy),
-                Awb::Preset(AwbPreset::Incandescent) => Some(SavedWb::Incandescent),
-                Awb::Preset(AwbPreset::Fluorescent) => Some(SavedWb::Fluorescent),
-                Awb::Kelvin(k) => Some(SavedWb::Kelvin(k)),
-                // The panel sets presets; gains are only what they become.
-                Awb::Gains(_) => None,
-            }),
-            focus: view.pro.lens.manual(),
-        };
-        if let Err(e) = s.save(&self.settings_path) {
-            tracing::warn!(error = %e, "settings not saved");
-        }
-    }
-
-    /// Put saved Pro values back (at start, when the setting keeps them).
-    fn restore_pro(c: &mut Controller, saved: &crate::settings::SavedPro) {
-        use crate::settings::SavedWb;
-        use omacam_core::backend::{Awb, AwbPreset, Setting};
-        fn m<T>(o: Option<T>) -> Setting<T> {
-            o.map(Setting::Manual).unwrap_or(Setting::Auto)
-        }
-        c.set_shutter(m(saved.shutter_us));
-        c.set_iso(m(saved.iso));
-        c.set_lens_position(m(saved.focus));
-        c.set_white_balance(m(saved.white_balance.map(|w| match w {
-            SavedWb::Daylight => Awb::Preset(AwbPreset::Daylight),
-            SavedWb::Cloudy => Awb::Preset(AwbPreset::Cloudy),
-            SavedWb::Incandescent => Awb::Preset(AwbPreset::Incandescent),
-            SavedWb::Fluorescent => Awb::Preset(AwbPreset::Fluorescent),
-            SavedWb::Kelvin(k) => Awb::Kelvin(k),
-        })));
-    }
-
     /// The manual controls: a value set by hand or given back to auto.
     fn manual_action(self: &Rc<Self>, action: crate::manual::Action) {
         use crate::manual::Action;
@@ -3055,7 +3098,6 @@ impl App {
         if let Some(out) = out {
             self.apply(out);
         }
-        self.save_pro();
     }
 
     fn open_settings(self: &Rc<Self>) {

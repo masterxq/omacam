@@ -153,6 +153,16 @@ pub struct ZoomButton {
     pub active: bool,
 }
 
+/// A lens of the side the app looks to, as the lens menu lists it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LensChoice {
+    /// Its index in the lens table.
+    pub lens: usize,
+    pub role: Role,
+    /// The lens chosen now.
+    pub active: bool,
+}
+
 /// The state the controls show.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewState {
@@ -167,6 +177,13 @@ pub struct ViewState {
     /// The lens row of the side the app looks to (the back's ladder while
     /// the macro lens is on, too).
     pub buttons: Vec<ZoomButton>,
+    /// The back's lenses to choose from (the macro lens last); empty on
+    /// the front, and where the back has one lens.
+    pub lenses: Vec<LensChoice>,
+    /// The zoom stages of the chosen lens ("1", "2"): the presets from its
+    /// own view up to the most it zooms, its own view first. While the
+    /// lens is held, a stage crops it; otherwise a stage may switch lens.
+    pub stages: Vec<f64>,
     /// The lens that is wanted for the current zoom.
     pub lens_role: Option<Role>,
     pub lens_name: String,
@@ -343,6 +360,9 @@ pub struct Controller {
     light_out: Option<LightOut>,
     /// A photo waits for the exposure to settle after the torch.
     light_out_photo: bool,
+    /// The window isn't in front (unfocused, hidden, the screen locked):
+    /// the LED is out, though the cameras may still run.
+    background: bool,
 }
 
 impl Controller {
@@ -391,6 +411,7 @@ impl Controller {
             light: Light::Off,
             light_out: None,
             light_out_photo: false,
+            background: false,
         }
     }
 
@@ -499,6 +520,8 @@ impl Controller {
             zoom_floor,
             presets: preset_values(presets, min_zoom, max_zoom),
             buttons: self.zoom_buttons(),
+            lenses: self.lens_choices(),
+            stages: self.zoom_stages(),
             lens_role: lens.map(|l| l.role),
             lens_name: lens.map(|l| l.name.clone()).unwrap_or_default(),
             switching: self.switch.is_switching(),
@@ -519,6 +542,57 @@ impl Controller {
             can_flash: self.opts.flash && self.facing == Facing::Back,
             light: self.light,
         }
+    }
+
+    /// The back's lenses: the zoom ladder's, widest first, then the macro
+    /// lens. None on the front side, nor for a back with a single lens.
+    fn lens_choices(&self) -> Vec<LensChoice> {
+        let Some(back) = self.back.as_ref().filter(|_| self.facing == Facing::Back) else {
+            return Vec::new();
+        };
+        let chosen = if self.macro_on {
+            self.macro_side.as_ref().map(|s| s.planned())
+        } else {
+            Some(back.planned())
+        };
+        let mut lenses: Vec<usize> = back.lenses.clone();
+        if let Some(m) = &self.macro_side {
+            lenses.extend(&m.lenses);
+        }
+        if lenses.len() < 2 {
+            return Vec::new();
+        }
+        lenses
+            .into_iter()
+            .map(|lens| LensChoice {
+                lens,
+                role: self.table.get(lens).role,
+                active: Some(lens) == chosen,
+            })
+            .collect()
+    }
+
+    /// The zoom stages of the side in use: its presets from the floor (the
+    /// chosen lens's own view while it is held) up to its most.
+    fn zoom_stages(&self) -> Vec<f64> {
+        let Some(side) = self.side() else {
+            return Vec::new();
+        };
+        let presets = match self.facing {
+            Facing::Back if self.macro_on => &MACRO_PRESETS[..],
+            Facing::Back => &BACK_PRESETS[..],
+            Facing::Front => &FRONT_PRESETS[..],
+        };
+        let ladder = side.planner.ladder();
+        let floor = side.planner.floor();
+        let mut stages: Vec<f64> = preset_values(presets, ladder.min(), ladder.max())
+            .into_iter()
+            // Not one just above the lens's own view (5 over the
+            // telephoto's 4.78).
+            .filter(|&z| z > floor * 1.1)
+            .collect();
+        stages.insert(0, floor);
+        stages
     }
 
     /// The lens row: the presets of the side's ladder, each shown by the
@@ -858,6 +932,59 @@ impl Controller {
         if changed.is_some() || left_macro {
             self.request_preview(now, &mut out);
         }
+        out
+    }
+
+    /// A zoom stage of the lens row. While the lens is held it crops the
+    /// chosen lens and never changes it; otherwise the stage's lens takes
+    /// over, as a preset does.
+    pub fn press_stage(&mut self, zoom: f64, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        if self.busy() {
+            return out;
+        }
+        let changed = self.side_mut().and_then(|s| {
+            let source = if s.planner.holds_lens() {
+                ZoomSource::Gesture
+            } else {
+                ZoomSource::Preset
+            };
+            s.planner.set(zoom, source, now)
+        });
+        if changed.is_some() {
+            self.request_preview(now, &mut out);
+        }
+        out
+    }
+
+    /// Choose a back lens from the lens menu ([`ViewState::lenses`]): it
+    /// opens at its own view. The macro lens can't be chosen or left while
+    /// recording; nor can any lens while taking a photo. Choosing the lens
+    /// in use does nothing.
+    pub fn choose_lens(&mut self, lens: usize, now: Instant) -> Vec<Output> {
+        let mut out = Vec::new();
+        let Some(choice) = self.lens_choices().into_iter().find(|c| c.lens == lens) else {
+            return out;
+        };
+        if choice.active || self.busy() {
+            return out;
+        }
+        let to_macro = choice.role == Role::Macro;
+        if self.recording && (to_macro || self.macro_on) {
+            return out;
+        }
+        if to_macro != self.macro_on {
+            self.macro_on = to_macro;
+            // Another lens, nothing to carry over from the old one's focus.
+            self.focus.reset();
+            self.last_meta = None;
+        }
+        let factor = self.table.get(lens).zoom;
+        if let Some(s) = self.side_mut() {
+            s.planner.set(factor, ZoomSource::Preset, now);
+        }
+        self.request_preview(now, &mut out);
+        self.sync_light(&mut out);
         out
     }
 
@@ -1432,7 +1559,7 @@ impl Controller {
 
     /// What the LED should do now.
     fn wanted_light(&self) -> Light {
-        if !self.opts.flash || self.suspended || self.facing != Facing::Back {
+        if !self.opts.flash || self.suspended || self.background || self.facing != Facing::Back {
             return Light::Off;
         }
         // The torch comes on once a back lens streams and stays on through
@@ -1463,6 +1590,7 @@ impl Controller {
             let torch_out = self.light == Light::Torch
                 && want == Light::Off
                 && !self.suspended
+                && !self.background
                 && !self.flash_photo
                 && self.facing == Facing::Back
                 && self.switch.streaming().is_some();
@@ -1474,6 +1602,29 @@ impl Controller {
             self.light = want;
             out.push(Output::Light(want));
         }
+    }
+
+    /// The window came to the front or left it. Out of the front the LED
+    /// goes out at once (the cameras are let go only later): a flash
+    /// photo still waiting under its light is given up, one being taken
+    /// finishes without it. Back in front, the torch comes on again when
+    /// it is the mode.
+    pub fn set_foreground(&mut self, front: bool) -> Vec<Output> {
+        let mut out = Vec::new();
+        if self.background != front {
+            return out;
+        }
+        self.background = !front;
+        if self.background {
+            if self.pre_flash.take().is_some() {
+                tracing::info!("flash: the app left the front; no flash photo");
+            }
+            self.flash_photo = false;
+            self.light_out = None;
+            self.light_out_photo = false;
+        }
+        self.sync_light(&mut out);
+        out
     }
 
     /// A preview frame after the torch went out: the wait for the exposure
@@ -2011,6 +2162,50 @@ mirror = true
         c.on_event(started(g, "main"), now);
         c.on_event(frame(g, "main", 10_000), now);
         g
+    }
+
+    #[test]
+    fn lenses_are_chosen_apart_from_the_zoom_stages() {
+        let now = Instant::now();
+        let opts = Options {
+            hold_lens: true,
+            ..Options::default()
+        };
+        let mut c = Controller::new(&spec(), &cameras(), opts);
+        let g = open(&mut c, now);
+        let v = c.view();
+        let roles: Vec<(Role, bool)> = v.lenses.iter().map(|l| (l.role, l.active)).collect();
+        assert_eq!(
+            roles,
+            vec![
+                (Role::Ultrawide, false),
+                (Role::Main, true),
+                (Role::Tele, false)
+            ]
+        );
+        assert_eq!(v.stages, vec![1.0, 2.0, 5.0]);
+        // A stage crops the main camera, even the telephoto's 5.
+        assert!(commands(&c.press_stage(5.0, now)).is_empty());
+        assert_eq!(c.view().zoom, 5.0);
+        assert_eq!(c.view().lens_role, Some(Role::Main));
+        // The ultrawide from the menu: its own view, its stages.
+        let uw = v.lenses[0].lens;
+        let (g2, cam, _) = start_of(&c.choose_lens(uw, now));
+        assert!(g2 > g && cam == "uw", "{cam}");
+        let v = c.view();
+        assert!((v.zoom - 0.45).abs() < 1e-9 && v.lenses[0].active);
+        assert_eq!(v.stages, vec![0.45, 1.0, 2.0, 5.0]);
+        assert!(commands(&c.press_stage(2.0, now)).is_empty(), "no switch");
+        // The telephoto: one stage, its own view.
+        c.choose_lens(v.lenses[2].lens, now);
+        assert_eq!(c.view().stages, vec![4.78]);
+        // The lens in use again: nothing.
+        let tele = c.view().lenses[2].lens;
+        assert!(c.choose_lens(tele, now).is_empty());
+        // The front side has no lens menu.
+        c.flip(now);
+        assert!(c.view().lenses.is_empty());
+        assert_eq!(c.view().stages, vec![1.0, 2.0]);
     }
 
     #[test]
@@ -3163,6 +3358,40 @@ still = [2592, 1940]
         assert!(
             matches!(commands(&out).as_slice(), [Command::Capture { .. }]),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn the_light_goes_out_when_the_app_leaves_the_front() {
+        let now = Instant::now();
+        let opts = Options {
+            flash: true,
+            flash_mode: FlashMode::Torch,
+            ..Options::default()
+        };
+        let mut c = Controller::new(&spec(), &cameras(), opts);
+        let (g, _, _) = start_of(&c.resume(now));
+        assert_eq!(
+            lights(&c.on_event(started(g, "main"), now)),
+            vec![Light::Torch]
+        );
+        // Out of the front: out at once, the camera still streams.
+        let out = c.set_foreground(false);
+        assert_eq!(lights(&out), vec![Light::Off]);
+        assert!(commands(&out).is_empty());
+        assert!(c.set_foreground(false).is_empty());
+        // Back: lit again.
+        assert_eq!(lights(&c.set_foreground(true)), vec![Light::Torch]);
+        // A flash photo waiting under its light is given up.
+        c.set_flash_mode(FlashMode::On);
+        c.on_event(frame(g, "main", 10_000), now);
+        assert_eq!(lights(&c.shutter(now)), vec![Light::Photo]);
+        assert_eq!(lights(&c.set_foreground(false)), vec![Light::Off]);
+        assert!(!c.view().capturing);
+        assert!(commands(&c.tick(now + crate::flash::PRE_FLASH_MAX)).is_empty());
+        assert!(
+            lights(&c.set_foreground(true)).is_empty(),
+            "nothing to light"
         );
     }
 

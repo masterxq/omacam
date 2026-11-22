@@ -2,8 +2,10 @@
 //! `--script "wait 3; zoom 5; wait 2; shot /tmp/tele.png; quit"`.
 //!
 //! Steps: `wait SECONDS`, `zoom Z` (as a preset button), `pinch Z` (as a
-//! pinch that ends at Z), `lens Z` (the lens row's button for Z), `dial Z`
-//! (the zoom dial, dragged to Z), `flip`, `macro` (the macro button),
+//! pinch that ends at Z), `lens Z` (the lens row's zoom stage for Z),
+//! `dial Z` (the zoom dial, dragged to Z), `camera main|macro|wide|tele`
+//! (a lens from the lens menu), `lens-menu` (open it), `flip`, `macro`
+//! (the macro lens from the menu, or back to the main camera),
 //! `shutter`, `tap U V` (a tap on the picture), `settings PAGE` and
 //! `close-settings`, `shot PATH` (the window as a PNG, rendered by the app
 //! itself, so it works with the panel off), `hold
@@ -13,7 +15,8 @@
 //! ev|focus|wb|shutter|iso|none` (open a value's slider), `focus P|auto`,
 //! `iso N|auto`, `wb KELVIN|auto`, `ev EV`, `pro-shutter MICROSECONDS`,
 //! `histogram on|off`, `lock`, `flash auto|on|off|torch`, `flash-menu`
-//! (the flash's choices), `aspect full|4:3|16:9|1:1`, `timer 0|3|10`, and
+//! (the flash's choices), `aspect full|4:3|16:9|1:1`, `aspect-menu`,
+//! `timer 0|3|10`, and
 //! `quit`.
 
 use std::path::PathBuf;
@@ -25,8 +28,14 @@ pub enum Step {
     Zoom(f64),
     Pinch(f64),
     Flip,
-    /// The macro button.
+    /// The macro lens from the lens menu, or back to the main camera.
     Macro,
+    /// A lens from the lens menu.
+    Camera(omacam_core::lens::Role),
+    /// Open the lens menu.
+    LensMenu,
+    /// Open the aspect ratios.
+    AspectMenu,
     Shutter,
     Shot(PathBuf),
     /// Open the settings sheet on a page (photo, video, advanced).
@@ -38,7 +47,7 @@ pub enum Step {
     Mode(String),
     /// The HDR chip.
     Hdr(bool),
-    /// The lens row's button for this zoom.
+    /// The lens row's zoom stage for this zoom.
     Lens(f64),
     /// The zoom dial, as if dragged to this zoom.
     Dial(f64),
@@ -95,6 +104,15 @@ pub fn parse(text: &str) -> Result<Vec<Step>, String> {
             "pinch" => Step::Pinch(number()?),
             "flip" => Step::Flip,
             "macro" => Step::Macro,
+            "camera" => Step::Camera(match arg {
+                "main" => omacam_core::lens::Role::Main,
+                "macro" => omacam_core::lens::Role::Macro,
+                "wide" => omacam_core::lens::Role::Ultrawide,
+                "tele" => omacam_core::lens::Role::Tele,
+                _ => return Err(format!("camera: main, macro, wide or tele, not {arg:?}")),
+            }),
+            "lens-menu" => Step::LensMenu,
+            "aspect-menu" => Step::AspectMenu,
             "shutter" => Step::Shutter,
             "shot" if !arg.is_empty() => Step::Shot(PathBuf::from(arg)),
             "shot" => return Err("shot: needs a path".into()),
@@ -221,6 +239,15 @@ mod tests {
         assert!(parse("timer 5").is_err());
         assert_eq!(parse("hold left").unwrap(), vec![Step::Hold("left".into())]);
         assert!(parse("hold sideways").is_err());
+        assert_eq!(
+            parse("camera macro; lens-menu; aspect-menu").unwrap(),
+            vec![
+                Step::Camera(omacam_core::lens::Role::Macro),
+                Step::LensMenu,
+                Step::AspectMenu
+            ]
+        );
+        assert!(parse("camera front").is_err());
         assert_eq!(
             parse("flash torch; flash auto").unwrap(),
             vec![

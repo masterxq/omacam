@@ -234,15 +234,25 @@ under the bottom bar, which is half see-through
 picture.
 
 - **Top:** flash (its four choices drop down under it; a long press
-  switches the torch), self-timer, aspect ratio, HDR (where the lens
-  table allows bursts) or 60 fps in video, the settings gear.
-- **Lens row:** one round button per lens and zoom stage
-  (`ViewState::buttons`), the macro lens's flower beside them; the one in
-  use shows the exact zoom. Dragging sideways across it shows the zoom
-  dial (`dial.rs`) in its place, a ruler of zoom values under a marker,
-  stages labeled, with a light detent at each. At the row's ends: the
-  torch (with the macro lens on, for its use as a magnifier) and the
-  adjust button for the manual controls.
+  switches the torch), self-timer, aspect ratio (its four choices drop
+  down too), HDR (where the lens table allows bursts) or 60 fps in video,
+  the settings gear. These start afresh at every launch, as do the lens,
+  the zoom and the manual values (flash auto, no timer, the full frame,
+  the main camera at 1x, all automatic): what stays across launches is
+  what the gear's sheet sets. Within a run, leaving the app and coming
+  back keeps them all; only a tapped point is given up.
+- **Lens row** (`lensrow.rs`): the zoom stages of the chosen lens
+  (`ViewState::stages`: the presets from its own view up to the most it
+  zooms, "1×", "2×"), the one in use with the exact zoom. A stage only
+  zooms (`Controller::press_stage`): it crops the chosen lens. Dragging
+  sideways across the stages shows the zoom dial (`dial.rs`) in their
+  place, a ruler of zoom values under a marker, stages labeled, with a
+  light detent at each. Beside the stages the lens button, a ring with
+  the chosen lens's symbol (`ViewState::lenses`); a tap drops the lens
+  menu over the row, each back lens with its symbol and name, and a
+  choice (`Controller::choose_lens`) opens that lens at its own view and
+  shows its name over the picture for a moment. The macro lens is one of
+  them. At the row's end the adjust button for the manual controls.
 - **Mode bar** (`modebar.rs`): one line, Night (where the lens table
   allows bursts), Photo, Video; a tap or a swipe chooses, and the line
   slides so the chosen mode sits in the middle.
@@ -432,9 +442,13 @@ Automatic by default, with manual control where the camera allows it:
   Continuous, AfMetering Windows, AfWindows), so it keeps following that
   spot without a visible scan; elsewhere it scans once, as in photos.
   Recording starts with one scan. AE/AF lock holds focus with AfPause.
-- **The tapped point stays marked.** After the ring has gone, focus
-  (continuous AF on the tapped window) and metering keep following the
-  point, so a small marker stays on it (`ViewState::tap_point`). A tap on
+- **The mark.** Four corners of a square, a thin light line with a dark
+  edge, so they show on a white wall and in the dark alike and leave the
+  subject inside free: larger while AF scans, a little smaller once sharp
+  (reddish when it fails).
+- **The tapped point stays marked.** After the scan, focus (continuous AF
+  on the tapped window) and metering keep following the point, so small,
+  fainter corners stay on it (`ViewState::tap_point`). A tap on
   the marker gives the whole picture back to focus and metering
   (`Controller::clear_tap`: AfMetering Auto, matrix metering, no
   correction for the spot); so does the window coming back to the front
@@ -465,8 +479,7 @@ Automatic by default, with manual control where the camera allows it:
   over starts there. ISO is analog gain × the sensor's base ISO
   (`base_iso` in the lens table). A histogram of the picture's luma can
   be shown over the picture. Manual values hold across lens switches,
-  apply to stills and video alike, and reset at each launch unless "Keep
-  manual settings" is on.
+  apply to stills and video alike, and reset at each launch.
 - **Stills wait for the exposure to settle.** After the switch to the
   still mode, the capture waits for AeState Converged (and the color to
   settle), at most 10 frames; a camera without AeState gets 8 frames.
@@ -504,14 +517,18 @@ ms and then walks down for over 2 s, while its still stream sets an
 exposure of its own: photos 0.6 s after the reaction came out as well
 exposed as those after 1.6 s.
 
-- **Modes** (`FlashMode`, the flash button, `flash` in `settings.toml`):
+- **Modes** (`FlashMode`, the flash button; every launch starts at auto):
   off, auto (lit for a photo when the preview's exposure time times its
   gain is above the lens table's `auto_above`), on (every photo), and
   torch, a steady light on every back lens (the macro camera as a
   magnifier) that stays on through photos. The front camera has no flash:
   the mode is kept and nothing lights there.
-- **The LED goes out** when the app is put away (suspended, unfocused for
-  10 s, closed), on the front camera, and while the camera fails (until it
+- **The LED goes out** as soon as the window leaves the front (unfocused,
+  hidden, the screen locked or off, the photo viewer opened:
+  `Controller::set_foreground`), well before the cameras are let go, and
+  the torch comes back on with the window. A flash photo still waiting
+  under its light is given up; one being taken finishes without it. It
+  goes out too on the front camera, and while the camera fails (until it
   streams again). The controller says what the LED should do
   (`Output::Light`: off, torch, photo) and the app sets it, only when
   that changes.

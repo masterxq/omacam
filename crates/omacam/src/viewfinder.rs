@@ -349,21 +349,44 @@ pub fn draw(
             rect.x() + rect.width() * ur as f32,
             rect.y() + rect.height() * vr as f32,
         );
-        let (r, width) = if ring.marker {
-            (12.0, 2.0)
-        } else {
-            (34.0, 2.5)
-        };
-        let bounds = graphene::Rect::new(cx - r, cy - r, 2.0 * r, 2.0 * r);
-        let rounded = gsk::RoundedRect::from_rect(bounds, r);
-        snapshot.append_border(&rounded, &[width; 4], &[ring.color; 4]);
-        if ring.marker {
-            // A dot in the middle: the point itself.
-            let d = graphene::Rect::new(cx - 2.0, cy - 2.0, 4.0, 4.0);
-            snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(d, 2.0));
-            snapshot.append_color(&ring.color, &d);
-            snapshot.pop();
-        }
+        draw_corners(snapshot, (cx, cy), ring.half, ring.color);
+    }
+}
+
+/// The focus mark: four corners of a square of half side `half` about
+/// `center`, a thin light line with a dark edge, so it shows on any
+/// picture and leaves the middle free.
+fn draw_corners(snapshot: &gtk::Snapshot, center: (f32, f32), half: f32, color: gdk::RGBA) {
+    const LINE: f32 = 1.5;
+    const EDGE: f32 = 1.0;
+    let arm = (half * 0.45).max(5.0);
+    let (cx, cy) = center;
+    // Each corner's two arms, as rectangles of the line's width.
+    let mut arms = Vec::with_capacity(8);
+    for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let (x, y) = (cx + sx * half, cy + sy * half);
+        // From the corner inwards along x, then along y.
+        let x0 = if sx < 0.0 { x } else { x - arm };
+        let y0 = if sy < 0.0 { y } else { y - LINE };
+        arms.push(graphene::Rect::new(x0, y0, arm, LINE));
+        let x1 = if sx < 0.0 { x } else { x - LINE };
+        let y1 = if sy < 0.0 { y } else { y - arm };
+        arms.push(graphene::Rect::new(x1, y1, LINE, arm));
+    }
+    let dark = gdk::RGBA::new(0.0, 0.0, 0.0, 0.55 * color.alpha());
+    for r in &arms {
+        snapshot.append_color(
+            &dark,
+            &graphene::Rect::new(
+                r.x() - EDGE,
+                r.y() - EDGE,
+                r.width() + 2.0 * EDGE,
+                r.height() + 2.0 * EDGE,
+            ),
+        );
+    }
+    for r in &arms {
+        snapshot.append_color(&color, r);
     }
 }
 
@@ -432,15 +455,14 @@ pub struct Decor {
     pub histogram: Option<Vec<f32>>,
 }
 
-/// A focus ring at a point of the whole upright picture (0..1).
+/// The focus mark at a point of the whole upright picture (0..1): four
+/// corners of a square, `half` its half side in pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ring {
     pub u: f64,
     pub v: f64,
+    pub half: f32,
     pub color: gdk::RGBA,
-    /// The small marker of a point that focus and metering still follow
-    /// after the ring has gone, instead of the ring.
-    pub marker: bool,
 }
 
 /// The largest centered part of an upright frame with the given aspect

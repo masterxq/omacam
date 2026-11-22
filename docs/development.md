@@ -110,12 +110,13 @@ rather than taking it).
   ```
 
   Steps: `wait SECONDS`, `zoom Z` (a preset), `pinch Z`, `lens Z` (the
-  lens row's button), `dial Z` (the zoom dial), `flip`, `macro` (the macro
-  button), `shutter`, `tap U V` (a tap on the picture), `settings PAGE`
+  lens row's zoom stage), `dial Z` (the zoom dial), `camera
+  main|macro|wide|tele` and `lens-menu` (the lens menu), `flip`, `macro`
+  (the macro lens, or back to the main one), `shutter`, `tap U V` (a tap on the picture), `settings PAGE`
   (photo, video, advanced), `close-settings`, `mode`, `manual on|off`,
   `manual-edit ev|focus|wb|shutter|iso`, `focus P|auto`, `iso N|auto`,
   `wb K|auto`, `flash auto|on|off|torch` (as the flash button sets it),
-  `flash-menu`, `aspect`, `timer`, `hold`, `shot PATH` and `quit` (the
+  `flash-menu`, `aspect`, `aspect-menu`, `timer`, `hold`, `shot PATH` and `quit` (the
   full list is in `script.rs`). `--flash MODE` sets the flash for one run
   without saving it. After each step the app logs a `state`
   line: lens, zoom, frame size, frame rate, the last switch time. `shot`

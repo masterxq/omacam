@@ -21,8 +21,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::settings::{
-    default_photo_dir, default_video_dir, Aspect, Grid, Resolution, Settings, Timer,
-    VideoResolution,
+    default_photo_dir, default_video_dir, Grid, Resolution, Settings, VideoResolution,
 };
 
 type OnChange = Rc<dyn Fn(&Settings)>;
@@ -181,16 +180,6 @@ pub fn dialog(
         .build();
     let shape = adw::PreferencesGroup::builder().title("Picture").build();
     shape.add(&combo(
-        "Aspect ratio",
-        Some("Cropped from the center of the frame"),
-        &Aspect::ALL,
-        Aspect::label,
-        s.aspect,
-        &state,
-        &on_change,
-        |s, v| s.aspect = v,
-    ));
-    shape.add(&combo(
         "Resolution",
         Some("Full is each lens's largest mode"),
         &Resolution::ALL,
@@ -206,16 +195,6 @@ pub fn dialog(
     let taking = adw::PreferencesGroup::builder()
         .title("Taking photos")
         .build();
-    taking.add(&combo(
-        "Timer",
-        None,
-        &Timer::ALL,
-        Timer::label,
-        s.timer,
-        &state,
-        &on_change,
-        |s, v| s.timer = v,
-    ));
     taking.add(&combo(
         "Grid",
         None,
@@ -330,14 +309,6 @@ pub fn dialog(
         &state,
         &on_change,
         |s, v| s.volume_shutter = v,
-    ));
-    adv.add(&switch(
-        "Keep manual settings",
-        "Off: every launch starts fully automatic",
-        s.keep_pro,
-        &state,
-        &on_change,
-        |s, v| s.keep_pro = v,
     ));
     adv.add(&switch(
         "Switch lenses while zooming",

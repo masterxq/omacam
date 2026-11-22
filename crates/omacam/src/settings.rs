@@ -41,15 +41,6 @@ impl Aspect {
             Aspect::Square => Some(1.0),
         }
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Aspect::Full => "Full frame",
-            Aspect::FourThree => "4:3",
-            Aspect::SixteenNine => "16:9",
-            Aspect::Square => "1:1",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -85,21 +76,11 @@ pub enum Timer {
 }
 
 impl Timer {
-    pub const ALL: [Timer; 3] = [Timer::Off, Timer::Three, Timer::Ten];
-
     pub fn seconds(self) -> u32 {
         match self {
             Timer::Off => 0,
             Timer::Three => 3,
             Timer::Ten => 10,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Timer::Off => "Off",
-            Timer::Three => "3 seconds",
-            Timer::Ten => "10 seconds",
         }
     }
 }
@@ -163,36 +144,23 @@ impl VideoResolution {
     }
 }
 
-/// The Pro panel's manual values, kept when `keep_pro` is on.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SavedPro {
-    pub shutter_us: Option<i32>,
-    pub iso: Option<u32>,
-    /// "daylight", "cloudy", "incandescent", "fluorescent", or kelvin.
-    pub white_balance: Option<SavedWb>,
-    pub focus: Option<f32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SavedWb {
-    Daylight,
-    Cloudy,
-    Incandescent,
-    Fluorescent,
-    Kelvin(u32),
-}
-
 pub const DEFAULT_QUALITY: u8 = 92;
 
+/// The settings of the gear's sheet, kept in `settings.toml`, and the
+/// quick settings of the top bar, which every launch starts at their
+/// defaults (`#[serde(skip)]`: neither saved nor read), so nothing stays
+/// set by accident: the aspect ratio, the self-timer and the flash. The
+/// manual values, the lens and the zoom start afresh too (they live in the
+/// controller).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    #[serde(skip)]
     pub aspect: Aspect,
     pub resolution: Resolution,
     /// JPEG quality, 50-100.
     pub jpeg_quality: u8,
+    #[serde(skip)]
     pub timer: Timer,
     pub grid: Grid,
     /// Save front-camera photos mirrored, as the preview shows them.
@@ -209,10 +177,6 @@ pub struct Settings {
     pub tap_to_focus: bool,
     pub debug_overlay: bool,
     pub video_resolution: VideoResolution,
-    /// Keep the Pro panel's manual values across launches (off: every
-    /// launch starts fully automatic).
-    pub keep_pro: bool,
-    pub pro: SavedPro,
     /// In dim light, show the telephoto's zoom with the main camera.
     pub low_light: bool,
     /// Video frame rate: 30, or 60 where the lens's mode allows it.
@@ -221,8 +185,8 @@ pub struct Settings {
     pub stabilization: bool,
     /// Photos are HDR bursts, merged and tone mapped (the HDR chip).
     pub hdr: bool,
-    /// The flash for photos (the torch isn't kept: every launch starts
-    /// with it off).
+    /// The flash for photos; every launch starts at auto.
+    #[serde(skip)]
     pub flash: FlashMode,
     /// Zooming past a lens's range switches to the next lens, and in dim
     /// light the main camera stands in for the telephoto. Off (the
@@ -249,13 +213,11 @@ impl Default for Settings {
             tap_to_focus: true,
             debug_overlay: false,
             video_resolution: VideoResolution::FullHd,
-            keep_pro: false,
-            pro: SavedPro::default(),
             low_light: true,
             video_fps: 30,
             stabilization: true,
             hdr: false,
-            flash: FlashMode::Off,
+            flash: FlashMode::Auto,
             switch_lenses_by_zoom: false,
             tap_ev_slider: false,
         }
@@ -300,9 +262,6 @@ impl Settings {
     fn sanitized(mut self) -> Settings {
         self.jpeg_quality = self.jpeg_quality.clamp(50, 100);
         self.video_fps = if self.video_fps >= 60 { 60 } else { 30 };
-        if self.flash == FlashMode::Torch {
-            self.flash = FlashMode::Off;
-        }
         if self
             .save_dir
             .as_ref()
@@ -353,7 +312,6 @@ mod tests {
         assert!(s.mirror_front, "front photos saved as previewed");
         assert!(s.tap_to_focus);
         assert!(!s.debug_overlay);
-        assert!(!s.keep_pro, "Pro values reset at every launch");
         assert_eq!(s.aspect, Aspect::Full);
         assert_eq!(s.resolution, Resolution::Full);
         assert_eq!(s.jpeg_quality, 92);
@@ -363,7 +321,7 @@ mod tests {
         assert!(s.low_light, "the low-light lens on");
         assert_eq!(s.video_fps, 30);
         assert!(s.stabilization);
-        assert_eq!(s.flash, FlashMode::Off);
+        assert_eq!(s.flash, FlashMode::Auto);
         assert!(!s.switch_lenses_by_zoom, "the lens changes only by hand");
     }
 
@@ -390,13 +348,6 @@ mod tests {
             tap_to_focus: false,
             debug_overlay: true,
             video_resolution: VideoResolution::Hd,
-            keep_pro: true,
-            pro: SavedPro {
-                shutter_us: Some(4_000),
-                iso: Some(200),
-                white_balance: Some(SavedWb::Kelvin(4300)),
-                focus: None,
-            },
             low_light: false,
             video_fps: 60,
             stabilization: false,
@@ -407,11 +358,23 @@ mod tests {
         };
         s.save(&p).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
-        assert!(text.contains("aspect = \"1:1\""), "{text}");
-        assert!(text.contains("timer = \"10s\""), "{text}");
+        // The quick settings start afresh at every launch.
+        assert!(
+            !text.contains("aspect") && !text.contains("timer"),
+            "{text}"
+        );
+        assert!(!text.contains("flash"), "{text}");
         assert!(text.contains("grid = \"3x3\""), "{text}");
         assert!(text.contains("video_resolution = \"720p\""), "{text}");
-        assert_eq!(Settings::load(&p), s);
+        assert_eq!(
+            Settings::load(&p),
+            Settings {
+                aspect: Aspect::Full,
+                timer: Timer::Off,
+                flash: FlashMode::Auto,
+                ..s
+            }
+        );
     }
 
     #[test]
@@ -424,6 +387,24 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_starts_the_quick_settings_and_manual_values_afresh() {
+        // As an older omacam wrote them: all ignored now.
+        let p = tmp("afresh");
+        std::fs::write(
+            &p,
+            "aspect = \"1:1\"\ntimer = \"10s\"\nflash = \"on\"\nkeep_pro = true\n\
+             grid = \"3x3\"\n[pro]\niso = 200\n",
+        )
+        .unwrap();
+        let s = Settings::load(&p);
+        assert_eq!(
+            (s.aspect, s.timer, s.flash),
+            (Aspect::Full, Timer::Off, FlashMode::Auto)
+        );
+        assert_eq!(s.grid, Grid::Thirds, "the sheet's settings stay");
+    }
+
+    #[test]
     fn out_of_range_values_are_clamped() {
         let p = tmp("clamp");
         std::fs::write(
@@ -432,7 +413,7 @@ mod tests {
         )
         .unwrap();
         let s = Settings::load(&p);
-        assert_eq!(s.flash, FlashMode::Off, "the torch isn't kept");
+        assert_eq!(s.flash, FlashMode::Auto, "the flash starts at auto");
         assert_eq!(s.jpeg_quality, 50);
         assert_eq!(s.video_fps, 30, "only 30 or 60");
         assert_eq!(s.save_dir, None);

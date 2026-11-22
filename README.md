@@ -22,13 +22,18 @@ finds.
   for selfies, with the controls over it where it runs under them; it
   never shows less than the photo gets. Held sideways, the layout stays
   and the icons turn.
-- Quick settings along the top: flash (auto, on, off, torch), self-timer,
-  aspect ratio, HDR or 60 fps, the settings.
-- Lenses and zoom: a row of round buttons, one per lens and zoom stage
-  (".5", "1", "2", "5", and a flower for the macro lens); the one in use
-  shows the exact zoom. Drag sideways across the row for a zoom dial, or
-  pinch the picture (it rests a moment at 1x). The lens changes only when
-  you pick another one: zooming crops the lens you chose. (The setting
+- Quick settings along the top: flash (auto, on, off, torch; a long
+  press switches the torch), self-timer, aspect ratio (its choices drop
+  down), HDR or 60 fps, the settings. Every launch starts them afresh:
+  flash on auto, no timer, the full frame, the main camera at 1x, all
+  manual values automatic.
+- Zoom and lenses apart: a row of zoom stages ("1×", "2×") of the lens in
+  use, the one showing now with the exact zoom; drag sideways across it
+  for a zoom dial, or pinch the picture (it rests a moment at 1x).
+  Zooming never changes the camera. The lens button beside the stages
+  shows the lens in use; tap it for the lenses, each with its symbol and
+  name (Wide, Main, Tele, Macro), and the chosen lens's name shows over
+  the picture for a moment. (The setting
   "Switch lenses while zooming" brings back the ultrawide, main and
   telephoto taking over as you pass 1x and 4.78x, with a short
   cross-fade.) (Until the main camera has a 4:3 preview mode,
@@ -43,9 +48,10 @@ finds.
   cropped to the zoom and saved upright as JPEG in `~/Pictures/Camera`.
 - Switching between the back and the front camera.
 - Continuous autofocus. Tap the picture to focus and meter there (in
-  video, autofocus keeps following the tapped spot); a small marker stays
-  on the spot while focus and metering follow it, and a tap on it (or
-  leaving the app) gives the whole picture back to them. Long-press for
+  video, autofocus keeps following the tapped spot); four thin corners
+  mark the spot, light with a dark edge so they show on any picture,
+  and stay small and faint while focus and metering follow it. A tap on
+  them (or leaving the app) gives the whole picture back. Long-press for
   AE/AF lock.
 - Manual controls behind one button beside the lens row: exposure
   correction, focus, white balance, shutter time and ISO, and a
@@ -63,8 +69,7 @@ finds.
   sound. Location tags in photos and videos, from GeoClue, when you turn
   them on (off by default). Photos and videos follow how the phone is
   held, and so do the controls: held sideways, they turn in place.
-- Settings from the gear: aspect ratio (full, 4:3, 16:9, 1:1), resolution,
-  JPEG quality, a 3 or 10 s timer, a 3x3 or 4x4 grid, mirrored selfies,
+- Settings from the gear: resolution, JPEG quality, a 3x3 or 4x4 grid, mirrored selfies,
   the shutter sound, location tags, where photos are saved, the video
   frame rate and stabilization, volume keys as the shutter, tap to focus,
   the low-light lens, and the debug overlay. They are kept in

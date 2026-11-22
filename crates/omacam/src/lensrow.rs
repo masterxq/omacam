@@ -1,11 +1,14 @@
-//! The lens row above the mode bar: a short row of round buttons, one per
-//! lens and zoom stage (".5", "1", "2", "5"), and the macro lens's flower;
-//! the button showing now carries the exact zoom ("1.4×"). A tap chooses a
-//! lens or stage. Dragging sideways across the row turns it into the zoom
-//! dial ([`crate::dial`]) for a stepless zoom; the dial stays a moment
-//! after the finger lifts and can be dragged again.
+//! The lens row above the mode bar: the zoom stages of the chosen lens
+//! ("1×", "2×"), the lens button beside them, and the adjust button at the
+//! end.
 //!
-//! At its end the row holds the adjust button (the manual controls).
+//! The stages only zoom: a tap goes to a stage, the button showing now
+//! carries the exact zoom ("1.4×"), and dragging sideways across them
+//! turns the row into the zoom dial ([`crate::dial`]) for a stepless zoom;
+//! the dial stays a moment after the finger lifts and can be dragged
+//! again. The lens changes only through the lens button: it shows the
+//! lens in use, and a tap drops the lens menu down (up, here) over the
+//! row, each lens with its symbol and its name.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -15,7 +18,8 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
-use omacam_core::controller::ZoomButton;
+use omacam_core::controller::LensChoice;
+use omacam_core::lens::Role;
 
 use crate::app::{format_zoom, stage_label};
 use crate::dial::{self, ZoomDial};
@@ -28,21 +32,49 @@ const DRAG_START: f64 = 10.0;
 /// What the user did in the row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LensEvent {
-    /// A lens or stage button: its zoom.
-    Button(f64),
-    /// The macro lens's button.
-    Macro,
+    /// A zoom stage: its zoom.
+    Stage(f64),
+    /// A lens from the lens menu (its index in the lens table).
+    Lens(usize),
     /// The dial moved to this zoom.
     Drag(f64),
     /// The finger left the dial.
     Released,
 }
 
+/// A lens's symbol.
+pub fn lens_icon(role: Role) -> &'static str {
+    match role {
+        Role::Main => "omacam-lens-main-symbolic",
+        Role::Ultrawide => "omacam-lens-wide-symbolic",
+        Role::Tele => "omacam-lens-tele-symbolic",
+        Role::Macro => "omacam-macro-symbolic",
+        Role::Front => "omacam-flip-symbolic",
+    }
+}
+
+/// A lens's name, as the menu and the note over the picture say it.
+pub fn lens_name(role: Role) -> &'static str {
+    match role {
+        Role::Main => "Main",
+        Role::Ultrawide => "Wide",
+        Role::Tele => "Tele",
+        Role::Macro => "Macro",
+        Role::Front => "Front",
+    }
+}
+
 pub struct LensRow {
     pub root: gtk::Stack,
     pill: gtk::Box,
-    buttons: RefCell<Vec<(ZoomButton, gtk::Button)>>,
-    macro_button: gtk::Button,
+    stages: RefCell<Vec<(f64, gtk::Button)>>,
+    /// Shows the lens in use; a tap opens [`LensRow::menu`].
+    pub lens_button: gtk::Button,
+    lens_icon: gtk::Image,
+    /// The lens menu, over the row when the lens button is tapped.
+    pub menu: gtk::Revealer,
+    menu_box: gtk::Box,
+    choices: RefCell<Vec<(LensChoice, gtk::Button)>>,
     /// Opens the manual controls.
     pub adjust: gtk::ToggleButton,
     dial: ZoomDial,
@@ -55,31 +87,37 @@ pub struct LensRow {
     hide: RefCell<Option<glib::SourceId>>,
 }
 
-fn side_button(icon: &str, tooltip: &str) -> gtk::ToggleButton {
-    let b = gtk::ToggleButton::new();
-    b.set_icon_name(icon);
-    b.set_tooltip_text(Some(tooltip));
-    b.add_css_class("side-button");
-    b.add_css_class("turnable");
-    b.set_valign(gtk::Align::Center);
-    b.set_size_request(44, 44);
-    b
-}
-
 impl LensRow {
     pub fn new(on_event: impl Fn(LensEvent) + 'static) -> Rc<LensRow> {
         let pill = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         pill.add_css_class("lens-pill");
-        pill.set_halign(gtk::Align::Center);
         pill.set_valign(gtk::Align::Center);
-        let macro_button = gtk::Button::from_icon_name("omacam-macro-symbolic");
-        macro_button.add_css_class("lens-button");
-        macro_button.add_css_class("turnable");
-        macro_button.set_tooltip_text(Some("Macro lens: sharp a few centimeters away"));
-        macro_button.set_visible(false);
-        let adjust = side_button("omacam-adjust-symbolic", "Manual controls");
+        let lens_icon = gtk::Image::from_icon_name(lens_icon(Role::Main));
+        let lens_button = gtk::Button::new();
+        lens_button.set_child(Some(&lens_icon));
+        lens_button.add_css_class("lens-choice");
+        lens_button.add_css_class("turnable");
+        lens_button.set_tooltip_text(Some("Lens"));
+        lens_button.set_valign(gtk::Align::Center);
+        lens_button.set_size_request(44, 44);
+        lens_button.set_visible(false);
+        let group = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        group.append(&pill);
+        group.append(&lens_button);
+        let adjust = gtk::ToggleButton::new();
+        adjust.set_icon_name("omacam-adjust-symbolic");
+        adjust.set_tooltip_text(Some("Manual controls"));
+        adjust.add_css_class("side-button");
+        adjust.add_css_class("turnable");
+        adjust.set_valign(gtk::Align::Center);
+        adjust.set_size_request(44, 44);
+        // As wide as the adjust button at the start, so the stages and the
+        // lens button stay in the middle.
+        let balance = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        balance.set_size_request(44, -1);
         let row = gtk::CenterBox::new();
-        row.set_center_widget(Some(&pill));
+        row.set_start_widget(Some(&balance));
+        row.set_center_widget(Some(&group));
         row.set_end_widget(Some(&adjust));
         row.add_css_class("lens-row");
         let dial = ZoomDial::new();
@@ -90,11 +128,22 @@ impl LensRow {
         root.add_named(&row, Some("row"));
         root.add_named(&dial, Some("dial"));
         root.set_visible_child_name("row");
+        let menu_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        menu_box.add_css_class("flash-menu");
+        let menu = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideUp)
+            .child(&menu_box)
+            .halign(gtk::Align::Center)
+            .build();
         let lr = Rc::new(LensRow {
             root,
             pill,
-            buttons: RefCell::new(Vec::new()),
-            macro_button,
+            stages: RefCell::new(Vec::new()),
+            lens_button,
+            lens_icon,
+            menu,
+            menu_box,
+            choices: RefCell::new(Vec::new()),
             adjust,
             dial,
             on_event: Rc::new(on_event),
@@ -104,14 +153,17 @@ impl LensRow {
             dragging: Cell::new(false),
             hide: RefCell::new(None),
         });
-        let e = lr.on_event.clone();
-        lr.macro_button
-            .connect_clicked(move |_| e(LensEvent::Macro));
+        let weak = Rc::downgrade(&lr);
+        lr.lens_button.connect_clicked(move |_| {
+            if let Some(lr) = weak.upgrade() {
+                lr.menu.set_reveal_child(!lr.menu.reveals_child());
+            }
+        });
         lr.connect_drag();
         lr
     }
 
-    /// A sideways drag that starts on the buttons or the dial zooms.
+    /// A sideways drag that starts on the stages or the dial zooms.
     fn connect_drag(self: &Rc<Self>) {
         let drag = gtk::GestureDrag::new();
         drag.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -163,6 +215,7 @@ impl LensRow {
         if let Some(id) = self.hide.borrow_mut().take() {
             id.remove();
         }
+        self.menu.set_reveal_child(false);
         self.root.set_visible_child_name("dial");
     }
 
@@ -182,62 +235,76 @@ impl LensRow {
         *self.hide.borrow_mut() = Some(id);
     }
 
-    /// Bring the row in line with the controller's view: the buttons, the
-    /// one showing now with the zoom, the macro button, the dial's range.
-    #[allow(clippy::too_many_arguments)]
+    /// Bring the row in line with the controller's view: the stages, the
+    /// one showing now with the zoom, the lens button and its menu, the
+    /// dial's range.
     pub fn update(
         &self,
-        buttons: &[ZoomButton],
-        zoom: f64,
-        floor: f64,
-        max: f64,
-        can_macro: bool,
-        macro_on: bool,
+        view: &omacam_core::controller::ViewState,
+        lens_sensitive: bool,
         sensitive: bool,
     ) {
+        let (zoom, floor, max) = (view.zoom, view.zoom_floor, view.max_zoom);
         let same = {
-            let built = self.buttons.borrow();
-            built.len() == buttons.len()
-                && built
-                    .iter()
-                    .zip(buttons)
-                    .all(|((a, _), b)| a.zoom == b.zoom && a.lens == b.lens)
+            let built = self.stages.borrow();
+            built.len() == view.stages.len()
+                && built.iter().zip(&view.stages).all(|((a, _), b)| a == b)
         };
         if !same {
-            self.build(buttons);
+            self.build_stages(&view.stages);
         }
-        for ((_, b), now) in self.buttons.borrow_mut().iter_mut().zip(buttons) {
-            if now.active {
+        // The highest stage at or below the zoom shows it.
+        let active = view.stages.iter().rposition(|&s| s <= zoom + 1e-6);
+        for (i, (stage, b)) in self.stages.borrow().iter().enumerate() {
+            if Some(i) == active {
                 b.add_css_class("active");
                 b.set_label(&format_zoom(zoom));
             } else {
                 b.remove_css_class("active");
-                b.set_label(&stage_label(now.zoom));
+                b.set_label(&stage_label(*stage));
             }
             b.set_sensitive(sensitive);
         }
-        for (built, now) in self.buttons.borrow_mut().iter_mut().zip(buttons) {
+        // The lens button and its menu.
+        let same = {
+            let built = self.choices.borrow();
+            built.len() == view.lenses.len()
+                && built
+                    .iter()
+                    .zip(&view.lenses)
+                    .all(|((a, _), b)| a.lens == b.lens)
+        };
+        if !same {
+            self.build_menu(&view.lenses);
+        }
+        let current = view.lenses.iter().find(|l| l.active);
+        self.lens_button.set_visible(current.is_some());
+        if current.is_none() {
+            self.menu.set_reveal_child(false);
+        }
+        if let Some(c) = current {
+            self.lens_icon.set_icon_name(Some(lens_icon(c.role)));
+            self.lens_button
+                .set_tooltip_text(Some(&format!("Lens: {}", lens_name(c.role))));
+        }
+        self.lens_button.set_sensitive(lens_sensitive);
+        for ((_, b), now) in self.choices.borrow_mut().iter_mut().zip(&view.lenses) {
+            if now.active {
+                b.add_css_class("active");
+            } else {
+                b.remove_css_class("active");
+            }
+            // While recording the macro lens can't be chosen or left.
+            let macro_part =
+                now.role == Role::Macro || current.is_some_and(|c| c.role == Role::Macro);
+            b.set_sensitive(lens_sensitive && !(view.recording && macro_part));
+        }
+        for (built, now) in self.choices.borrow_mut().iter_mut().zip(&view.lenses) {
             built.0 = *now;
         }
-        self.macro_button.set_visible(can_macro);
-        self.macro_button.set_sensitive(sensitive);
-        if macro_on {
-            self.macro_button.add_css_class("active");
-            self.macro_button
-                .set_tooltip_text(Some(&format!("Macro lens, {}", format_zoom(zoom))));
-        } else {
-            self.macro_button.remove_css_class("active");
-            self.macro_button
-                .set_tooltip_text(Some("Macro lens: sharp a few centimeters away"));
-        }
         self.range.set((zoom, floor, max));
-        // The dial marks the stages within its range; with the macro lens
-        // on, its own whole stops.
-        let mut stops: Vec<f64> = if macro_on {
-            vec![1.0, 2.0, 3.0, 4.0]
-        } else {
-            buttons.iter().map(|b| b.zoom).collect()
-        };
+        // The dial marks the stages within its range.
+        let mut stops: Vec<f64> = view.stages.clone();
         stops.retain(|s| *s >= floor - 1e-6 && *s <= max + 1e-6);
         if !stops.iter().any(|s| (s - floor).abs() < 1e-6) {
             stops.insert(0, floor);
@@ -246,25 +313,59 @@ impl LensRow {
         *self.stops.borrow_mut() = stops;
     }
 
-    fn build(&self, buttons: &[ZoomButton]) {
+    fn build_stages(&self, stages: &[f64]) {
         while let Some(c) = self.pill.first_child() {
             self.pill.remove(&c);
         }
         let mut built = Vec::new();
-        for zb in buttons {
-            let b = gtk::Button::with_label(&stage_label(zb.zoom));
+        for &z in stages {
+            let b = gtk::Button::with_label(&stage_label(z));
             b.add_css_class("lens-button");
             b.add_css_class("turnable");
-            if !zb.native {
-                b.add_css_class("stage");
-            }
-            b.set_tooltip_text(Some(&format_zoom(zb.zoom)));
-            let (e, z) = (self.on_event.clone(), zb.zoom);
-            b.connect_clicked(move |_| e(LensEvent::Button(z)));
+            b.set_tooltip_text(Some(&format_zoom(z)));
+            let e = self.on_event.clone();
+            b.connect_clicked(move |_| e(LensEvent::Stage(z)));
             self.pill.append(&b);
-            built.push((*zb, b));
+            built.push((z, b));
         }
-        self.pill.append(&self.macro_button);
-        *self.buttons.borrow_mut() = built;
+        *self.stages.borrow_mut() = built;
+    }
+
+    fn build_menu(&self, lenses: &[LensChoice]) {
+        while let Some(c) = self.menu_box.first_child() {
+            self.menu_box.remove(&c);
+        }
+        let mut built = Vec::new();
+        for l in lenses {
+            let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            col.append(&gtk::Image::from_icon_name(lens_icon(l.role)));
+            col.append(&gtk::Label::new(Some(lens_name(l.role))));
+            let b = gtk::Button::new();
+            b.set_child(Some(&col));
+            b.add_css_class("flash-choice");
+            b.add_css_class("turnable");
+            let (e, lens, menu) = (self.on_event.clone(), l.lens, self.menu.clone());
+            b.connect_clicked(move |_| {
+                menu.set_reveal_child(false);
+                e(LensEvent::Lens(lens));
+            });
+            self.menu_box.append(&b);
+            built.push((*l, b));
+        }
+        *self.choices.borrow_mut() = built;
+    }
+
+    /// The lens of this role from the menu, as a tap on its entry.
+    pub fn choose(&self, role: Role) {
+        let lens = self
+            .choices
+            .borrow()
+            .iter()
+            .find(|(c, _)| c.role == role)
+            .map(|(c, _)| c.lens);
+        if let Some(lens) = lens {
+            self.menu.set_reveal_child(false);
+            (self.on_event)(LensEvent::Lens(lens));
+        }
     }
 }
