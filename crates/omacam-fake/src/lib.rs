@@ -83,6 +83,77 @@ pub fn cheetah_cameras() -> Vec<CameraInfo> {
     ]
 }
 
+/// The Moto G60s's cameras as the lens table `data/lisbon.toml` names
+/// them (main with a focus motor, front, macro with a fixed focus), and an
+/// ultrawide it doesn't have when `ultrawide` is set (its lens table entry
+/// is [`LISBON_ULTRAWIDE`]): for trying the controls on a laptop.
+pub fn lisbon_cameras(ultrawide: bool) -> Vec<CameraInfo> {
+    let cam = |id: &str, location, rotation, model: &str, af: bool| CameraInfo {
+        id: id.into(),
+        location,
+        rotation,
+        model: model.into(),
+        autofocus: af,
+        af_windows: af,
+        crop_maximum: Some(omacam_core::backend::Rect {
+            x: 0,
+            y: 0,
+            width: 4624,
+            height: 3472,
+        }),
+        caps: full_caps(af),
+    };
+    let mut cams = vec![
+        cam(
+            "/base/soc/i2c@11009000/camera@22",
+            Location::Back,
+            90,
+            "ov64b40",
+            true,
+        ),
+        cam(
+            "/base/soc/i2c@11011000/camera@10",
+            Location::Front,
+            270,
+            "ov16a1q",
+            false,
+        ),
+        cam(
+            "/base/soc/i2c@1101a000/camera@10",
+            Location::Back,
+            90,
+            "s5k5e9",
+            false,
+        ),
+    ];
+    if ultrawide {
+        cams.push(cam(
+            LISBON_ULTRAWIDE_ID,
+            Location::Back,
+            90,
+            "ultrawide",
+            false,
+        ));
+    }
+    cams
+}
+
+/// The id of the ultrawide [`lisbon_cameras`] adds.
+pub const LISBON_ULTRAWIDE_ID: &str = "/fake/ultrawide";
+
+/// The lens table entry of that ultrawide, to append to `data/lisbon.toml`.
+pub const LISBON_ULTRAWIDE: &str = r#"
+[[lens]]
+role = "ultrawide"
+name = "Ultrawide"
+id = "/fake/ultrawide"
+zoom = 0.5
+preview = [2304, 1728]
+still = [4624, 3472]
+coverage = [1.0, 1.0]
+base_iso = 100
+"#;
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub cameras: Vec<CameraInfo>,
@@ -203,6 +274,9 @@ struct Stream {
     aperture: f64,
     /// Give each frame a raw picture too.
     raw: bool,
+    /// The lens moves: the test card's target is sharp only near the
+    /// middle of the lens's travel (where auto focus puts it).
+    movable_lens: bool,
 }
 
 /// The aperture of the Pixel 7 Pro's cameras by sensor model, against the
@@ -253,8 +327,11 @@ fn fit(size: Size, max: Size) -> Size {
 
 /// A test card: a tinted gradient, a center cross (to check crop and
 /// rotation centring), a block in the top-left corner (to check
-/// orientation) and a bar that moves with the frame count.
-fn render(stream: &Stream) -> Vec<u8> {
+/// orientation), a bar that moves with the frame count, and a checkered
+/// target about the center whose contrast shows the focus (a lens set far
+/// from where auto focus puts it blurs it). `gain` is the total gain the
+/// frame took: the more, the more noise, as on a real sensor in dim light.
+fn render(stream: &Stream, gain: f32) -> Vec<u8> {
     let Size { width, height } = stream.size;
     let (w, h) = (width as usize, height as usize);
     let stride = w * 4;
@@ -280,6 +357,15 @@ fn render(stream: &Stream) -> Vec<u8> {
         _ => (1.0, 1.0),
     };
     let tone = |v: f32, w: f32| (v * light * w).clamp(0.0, 255.0) as u8;
+    // Sharp at 0.5 (where the fake's auto focus sits), soft away from it.
+    let sharpness = match set.lens {
+        Setting::Manual(p) if stream.movable_lens => (-((p - 0.5) / 0.15).powi(2)).exp(),
+        _ => 1.0,
+    };
+    let half = h.min(w) / 5;
+    let cell = (h / 48).max(2);
+    let noise = ((gain - 1.0) * 2.5).clamp(0.0, 60.0);
+    let mut seed = 0x9e37_79b9u32 ^ stream.sequence.wrapping_mul(2_654_435_761);
     for y in 0..h {
         for x in 0..w {
             let i = y * stride + x * 4;
@@ -290,10 +376,23 @@ fn render(stream: &Stream) -> Vec<u8> {
                 tone(stream.tint[1] as f32 * (0.4 + 0.6 * fy), 1.0),
                 tone(stream.tint[2] as f32, bw),
             ];
+            if x.abs_diff(w / 2) < half && y.abs_diff(h / 2) < half {
+                let dark = ((x / cell) + (y / cell)) % 2 == 0;
+                let v = 128.0 + if dark { -110.0 } else { 110.0 } * sharpness;
+                let v = (v * light).clamp(0.0, 255.0) as u8;
+                rgb = [v, v, v];
+            }
             let cross = x.abs_diff(w / 2) < 3 || y.abs_diff(h / 2) < 3;
             let corner = x < w / 8 && y < h / 8;
             if cross || corner {
                 rgb = [255, 255, 255];
+            }
+            if noise > 0.0 {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let n = ((seed & 0xff) as f32 / 255.0 - 0.5) * noise;
+                rgb = rgb.map(|c| (c as f32 + n).clamp(0.0, 255.0) as u8);
             }
             if x.abs_diff(bar) < 4 {
                 rgb = [20, 20, 20];
@@ -373,6 +472,10 @@ fn handle(
                     .find(|c| c.id == camera)
                     .map(|c| aperture_factor(&c.model))
                     .unwrap_or(1.0),
+                movable_lens: cameras
+                    .iter()
+                    .find(|c| c.id == camera)
+                    .is_some_and(|c| c.caps.lens_position.is_some()),
                 camera,
                 size: fit(size.expect("checked"), opts.max_size),
                 raw: req.raw,
@@ -452,18 +555,19 @@ fn step(s: &mut Stream, sink: &EventSink, opts: &Options, epoch: Instant) {
     let start = s.controls.exposure_us.unwrap_or(settle_t) as f64;
     let k = 0.5f64.powi(s.sequence.min(30) as i32);
     let exposure = (settle_t as f64 + (start - settle_t as f64) * k) as i32;
+    let analog = s.settings.gain.manual().unwrap_or(settle_gain);
     sink(Event::Frame(Frame {
         generation: s.generation,
         camera: s.camera.clone(),
         size: s.size,
         stride: s.size.width * 4,
         layout: PixelLayout::Xrgb8888,
-        data: FrameData::Memory(render(s)),
+        data: FrameData::Memory(render(s, analog * digital)),
         meta: FrameMeta {
             sequence: s.sequence,
             timestamp_ns: now.duration_since(epoch).as_nanos() as u64,
             exposure_us: Some(s.settings.shutter.manual().unwrap_or(exposure)),
-            analog_gain: Some(s.settings.gain.manual().unwrap_or(settle_gain)),
+            analog_gain: Some(analog),
             digital_gain: Some(digital),
             lens_position: Some(s.settings.lens.manual().unwrap_or(0.5)),
             ..FrameMeta::default()
@@ -551,8 +655,9 @@ mod tests {
             tint: [100, 100, 100],
             aperture: 1.0,
             raw: false,
+            movable_lens: false,
         };
-        let px = render(&s);
+        let px = render(&s, 1.0);
         let at = |x: usize, y: usize| px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 3].to_vec();
         assert_eq!(at(32, 16), [255, 255, 255]);
         assert_eq!(at(5, 2), [255, 255, 255]);
