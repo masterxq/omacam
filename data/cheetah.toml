@@ -14,6 +14,12 @@
 # video: optional, the size of the camera's own video stream (its video
 #   role), which video mode then streams instead of the preview. Left out,
 #   as here, videos record the preview's frames.
+# bursts: false where the camera merges a series of frames of its own for
+#   each photo, at an exposure of its own: the app's Night and HDR bursts,
+#   which hold one exposure over several frames, can't work there. The Night
+#   mode and the HDR chip then stay hidden, and a Night or HDR photo asked
+#   for anyway (settings, command line, script) is a single photo. Left
+#   out, as here, it is true. One key for the device, beside max_zoom.
 # rotation: leave out to use libcamera's Rotation property.
 # base_iso: ISO at analog gain 1, to show and record gain as ISO
 #   (ISO = gain x base_iso). 50 for each sensor, an estimate: no published

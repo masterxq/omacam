@@ -61,7 +61,9 @@ finds.
   The burst's raw sensor frames are merged before the color processing,
   which keeps the shadows and cuts the noise further (`--no-raw-merge`
   merges the processed frames instead). Hold still while it's taken; the
-  merge takes a few seconds.
+  merge takes a few seconds. Where the camera merges a series of frames of
+  its own for each photo (the Moto G60s), both stay hidden: the lens
+  table's `bursts = false`.
 - The cameras are let go while the window is hidden, so other apps (a
   browser, a video call) can use them.
 

@@ -138,6 +138,9 @@ struct TableFile {
     #[allow(dead_code)]
     device: Option<String>,
     max_zoom: Option<f64>,
+    /// The app takes Night and HDR bursts of its own (see
+    /// [`TableSpec::bursts`]); true when left out.
+    bursts: Option<bool>,
     #[serde(default, rename = "lens")]
     lenses: Vec<LensEntry>,
 }
@@ -187,6 +190,7 @@ pub enum TableError {
 #[derive(Debug, Clone)]
 pub struct TableSpec {
     max_zoom: f64,
+    bursts: bool,
     entries: Vec<LensEntry>,
 }
 
@@ -246,6 +250,7 @@ impl TableSpec {
         }
         Ok(TableSpec {
             max_zoom,
+            bursts: file.bursts.unwrap_or(true),
             entries: file.lenses,
         })
     }
@@ -286,8 +291,18 @@ impl TableSpec {
     pub fn empty() -> TableSpec {
         TableSpec {
             max_zoom: DEFAULT_MAX_ZOOM,
+            bursts: true,
             entries: Vec::new(),
         }
+    }
+
+    /// Whether the app may take Night and HDR bursts of its own: a burst
+    /// holds one exposure of the app's over several frames. False where
+    /// the camera merges a series of frames of its own for each photo,
+    /// at an exposure of its own: the app's Night mode and HDR then can't
+    /// work and stay hidden.
+    pub fn bursts(&self) -> bool {
+        self.bursts
     }
 
     /// Match the table against the cameras present.
@@ -362,6 +377,7 @@ impl TableSpec {
         LensTable {
             lenses,
             max_zoom: self.max_zoom,
+            bursts: self.bursts,
         }
     }
 }
@@ -371,6 +387,7 @@ impl TableSpec {
 pub struct LensTable {
     lenses: Vec<Lens>,
     max_zoom: f64,
+    bursts: bool,
 }
 
 /// Which way the app looks.
@@ -417,6 +434,11 @@ impl LensTable {
             Facing::Back => self.max_zoom,
             Facing::Front => FRONT_MAX_ZOOM,
         }
+    }
+
+    /// Whether the app may take bursts of its own ([`TableSpec::bursts`]).
+    pub fn bursts(&self) -> bool {
+        self.bursts
     }
 }
 
@@ -511,6 +533,20 @@ mod tests {
         let front = t.get(t.by_role(Role::Front).expect("front"));
         assert!(front.mirror && !front.autofocus);
         assert_eq!(t.max_zoom(Facing::Back), 4.0);
+        // Its camera merges a series of frames for each photo itself.
+        assert!(!t.bursts());
+    }
+
+    #[test]
+    fn bursts_are_on_unless_the_table_turns_them_off() {
+        for spec in [TableSpec::cheetah(), TableSpec::tegu(), TableSpec::empty()] {
+            assert!(spec.bursts());
+            assert!(spec.resolve(&cheetah_cameras()).bursts());
+        }
+        assert!(!TableSpec::lisbon().bursts());
+        let off = TableSpec::parse("bursts = false\n").unwrap();
+        assert!(!off.bursts() && !off.resolve(&[]).bursts());
+        assert!(TableSpec::parse("bursts = \"no\"\n").is_err());
     }
 
     #[test]

@@ -1102,12 +1102,21 @@ impl Controller {
             .switch
             .streaming()
             .is_some_and(|(g, _)| self.beside.is_some_and(|(b, _)| b == g));
+        let wanted = match self.opts.capture_mode {
+            capture::Mode::Burst(_) if !self.table.bursts() => {
+                tracing::info!(
+                    "no burst: the camera merges its own frames for each photo; a single photo instead"
+                );
+                capture::Mode::Full
+            }
+            m => m,
+        };
         let mode = if same_mode {
             capture::Mode::Quick
-        } else if beside && self.opts.capture_mode == capture::Mode::Full {
+        } else if beside && wanted == capture::Mode::Full {
             capture::Mode::Beside
         } else {
-            self.opts.capture_mode
+            wanted
         };
         let meta = self.last_meta.as_ref().map(|(_, m)| m);
         let step = self.capture.begin(mode, autofocus, meta, now);
@@ -1454,9 +1463,7 @@ mod tests {
         ]
     }
 
-    fn spec() -> TableSpec {
-        TableSpec::parse(
-            r#"
+    const SPEC: &str = r#"
 max_zoom = 15.0
 [[lens]]
 role = "main"
@@ -1483,9 +1490,10 @@ role = "front"
 id = "front"
 zoom = 1.0
 mirror = true
-"#,
-        )
-        .unwrap()
+"#;
+
+    fn spec() -> TableSpec {
+        TableSpec::parse(SPEC).unwrap()
     }
 
     fn commands(out: &[Output]) -> Vec<&Command> {
@@ -2394,6 +2402,40 @@ still = [2592, 1940]
         let out = c.on_event(frame(gp, "main", 10_000), now);
         assert!(matches!(out[0], Output::Show(_)));
         assert!(!c.view().capturing);
+    }
+
+    #[test]
+    fn a_table_without_bursts_takes_single_photos_in_night_and_hdr() {
+        let now = Instant::now();
+        let no_bursts = TableSpec::parse(&format!("bursts = false\n{SPEC}")).unwrap();
+        for (bursts, spec) in [(true, spec()), (false, no_bursts)] {
+            for burst in [capture::BurstSpec::NIGHT, capture::BurstSpec::HDR] {
+                let opts = Options {
+                    capture_mode: capture::Mode::Burst(burst),
+                    ..Options::default()
+                };
+                let mut c = Controller::new(&spec, &cameras(), opts);
+                let (g, _, _) = start_of(&c.resume(now));
+                let mut e = started(g, "main");
+                if let Event::Started { still, .. } = &mut e {
+                    *still = Some(Size::new(4080, 3072));
+                }
+                c.on_event(e, now);
+                c.on_event(frame(g, "main", 10_000), now);
+                let out = c.shutter(now);
+                if bursts {
+                    assert_eq!(c.capture.burst(), Some(burst));
+                } else {
+                    // A photo as in photo mode: from the still stream
+                    // beside the preview.
+                    assert_eq!(c.capture.burst(), None);
+                    assert!(
+                        matches!(commands(&out).as_slice(), [Command::Capture { generation }] if *generation == g),
+                        "{out:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

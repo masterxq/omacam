@@ -249,6 +249,11 @@ struct App {
     controls_turn: Cell<u32>,
     /// The phone has a gyroscope stream (videos can be stabilized).
     has_gyro: bool,
+    /// The lens table allows Night and HDR bursts ([`TableSpec::bursts`]):
+    /// otherwise both stay hidden and photos are single ones.
+    ///
+    /// [`TableSpec::bursts`]: omacam_core::lens::TableSpec::bursts
+    bursts: bool,
     /// GeoClue, while location tags are on.
     locator: RefCell<Option<crate::location::Locator>>,
 }
@@ -643,6 +648,10 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     mode_box.add_css_class("mode-switch");
     mode_box.set_halign(gtk::Align::Center);
+    // Where the camera merges frames of its own for each photo, the app's
+    // bursts can't work: no Night mode (and no HDR chip, `refresh`).
+    let bursts = cli.lens_table().bursts();
+    mode_night.set_visible(bursts);
     mode_box.append(&mode_night);
     mode_box.append(&mode_photo);
     mode_box.append(&mode_video);
@@ -749,6 +758,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         sensor: RefCell::new(None),
         controls_turn: Cell::new(0),
         has_gyro,
+        bursts,
         locator: RefCell::new(None),
     });
     {
@@ -797,9 +807,18 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     }
     // Night or HDR from the command line: for this run only.
     match app.cli.capture {
+        CaptureMode::Night | CaptureMode::Hdr if !app.bursts => {
+            tracing::info!(
+                capture = ?app.cli.capture,
+                "no bursts on this camera (lens table): single photos instead"
+            );
+        }
         CaptureMode::Night => app.mode_night.set_active(true),
         CaptureMode::Hdr => app.settings.borrow_mut().hdr = true,
         CaptureMode::Full | CaptureMode::Quick => {}
+    }
+    if !app.bursts && app.settings.borrow().hdr {
+        tracing::info!("HDR is on in the settings, but this camera takes no bursts (lens table): single photos instead");
     }
     // The controls that turn with the phone.
     for w in [
@@ -893,9 +912,16 @@ async fn run_script(app: Rc<App>, steps: Vec<crate::script::Step>) {
             }
             Step::Mode(m) => match m.as_str() {
                 "video" => app.mode_video.set_active(true),
+                "night" if !app.bursts => {
+                    tracing::info!("no Night mode on this camera (lens table): photo mode instead");
+                    app.mode_photo.set_active(true);
+                }
                 "night" => app.mode_night.set_active(true),
                 _ => app.mode_photo.set_active(true),
             },
+            Step::Hdr(true) if !app.bursts => {
+                tracing::info!("no HDR on this camera (lens table): single photos instead");
+            }
             Step::Hdr(on) => app.hdr_toggle.set_active(on),
             Step::Tap(u, v) => app.tap_at(u, v),
             Step::Pro(on) => app.pro_toggle.set_active(on),
@@ -1524,11 +1550,11 @@ impl App {
     }
 
     /// The photo capture the controls ask for: a Night or HDR burst, or the
-    /// command line's single frame.
+    /// command line's single frame. No burst where the lens table has none.
     fn capture_mode(&self) -> capture::Mode {
-        if self.mode_night.is_active() {
+        if self.bursts && self.mode_night.is_active() {
             capture::Mode::Burst(capture::BurstSpec::NIGHT)
-        } else if self.settings.borrow().hdr {
+        } else if self.bursts && self.settings.borrow().hdr {
             capture::Mode::Burst(capture::BurstSpec::HDR)
         } else if self.cli.capture == CaptureMode::Quick {
             capture::Mode::Quick
@@ -1746,7 +1772,10 @@ impl App {
             self.setting_fps.set(false);
         }
         self.hdr_toggle.set_visible(
-            !video_mode && !self.mode_night.is_active() && !self.pro_toggle.is_active(),
+            self.bursts
+                && !video_mode
+                && !self.mode_night.is_active()
+                && !self.pro_toggle.is_active(),
         );
         let hdr = self.settings.borrow().hdr;
         if self.hdr_toggle.is_active() != hdr {

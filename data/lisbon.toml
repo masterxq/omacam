@@ -28,9 +28,15 @@
 # f_number, focal lengths: left out until measured.
 # autofocus: the S5K5E9 has a fixed focus, sharp at a few centimeters.
 # max_zoom: 4, where a crop of the 4624x3472 mode still keeps 1156x868.
+# bursts: false. The camera's pipeline merges a series of frames of its own
+#   for each photo on the still stream, at an exposure of its own, and each
+#   of those frames takes about 1.2 s: the app's Night and HDR bursts never
+#   get the exposure they ask for. The camera's merge stands in for them;
+#   Night and HDR stay hidden.
 
 device = "lisbon"
 max_zoom = 4.0
+bursts = false
 
 [[lens]]
 role = "main"
