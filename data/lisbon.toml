@@ -20,7 +20,10 @@
 #   libcamera, and falls back when the camera can't).
 # rotation: left out, libcamera's Rotation property comes from the device
 #   tree.
-# f_number, focal lengths, base_iso: left out until measured.
+# base_iso: 100, the convention of the camera's tuning (ISO = 100 x total
+#   gain), which matches what the stock firmware records for the same
+#   exposure.
+# f_number, focal lengths: left out until measured.
 # max_zoom: 4, where a crop of the 4624x3472 mode still keeps 1156x868.
 
 device = "lisbon"
@@ -35,6 +38,7 @@ preview = [2304, 1728]
 still = [4624, 3472]
 video = [1920, 1080]
 coverage = [1.0, 1.0]
+base_iso = 100
 autofocus = true
 
 [[lens]]
@@ -45,5 +49,6 @@ zoom = 1.0
 preview = [2304, 1728]
 still = [2304, 1728]
 coverage = [1.0, 1.0]
+base_iso = 100
 autofocus = false
 mirror = true
