@@ -519,8 +519,9 @@ exposed as those after 1.6 s.
   brightness for the user of the active graphical session
   (`org.freedesktop.login1.Session.SetBrightness("leds", NAME, VALUE)`), as
   Phosh's torch does; omacam calls it on the user's display session
-  (`org.freedesktop.login1.User.Display`), since the app runs in a systemd
-  user scope outside any session.
+  (`org.freedesktop.login1.User.Display` of the user with the app's uid),
+  since the app runs in a systemd user scope outside any session, or, started
+  with su or over ssh, in a session without a seat.
 - **A crash or a kill can't leave it on.** A helper process (`omacam
   --led-helper NAME`) makes the calls, fed brightness values through a pipe;
   when the app ends in any way, the pipe closes and the helper puts the LED

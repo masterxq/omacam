@@ -8,10 +8,11 @@
 //! (`org.freedesktop.login1.Session.SetBrightness("leds", NAME, VALUE)`),
 //! which is how Phosh's torch does it, so the app needs no rights of its
 //! own. The session is the user's display session
-//! (`org.freedesktop.login1.User.Display`), not the caller's: an app
-//! started from the launcher runs in a systemd user scope outside any
-//! session, and one started over ssh in a session without a seat, which
-//! logind refuses.
+//! (`org.freedesktop.login1.User.Display` of the user with this process's
+//! uid), not the caller's: an app started from the launcher runs in a
+//! systemd user scope outside any session, and one started over ssh, or
+//! with su from a root shell, in a session without a seat, which logind
+//! refuses.
 //!
 //! A helper process does the calls: the app starts `omacam --led-helper
 //! NAME` with a pipe on its standard input and writes each brightness as a
@@ -158,6 +159,16 @@ fn find_led(dir: &Path) -> Option<String> {
     names.into_iter().next()
 }
 
+/// The session path in the reply to Get(User, "Display"): `(v)` holding
+/// `(so)`, the session's id and path; "/" when the user has none.
+fn display_path(reply: &glib::Variant) -> Option<String> {
+    // glib hands the `v`'s content over unboxed.
+    let (value,): (glib::Variant,) = reply.get()?;
+    let (_, path): (String, glib::variant::ObjectPath) = value.get()?;
+    let path = path.as_str().to_string();
+    (path != "/").then_some(path)
+}
+
 /// logind on the system bus.
 struct Logind {
     bus: gio::DBusConnection,
@@ -172,13 +183,33 @@ impl Logind {
             .map_err(|e| format!("system bus: {e}"))
     }
 
-    /// The user's graphical session: the one the shell runs in.
+    /// The user's graphical session: the one the shell runs in. The user
+    /// is looked up by this process's uid: `user/self` goes by the session
+    /// the process runs in, which for one started with su from a root
+    /// shell is root's.
     fn display_session(&self) -> Option<String> {
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
         let reply = self
             .bus
             .call_sync(
                 Some(LOGIN1),
-                "/org/freedesktop/login1/user/self",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "GetUser",
+                Some(&(uid,).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                2000,
+                gio::Cancellable::NONE,
+            )
+            .ok()?;
+        let (user,): (glib::variant::ObjectPath,) = reply.get()?;
+        let reply = self
+            .bus
+            .call_sync(
+                Some(LOGIN1),
+                user.as_str(),
                 "org.freedesktop.DBus.Properties",
                 "Get",
                 Some(&("org.freedesktop.login1.User", "Display").to_variant()),
@@ -188,10 +219,7 @@ impl Logind {
                 gio::Cancellable::NONE,
             )
             .ok()?;
-        let (value,): (glib::Variant,) = reply.get()?;
-        let (_, path): (String, glib::variant::ObjectPath) = value.as_variant()?.get()?;
-        let path = path.as_str().to_string();
-        (path != "/").then_some(path)
+        display_path(&reply)
     }
 
     fn set_on(&self, session: &str, led: &str, level: u32) -> Result<(), glib::Error> {
@@ -286,5 +314,22 @@ mod tests {
         std::fs::create_dir(dir.join(":torch")).unwrap();
         assert_eq!(find_led(&dir).as_deref(), Some(":torch"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_the_display_session_from_the_reply() {
+        let reply = |path: &str| {
+            let so = (
+                "c1".to_string(),
+                glib::variant::ObjectPath::try_from(path.to_string()).unwrap(),
+            )
+                .to_variant();
+            glib::Variant::tuple_from_iter([glib::Variant::from_variant(&so)])
+        };
+        assert_eq!(
+            display_path(&reply("/org/freedesktop/login1/session/c1")).as_deref(),
+            Some("/org/freedesktop/login1/session/c1")
+        );
+        assert_eq!(display_path(&reply("/")), None);
     }
 }
