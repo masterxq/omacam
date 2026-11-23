@@ -44,8 +44,15 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{AeState, AfState, Controls, FrameMeta};
 
-/// Longest wait for autofocus to finish before taking the picture anyway.
-pub const FOCUS_WAIT: Duration = Duration::from_millis(500);
+/// Longest wait for autofocus to finish before taking the picture anyway:
+/// a contrast scan of the Moto G60s's main camera took 15-25 frames
+/// (0.5-0.8 s at 30 fps), and its autofocus says Scanning from the start
+/// and from a change of scene until the lens stands at the result.
+pub const FOCUS_WAIT: Duration = Duration::from_millis(1200);
+/// Longest wait for the auto-exposure to stop searching in beside mode
+/// (it may search in small steps for a while; its result is the
+/// preview's either way).
+pub const EXPOSURE_WAIT: Duration = Duration::from_millis(500);
 /// Frames to drop at least after the still mode starts (the sensor applies
 /// controls two frames late).
 pub const MIN_DISCARD: u32 = 2;
@@ -165,6 +172,8 @@ enum State {
     /// Beside mode: waiting for autofocus and exposure on the preview.
     BesideWait {
         deadline: Instant,
+        /// Past this the exposure need not have stopped searching.
+        exposure_deadline: Instant,
         autofocus: bool,
     },
     /// Beside mode: the still frame is asked for.
@@ -299,11 +308,12 @@ impl CaptureController {
                 Step::Nothing
             }
             Mode::Beside => {
-                if beside_ready(autofocus, last) {
+                if beside_ready(autofocus, last, false) {
                     self.capture_beside(last, now)
                 } else {
                     self.state = State::BesideWait {
                         deadline: now + FOCUS_WAIT,
+                        exposure_deadline: now + EXPOSURE_WAIT,
                         autofocus,
                     };
                     Step::Nothing
@@ -380,9 +390,11 @@ impl CaptureController {
             }
             State::BesideWait {
                 deadline,
+                exposure_deadline,
                 autofocus,
             } => {
-                if beside_ready(autofocus, Some(meta)) || now >= deadline {
+                if beside_ready(autofocus, Some(meta), now >= exposure_deadline) || now >= deadline
+                {
                     self.capture_beside(Some(meta), now)
                 } else {
                     Step::Nothing
@@ -568,7 +580,15 @@ impl CaptureController {
     pub fn tick(&mut self, last: Option<&FrameMeta>, now: Instant) -> Step {
         match self.state {
             State::WaitFocus { deadline } if now >= deadline => self.go_still(last, now),
-            State::BesideWait { deadline, .. } if now >= deadline => self.capture_beside(last, now),
+            State::BesideWait {
+                deadline,
+                exposure_deadline,
+                autofocus,
+            } if now >= deadline
+                || (now >= exposure_deadline && beside_ready(autofocus, last, true)) =>
+            {
+                self.capture_beside(last, now)
+            }
             State::BesideStill { deadline, .. } if now >= deadline => {
                 // The preview runs on: nothing to restore.
                 self.state = State::Idle;
@@ -595,12 +615,12 @@ impl CaptureController {
 }
 
 /// Beside mode can take the still now: autofocus isn't scanning (on a lens
-/// that focuses) and the exposure isn't searching, as far as the last
-/// preview frame says.
-fn beside_ready(autofocus: bool, last: Option<&FrameMeta>) -> bool {
+/// that focuses) and the exposure isn't searching (unless it has searched
+/// long enough, `exposure_late`), as far as the last preview frame says.
+fn beside_ready(autofocus: bool, last: Option<&FrameMeta>, exposure_late: bool) -> bool {
     let scanning = autofocus && last.and_then(|m| m.af_state) == Some(AfState::Scanning);
     let searching = last.and_then(|m| m.ae_state) == Some(AeState::Searching);
-    !scanning && !searching
+    !scanning && (!searching || exposure_late)
 }
 
 #[cfg(test)]
@@ -1015,13 +1035,42 @@ mod tests {
             c.begin(Mode::Beside, false, Some(&searching), now),
             Step::Nothing
         );
-        assert_eq!(c.tick(Some(&searching), now + FOCUS_WAIT), Step::Capture);
+        assert_eq!(c.tick(Some(&searching), now + EXPOSURE_WAIT), Step::Capture);
         // The still that never comes gives up without a restore.
         assert!(matches!(
-            c.tick(None, now + FOCUS_WAIT + BESIDE_TIMEOUT),
+            c.tick(None, now + EXPOSURE_WAIT + BESIDE_TIMEOUT),
             Step::Fail(_)
         ));
         assert!(!c.is_busy());
+    }
+
+    #[test]
+    fn beside_mode_waits_longer_for_a_focus_scan_than_for_the_exposure() {
+        let now = Instant::now();
+        let at = |ms: u64| now + Duration::from_millis(ms);
+        let both = FrameMeta {
+            ae_state: Some(AeState::Searching),
+            ..meta(10_000, 1.0, Some(AfState::Scanning))
+        };
+        let searching = FrameMeta {
+            ae_state: Some(AeState::Searching),
+            ..meta(10_000, 1.0, Some(AfState::Focused))
+        };
+        let mut c = CaptureController::new();
+        assert_eq!(c.begin(Mode::Beside, true, Some(&both), now), Step::Nothing);
+        // Past the exposure's wait, the scan still holds the photo.
+        assert_eq!(c.on_preview_frame(&both, at(600)), Step::Nothing);
+        assert_eq!(c.tick(Some(&both), at(700)), Step::Nothing);
+        // The scan is done; the exposure still searches, but long enough.
+        assert_eq!(c.on_preview_frame(&searching, at(800)), Step::Capture);
+        // A scan that doesn't end: the photo at the focus wait.
+        let mut c = CaptureController::new();
+        c.begin(Mode::Beside, true, Some(&both), now);
+        assert_eq!(
+            c.tick(Some(&both), now + FOCUS_WAIT - Duration::from_millis(1)),
+            Step::Nothing
+        );
+        assert_eq!(c.tick(Some(&both), now + FOCUS_WAIT), Step::Capture);
     }
 
     #[test]

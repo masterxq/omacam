@@ -24,13 +24,17 @@
 //!
 //! [`PreFlash`] is the wait under the light before the photo: the
 //! controller feeds it the preview's frames and starts the capture when
-//! it says the picture has settled.
+//! it says the picture has settled. On a lens that focuses by itself it
+//! asks for one focus scan once the exposure has seen the light
+//! ([`PreFlashStep::Focus`]): in a dim scene the focus found before the
+//! light (if any) came from a picture mostly of noise, and the camera's
+//! continuous autofocus takes its time to notice the change of light.
 
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{AeState, FrameMeta};
+use crate::backend::{AeState, AfState, FrameMeta};
 
 /// What the flash does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -199,7 +203,14 @@ pub const PRE_FLASH_FRAMES: u32 = 4;
 /// The least time under the light before the photo.
 pub const PRE_FLASH_MIN: Duration = Duration::from_millis(300);
 /// The longest wait under the light: past it the photo is taken as it is.
-pub const PRE_FLASH_MAX: Duration = Duration::from_millis(2500);
+pub const PRE_FLASH_MAX: Duration = Duration::from_millis(3000);
+/// The longest wait for the focus scan under the light, from asking for
+/// it. A contrast scan on the Moto G60s took 15-25 frames (0.5-0.8 s at
+/// 30 fps).
+pub const PRE_FLASH_FOCUS: Duration = Duration::from_millis(1500);
+/// A focus result counts without the scan having been seen after this
+/// long (a camera that answers at once, or frames lost).
+pub const PRE_FLASH_FOCUS_SEEN: Duration = Duration::from_millis(300);
 /// The longest wait once the exposure has seen the light. The Moto G60s's
 /// exposure loop saw the light after 300-500 ms and then walked its gain
 /// down by about a tenth every 100-150 ms, still Searching after 2 s; its
@@ -246,6 +257,21 @@ pub struct PreFlash {
     steady: u32,
     /// The light went out instead of on: the demand rises.
     darker: bool,
+    /// The focus scan under the light, on a lens that focuses.
+    focus: Option<FocusWait>,
+}
+
+/// Where the focus scan under the light is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FocusWait {
+    /// To be asked for once the exposure has seen the light.
+    Due,
+    /// Asked for at `at`; `scanning` once a frame said so.
+    Asked { at: Instant, scanning: bool },
+    /// Focused or failed.
+    Done,
+    /// The scan took too long.
+    GaveUp,
 }
 
 /// How the wait under the light ended.
@@ -257,6 +283,8 @@ pub enum PreFlashStep {
     Settled,
     /// The wait ran out: take the photo anyway.
     TimedOut,
+    /// Ask the camera for one focus scan now (once); keep waiting.
+    Focus,
 }
 
 impl PreFlash {
@@ -273,6 +301,55 @@ impl PreFlash {
             reacted: None,
             steady: 0,
             darker: false,
+            focus: None,
+        }
+    }
+
+    /// The wait also covers a focus scan under the light (a lens that
+    /// focuses by itself).
+    pub fn with_focus(mut self) -> PreFlash {
+        self.focus = Some(FocusWait::Due);
+        self
+    }
+
+    /// Whether the focus scan under the light is still to come or under
+    /// way.
+    pub fn focusing(&self) -> bool {
+        matches!(self.focus, Some(FocusWait::Due | FocusWait::Asked { .. }))
+    }
+
+    /// Whether a focus scan was asked for under the light.
+    pub fn asked_focus(&self) -> bool {
+        matches!(
+            self.focus,
+            Some(FocusWait::Asked { .. } | FocusWait::Done | FocusWait::GaveUp)
+        )
+    }
+
+    /// Follow the focus scan: done once a frame after the scan says
+    /// Focused or Failed, or when it takes too long.
+    fn follow_focus(&mut self, meta: &FrameMeta, now: Instant) {
+        let Some(FocusWait::Asked { at, scanning }) = &mut self.focus else {
+            return;
+        };
+        let since = now.saturating_duration_since(*at);
+        match meta.af_state {
+            Some(AfState::Scanning) => *scanning = true,
+            Some(AfState::Focused | AfState::Failed)
+                if *scanning || since >= PRE_FLASH_FOCUS_SEEN =>
+            {
+                self.focus = Some(FocusWait::Done);
+                return;
+            }
+            None if since >= PRE_FLASH_FOCUS_SEEN => {
+                // The camera reports no focus state.
+                self.focus = Some(FocusWait::Done);
+                return;
+            }
+            _ => {}
+        }
+        if since >= PRE_FLASH_FOCUS {
+            self.focus = Some(FocusWait::GaveUp);
         }
     }
 
@@ -310,6 +387,18 @@ impl PreFlash {
                 return PreFlashStep::Wait;
             }
         }
+        // The light reaches the scene: the focus scan under it, while the
+        // exposure walks there (the scan's measure doesn't depend on it).
+        if self.focus == Some(FocusWait::Due) {
+            self.focus = Some(FocusWait::Asked {
+                at: now,
+                scanning: false,
+            });
+            self.last_demand = demand;
+            self.steady = 0;
+            return PreFlashStep::Focus;
+        }
+        self.follow_focus(meta, now);
         let reacted = self.reacted.expect("just set");
         let steady = match (demand, last) {
             (Some(d), Some(l)) => l > 0.0 && ((d - l) / l).abs() <= PRE_FLASH_STEADY,
@@ -335,9 +424,19 @@ impl PreFlash {
             Some(_) => self.steady >= PRE_FLASH_STEADY_FRAMES,
             None => self.steady >= PRE_FLASH_STEADY_FRAMES && self.frames >= PRE_FLASH_FIXED,
         };
-        if exposure && color {
+        // A focus scan under way holds the photo as long as it may take.
+        let focus_until = match self.focus {
+            Some(FocusWait::Asked { at, .. }) => Some(at + PRE_FLASH_FOCUS),
+            _ => None,
+        };
+        if self.focus == Some(FocusWait::GaveUp) {
+            return PreFlashStep::TimedOut;
+        }
+        if exposure && color && focus_until.is_none() {
             PreFlashStep::Settled
-        } else if now.saturating_duration_since(reacted) >= PRE_FLASH_AFTER {
+        } else if now.saturating_duration_since(reacted) >= PRE_FLASH_AFTER
+            && focus_until.is_none_or(|t| now >= t)
+        {
             PreFlashStep::TimedOut
         } else {
             PreFlashStep::Wait
@@ -534,6 +633,64 @@ mod tests {
             i >= PRE_FLASH_FIXED as u64 && 50 * i >= PRE_FLASH_REACT.as_millis() as u64,
             "{i}"
         );
+    }
+
+    #[test]
+    fn pre_flash_focuses_under_the_light_and_waits_for_the_scan() {
+        let now = Instant::now();
+        let at = |ms: u64| now + Duration::from_millis(ms);
+        let dark = meta(100_000, 15.5, Some(AeState::Converged), Some([2.0, 1.0]));
+        let lit = |af: AfState| FrameMeta {
+            af_state: Some(af),
+            ..meta(30_000, 3.0, Some(AeState::Converged), Some([1.5, 1.5]))
+        };
+        let mut p = PreFlash::new(now, Some(&dark)).with_focus();
+        assert!(p.focusing() && !p.asked_focus());
+        for ms in [100, 200, 300] {
+            assert_eq!(p.on_frame(&dark, at(ms)), PreFlashStep::Wait);
+        }
+        // The exposure sees the light: ask for the scan, once.
+        assert_eq!(
+            p.on_frame(&lit(AfState::Focused), at(400)),
+            PreFlashStep::Focus
+        );
+        assert!(p.asked_focus());
+        // Exposure and color settle; the frames still in flight say
+        // Focused, then the scan runs past the exposure's own wait.
+        let mut ms = 400;
+        for af in [AfState::Focused, AfState::Focused]
+            .into_iter()
+            .chain([AfState::Scanning; 20])
+        {
+            ms += 50;
+            assert_eq!(p.on_frame(&lit(af), at(ms)), PreFlashStep::Wait, "{ms}");
+        }
+        assert!(ms > 400 + PRE_FLASH_AFTER.as_millis() as u64);
+        assert!(p.focusing());
+        // The lens stands at the result: the photo.
+        assert_eq!(
+            p.on_frame(&lit(AfState::Focused), at(ms + 50)),
+            PreFlashStep::Settled
+        );
+        assert!(!p.focusing());
+
+        // A scan that doesn't end holds the photo only so long.
+        let mut p = PreFlash::new(now, Some(&dark)).with_focus();
+        p.on_frame(&dark, at(100));
+        assert_eq!(
+            p.on_frame(&lit(AfState::Scanning), at(400)),
+            PreFlashStep::Focus
+        );
+        let mut ms = 400;
+        let step = loop {
+            ms += 50;
+            match p.on_frame(&lit(AfState::Scanning), at(ms)) {
+                PreFlashStep::Wait => {}
+                step => break step,
+            }
+        };
+        assert_eq!(step, PreFlashStep::TimedOut);
+        assert_eq!(ms, 400 + PRE_FLASH_FOCUS.as_millis() as u64);
     }
 
     #[test]

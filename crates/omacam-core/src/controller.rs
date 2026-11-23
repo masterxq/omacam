@@ -364,6 +364,9 @@ pub struct Controller {
     pre_flash: Option<PreFlash>,
     /// The LED is lit for the photo being taken.
     flash_photo: bool,
+    /// The photo under the light asked for a focus scan: continuous
+    /// autofocus comes back after it.
+    flash_focus: bool,
     /// What the LED was last told.
     light: Light,
     /// The torch went out while a back camera streams: the exposure walks
@@ -420,6 +423,7 @@ impl Controller {
             tap_point: None,
             pre_flash: None,
             flash_photo: false,
+            flash_focus: false,
             light: Light::Off,
             light_out: None,
             light_out_photo: false,
@@ -1442,7 +1446,13 @@ impl Controller {
                 demand = demand.map(|d| format!("{d:.0}")),
                 "flash: light on for the photo"
             );
-            self.pre_flash = Some(PreFlash::new(now, self.last_meta.as_ref().map(|(_, m)| m)));
+            let pre = PreFlash::new(now, self.last_meta.as_ref().map(|(_, m)| m));
+            // A lens that focuses by itself focuses again under the light.
+            let focuses = self.side().is_some_and(|s| {
+                let l = self.table.get(s.lens());
+                l.autofocus && self.exposure.effective(&l.caps).lens.is_auto()
+            });
+            self.pre_flash = Some(if focuses { pre.with_focus() } else { pre });
             self.flash_photo = true;
             self.sync_light(&mut out);
             return out;
@@ -1522,9 +1532,31 @@ impl Controller {
         }
     }
 
+    /// The photo under the light is done: the focus scan it asked for
+    /// left the camera in single-scan mode; continuous autofocus comes back
+    /// (unless a tapped focus holds, which comes back by itself).
+    fn resume_after_flash_focus(&mut self, out: &mut Vec<Output>) {
+        if !std::mem::take(&mut self.flash_focus) || self.focus.is_active() {
+            return;
+        }
+        let Some((generation, lens)) = self.preview_lens() else {
+            return;
+        };
+        if lens.autofocus && self.exposure.effective(&lens.caps).lens.is_auto() {
+            out.push(Output::Backend(Command::SetControls {
+                generation,
+                controls: crate::backend::Controls {
+                    af_continuous: true,
+                    ..Default::default()
+                },
+            }));
+        }
+    }
+
     /// Forget a flash photo (the stream stopped or broke).
     fn abort_flash(&mut self) {
         self.pre_flash = None;
+        self.flash_focus = false;
         self.flash_photo = false;
         self.light_out = None;
         self.light_out_photo = false;
@@ -1554,6 +1586,7 @@ impl Controller {
     fn sync_light(&mut self, out: &mut Vec<Output>) {
         if self.flash_photo && self.pre_flash.is_none() && !self.capture.is_busy() {
             self.flash_photo = false;
+            self.resume_after_flash_focus(out);
         }
         let want = self.wanted_light();
         if want != self.light {
@@ -1940,6 +1973,26 @@ impl Controller {
                 self.last_meta = Some((lens_idx, frame.meta.clone()));
                 if let Some(p) = &mut self.pre_flash {
                     let step = p.on_frame(&frame.meta, now);
+                    if step == PreFlashStep::Focus {
+                        // One focus scan under the light, on the tapped
+                        // point if there is one (the camera keeps its
+                        // window).
+                        if let Some((generation, _)) = self.switch.streaming() {
+                            tracing::info!(
+                                ms = p.elapsed(now).as_millis() as u64,
+                                "flash: focus under the light"
+                            );
+                            self.flash_focus = true;
+                            out.push(Output::Backend(Command::SetControls {
+                                generation,
+                                controls: crate::backend::Controls {
+                                    focus: Some(crate::backend::FocusRequest { window: None }),
+                                    ..Default::default()
+                                },
+                            }));
+                        }
+                    }
+                    let p = self.pre_flash.as_mut().expect("still waiting");
                     tracing::debug!(
                         ms = p.elapsed(now).as_millis() as u64,
                         exposure_us = frame.meta.exposure_us,
@@ -1947,18 +2000,23 @@ impl Controller {
                         digital = frame.meta.digital_gain,
                         ae = ?frame.meta.ae_state,
                         gains = ?frame.meta.color_gains,
+                        af = ?frame.meta.af_state,
+                        lens = frame.meta.lens_position,
                         reacted = p.reacted(),
                         ?step,
                         "flash: frame under the light"
                     );
-                    if step != PreFlashStep::Wait {
+                    if !matches!(step, PreFlashStep::Wait | PreFlashStep::Focus) {
                         tracing::info!(
                             frames = p.frames(),
                             ms = p.elapsed(now).as_millis() as u64,
                             settled = step == PreFlashStep::Settled,
                             reacted = p.reacted(),
+                            focus = p.asked_focus(),
                             exposure_us = frame.meta.exposure_us,
                             gain = frame.meta.analog_gain,
+                            af = ?frame.meta.af_state,
+                            lens = frame.meta.lens_position,
                             "flash: the picture under the light"
                         );
                         self.pre_flash = None;
@@ -3252,15 +3310,25 @@ still = [2592, 1940]
         // A second press while waiting does nothing; nor do zoom or flip.
         assert!(c.shutter(now).is_empty());
         assert!(c.flip(now).is_empty());
-        // Frames under the light: no AeState here, so the fixed wait.
+        // Frames under the light: no AeState here, so the fixed wait. The
+        // exposure sees the light at once: one focus scan under it.
         let mut asked = None;
+        let mut focus = 0;
         for i in 1..=crate::flash::PRE_FLASH_FIXED {
             let out = c.on_event(frame(g, "main", 20_000), at(50 * i as u64));
+            for cmd in commands(&out) {
+                if let Command::SetControls { controls, .. } = cmd {
+                    if controls.focus.is_some() {
+                        focus += 1;
+                    }
+                }
+            }
             if let [Command::Capture { generation }] = commands(&out).as_slice() {
                 asked = Some((i, *generation));
                 break;
             }
         }
+        assert_eq!(focus, 1, "one focus scan under the light");
         assert_eq!(asked, Some((crate::flash::PRE_FLASH_FIXED, g)));
         assert_eq!(c.view().light, Light::Photo, "lit until the still comes");
         let mut still = frame(g, "main", 20_000);
@@ -3271,6 +3339,12 @@ still = [2592, 1940]
         assert!(matches!(out.first(), Some(Output::Picture(_))), "{out:?}");
         assert_eq!(lights(&out), vec![Light::Off]);
         assert!(!c.view().capturing);
+        // Continuous autofocus comes back after the scan for the photo.
+        assert!(
+            commands(&out).iter().any(|cmd| matches!(cmd,
+                Command::SetControls { controls, .. } if controls.af_continuous)),
+            "{out:?}"
+        );
     }
 
     #[test]
