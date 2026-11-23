@@ -826,4 +826,33 @@ mod tests {
         let main = t.by_role(Role::Main).unwrap();
         assert_eq!(t.ladder(Facing::Back), vec![main]);
     }
+
+    #[test]
+    fn the_lisbon_table_has_an_ultrawide_below_the_main_camera() {
+        let cam = |id: &str, location| CameraInfo {
+            id: id.into(),
+            location,
+            rotation: 270,
+            model: "sensor".into(),
+            ..CameraInfo::default()
+        };
+        let cams = vec![
+            cam("/base/soc/i2c@11009000/camera@22", Location::Back),
+            cam("/base/soc/i2c@11011000/camera@10", Location::Front),
+            cam("/base/soc/i2c@1101a000/camera@2d", Location::Back),
+            cam("/base/soc/i2c@1101a000/camera@10", Location::Back),
+        ];
+        let t = TableSpec::builtin(&["motorola,lisbon", "mediatek,mt6785"]).resolve(&cams);
+        assert_eq!(t.lenses().len(), 4);
+        let uw = t.by_role(Role::Ultrawide).expect("ultrawide");
+        let main = t.by_role(Role::Main).unwrap();
+        assert_eq!(t.ladder(Facing::Back), vec![uw, main]);
+        let l = t.get(uw);
+        assert_eq!(l.name, "Wide");
+        assert!(l.zoom > 0.4 && l.zoom < 0.7);
+        assert_eq!(l.max_zoom, Some(8.0));
+        assert!(!l.autofocus && !l.mirror);
+        assert_eq!(l.still, Some(Size::new(3234, 2448)));
+        assert_eq!(l.shown_coverage(), (1.0, 1.0));
+    }
 }

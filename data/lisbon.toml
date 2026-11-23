@@ -2,18 +2,30 @@
 # mainline Linux, in the same format as data/cheetah.toml, which explains
 # every field. Chosen when the device tree says motorola,lisbon.
 #
-# Three cameras have drivers so far: the OmniVision OV64B40 at the back,
-# with a focus motor, the OmniVision OV16A1Q at the front, and the Samsung
-# S5K5E9 macro camera at the back. The back's zoom ladder has one lens and
-# zoom is digital: a crop of the main camera's frames. The macro camera
-# stays off the ladder; its button turns it on, as a magnifier.
+# Four cameras have drivers so far: the OmniVision OV64B40 at the back,
+# with a focus motor, the OmniVision OV16A1Q at the front, and at the back
+# the Samsung S5K4H7 ultrawide and the Samsung S5K5E9 macro camera, both
+# with a fixed focus. The back's zoom ladder has two lenses, the ultrawide
+# below 1x and the main camera from 1x; beyond a lens's own view zoom is
+# digital, a crop of its frames. The macro camera stays off the ladder; its
+# button turns it on, as a magnifier.
 #
 # preview/still: the sensor modes libcamera offers. OV64B40: 2304x1728 and
 #   4624x3472, OV16A1Q: 2304x1728 alone, S5K5E9: 2592x1940 alone (its
-#   preview is the ISP's scaled output of the same frames, half the size). Each shows the sensor's whole
-#   field of view, hence coverage [1, 1]. libcamera may adjust the sizes
-#   (the software ISP leaves a few columns at the edge); the app uses what
-#   it gets.
+#   preview is the ISP's scaled output of the same frames, half the size),
+#   S5K4H7: 3264x2448 (and a binned 1280x720 crop of the center, which the
+#   sizes here don't pick). Each shows the sensor's whole field of view,
+#   hence coverage [1, 1]. The ISP's main output of the S5K4H7 takes 3234 of
+#   its 3264 columns (widths of 3236 to 3280 are a band the ISP's tile
+#   computation can't serve), the scaled one half of that: still
+#   3234x2448, preview 1616x1224. libcamera may adjust the sizes (the
+#   software ISP leaves a few columns at the edge); the app uses what it
+#   gets.
+#   The macro camera may also preview its whole mode (preview = still =
+#   [2592, 1940], the ISP's main output; a photo is then the next preview
+#   frame): more detail at a high zoom, as a magnifier, for four times the
+#   pixels per frame. Not measured yet, so not the default; to try it, a
+#   copy of this table with that change as ~/.config/omacam/lenses.toml.
 # video: the back camera's video stream, 16:9 of the 4624x3472 mode's whole
 #   width scaled to 1920x1080 by the ISP: video mode streams it instead of
 #   the preview, so videos keep the full width and the CPU neither crops nor
@@ -26,16 +38,26 @@
 #   gain), which matches what the stock firmware records for the same
 #   exposure.
 # f_number, focal lengths: left out until measured.
-# autofocus: the S5K5E9 has a fixed focus, sharp at a few centimeters.
+# zoom: the ultrawide's field of view relative to the main camera's,
+#   tan(FOV_main / 2) / tan(FOV_ultrawide / 2) on the diagonal: 81 degrees
+#   for the main camera (the stock camera's focal length of 4.74 mm in its
+#   photos' EXIF data, 0.7 um pixels, 9248x6944 of them), 118 degrees for
+#   the ultrawide (the published figure, taken as rectilinear) give 0.51, here
+#   0.5. Derived, not yet measured on our own frames.
+# autofocus: the S5K4H7 and the S5K5E9 have a fixed focus, the S5K5E9 sharp
+#   at a few centimeters.
 # max_zoom: 10, the most of any lens (each lens's own below).
 # min_zoom/max_zoom of a lens: how far it zooms, relative to its own view
 #   (from 1 by default; up to the table's max_zoom). Generous, for the
 #   cameras as magnifiers, where seeing something matters more than detail:
 #   the main camera 1 to 10 (a 10x crop of the 4624x3472 still keeps
-#   462x347, of the 2304x1728 preview 230x173), the macro 1 to 8 (2592x1940
-#   still, 1296x970 preview: 324x242 and 162x121), the front 1 to 4.
+#   462x347, of the 2304x1728 preview 230x173), the ultrawide 1 to 8
+#   (3234x2448 still, 1616x1224 preview: 404x306 and 202x153), the macro 1
+#   to 8 (2592x1940 still, 1296x970 preview: 324x242 and 162x121), the
+#   front 1 to 4.
 #   Nothing in omacam or the ISP limits the crop: it is the viewfinder's
-#   render transform and the photo's own crop of the full frame.# bursts: false. The camera's pipeline merges a series of frames of its own
+#   render transform and the photo's own crop of the full frame.
+# bursts: false. The camera's pipeline merges a series of frames of its own
 #   for each photo on the still stream, at an exposure of its own, and each
 #   of those frames takes about 1.2 s: the app's Night and HDR bursts never
 #   get the exposure they ask for. The camera's merge stands in for them;
@@ -79,6 +101,18 @@ video = [1920, 1080]
 coverage = [1.0, 1.0]
 base_iso = 100
 autofocus = true
+
+[[lens]]
+role = "ultrawide"
+name = "Wide"
+id = "/base/soc/i2c@1101a000/camera@2d" # Samsung S5K4H7
+zoom = 0.5
+max_zoom = 8.0
+preview = [1616, 1224]
+still = [3234, 2448]
+coverage = [1.0, 1.0]
+base_iso = 100
+autofocus = false
 
 [[lens]]
 role = "front"

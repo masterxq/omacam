@@ -56,9 +56,9 @@ pub enum CaptureMode {
 pub enum FakeLenses {
     /// The Pixel 7 Pro's: ultrawide, main, telephoto, front.
     Pixel,
-    /// The Moto G60s's: main, front, macro.
+    /// The Moto G60s's without its ultrawide: main, front, macro.
     Lisbon,
-    /// The Moto G60s's and an ultrawide (0.5x) it doesn't have.
+    /// The Moto G60s's with its ultrawide (0.5x).
     LisbonUltrawide,
 }
 
@@ -181,15 +181,7 @@ impl Cli {
         if self.fake && self.lens_table.is_none() {
             match self.fake_lenses {
                 FakeLenses::Pixel => {}
-                FakeLenses::Lisbon => return TableSpec::lisbon(),
-                FakeLenses::LisbonUltrawide => {
-                    let text = format!(
-                        "{}{}",
-                        omacam_core::lens::LISBON,
-                        omacam_fake::LISBON_ULTRAWIDE
-                    );
-                    return TableSpec::parse(&text).expect("the fake lens table parses");
-                }
+                FakeLenses::Lisbon | FakeLenses::LisbonUltrawide => return TableSpec::lisbon(),
             }
         }
         let user = gtk::glib::user_config_dir().join("omacam/lenses.toml");

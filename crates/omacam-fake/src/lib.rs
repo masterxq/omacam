@@ -84,9 +84,9 @@ pub fn cheetah_cameras() -> Vec<CameraInfo> {
 }
 
 /// The Moto G60s's cameras as the lens table `data/lisbon.toml` names
-/// them (main with a focus motor, front, macro with a fixed focus), and an
-/// ultrawide it doesn't have when `ultrawide` is set (its lens table entry
-/// is [`LISBON_ULTRAWIDE`]): for trying the controls on a laptop.
+/// them (main with a focus motor, front, macro with a fixed focus), and
+/// its ultrawide when `ultrawide` is set: for trying the controls on a
+/// laptop.
 pub fn lisbon_cameras(ultrawide: bool) -> Vec<CameraInfo> {
     let cam = |id: &str, location, rotation, model: &str, af: bool| CameraInfo {
         id: id.into(),
@@ -131,28 +131,16 @@ pub fn lisbon_cameras(ultrawide: bool) -> Vec<CameraInfo> {
             LISBON_ULTRAWIDE_ID,
             Location::Back,
             90,
-            "ultrawide",
+            "s5k4h7",
             false,
         ));
     }
     cams
 }
 
-/// The id of the ultrawide [`lisbon_cameras`] adds.
-pub const LISBON_ULTRAWIDE_ID: &str = "/fake/ultrawide";
-
-/// The lens table entry of that ultrawide, to append to `data/lisbon.toml`.
-pub const LISBON_ULTRAWIDE: &str = r#"
-[[lens]]
-role = "ultrawide"
-name = "Ultrawide"
-id = "/fake/ultrawide"
-zoom = 0.5
-preview = [2304, 1728]
-still = [4624, 3472]
-coverage = [1.0, 1.0]
-base_iso = 100
-"#;
+/// The id of the ultrawide [`lisbon_cameras`] adds, as `data/lisbon.toml`
+/// names it.
+pub const LISBON_ULTRAWIDE_ID: &str = "/base/soc/i2c@1101a000/camera@2d";
 
 #[derive(Debug, Clone)]
 pub struct Options {
