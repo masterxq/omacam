@@ -71,13 +71,14 @@
 # flash.auto_above: auto lights the LED for a photo above this exposure
 #   time (us) times gain, analog and digital, on the preview. The preview
 #   stays at 1/30 s and puts analog gain 15.5, then digital gain on top,
-#   before it lengthens frames up to 100 ms; 4000000 (1/30 s at a total
-#   gain of 120) is about where it does. Measured on the main camera with
-#   the room's light panel: 0-10 % 12800000 (100 ms), 20 % 8660000 (70 ms),
-#   30 % 2820000, 40 % 1300000, 70 % 370000, 100 % 167000 (all 1/30 s).
-#   Above it the camera's own merge of frames still makes a usable photo
-#   at 1/30 s; below it frames grow long enough to blur, and the LED
-#   (175 mA), which only lights what is near, is worth its light.
+#   before it lengthens frames up to 100 ms. Measured on the main camera
+#   with the room's light panel: 0-10 % 12800000 (100 ms), 20 % 8660000
+#   (70 ms), 30 % 2820000, 40 % 1300000, 70 % 370000, 100 % 167000 (all
+#   1/30 s). 8000000, a little below the panel at 20 % (frames of about
+#   65 ms, by those figures): chosen on the phone in the room's light,
+#   where it matched what the light called for. Above it frames grow long
+#   enough to blur, and the LED (175 mA), which only lights what is near,
+#   is worth its light.
 
 device = "lisbon"
 max_zoom = 10.0
@@ -87,7 +88,7 @@ bursts = false
 led = "white:flash-1"
 torch = 13
 photo = 13
-auto_above = 4000000
+auto_above = 8000000
 
 [[lens]]
 role = "main"
