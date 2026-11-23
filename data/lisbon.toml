@@ -70,6 +70,12 @@
 #   of those frames takes about 1.2 s: the app's Night and HDR bursts never
 #   get the exposure they ask for. The camera's merge stands in for them;
 #   Night and HDR stay hidden.
+# exif_orientation: true. A photo keeps the ISP's pixels and records the
+#   turn upright as the EXIF Orientation: turning 16 MP on the CPU takes a
+#   good part of the time a photo takes, and the hardware encoder can't
+#   turn.
+# jpeg_encoder: the MT6785's JPEG encoder (mtk-jpeg-enc, a driver of the
+#   kernel's), which takes the ISP's NV12 (BT.601, full range) as it is.
 # flash: the white LED beside the back cameras, on the MT6360's FLED1
 #   (white:flash-1). Its steps are 25 mA plus 12.5 mA each; the device tree
 #   caps them at 13 (175 mA), the torch current of the stock camera, which
@@ -91,6 +97,8 @@
 device = "lisbon"
 max_zoom = 10.0
 bursts = false
+exif_orientation = true
+jpeg_encoder = "mtk-jpeg-enc"
 
 [flash]
 led = "white:flash-1"

@@ -378,7 +378,11 @@ the phone is held when recording starts (`orientation.rs`, from
 iio-sensor-proxy's accelerometer; the front camera turns the other way),
 so a video recorded in landscape plays in landscape. Photos turn their
 pixels the same way at the shutter (EXIF Orientation stays 1), and a 4:3
-or 16:9 aspect becomes a landscape one when held sideways. The file's
+or 16:9 aspect becomes a landscape one when held sideways. Where the lens
+table sets `exif_orientation`, photos keep the frame's pixels and record
+that turn (and the front camera's mirror) as the EXIF Orientation instead,
+and with `jpeg_encoder` a V4L2 JPEG encoder takes the frame's NV12 crop as
+it is (`hwjpeg.rs`), falling back to the CPU when it can't. The file's
 creation time is when recording started. `videocrop` takes the 16:9 middle of the frame and the zoom crop
 (padded rows are cropped off the same way), `videoscale` makes it 1920x1080
 or 1280x720 with square pixels (a fixed pixel aspect ratio: a zoom that

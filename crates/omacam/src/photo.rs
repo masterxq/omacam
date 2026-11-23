@@ -1,6 +1,8 @@
 //! Turning a captured frame into a JPEG file: crop to the zoom, turn
-//! upright (so the file needs no EXIF orientation), encode with
-//! libjpeg-turbo, and make a thumbnail. Runs off the UI thread.
+//! upright (or, where the lens table says so, leave the pixels as the
+//! camera gave them and record the turn as the EXIF orientation), encode
+//! with libjpeg-turbo or a hardware encoder, and make a thumbnail. Runs off
+//! the UI thread.
 
 use std::path::{Path, PathBuf};
 
@@ -108,6 +110,161 @@ pub fn crop_window_and_rotate(
         height: oh,
         data: out,
     })
+}
+
+/// The largest centered part of `rect` (x, y, w, h, even) that has
+/// `aspect` (width over height) once turned clockwise by `turn`: the
+/// aspect crop of a photo whose pixels stay as the frame has them.
+pub fn rect_to_aspect(
+    rect: (u32, u32, u32, u32),
+    aspect: Option<f64>,
+    turn: u32,
+) -> (u32, u32, u32, u32) {
+    let Some(a) = aspect.filter(|a| a.is_finite() && *a > 0.0) else {
+        return rect;
+    };
+    let a = if turn % 180 == 90 { 1.0 / a } else { a };
+    let (x, y, w, h) = rect;
+    let (fw, fh) = (w as f64, h as f64);
+    let (cw, ch) = if fw / fh > a {
+        (fh * a, fh)
+    } else {
+        (fw, fw / a)
+    };
+    let cw = ((cw as u32) & !1).clamp(2.min(w), w);
+    let ch = ((ch as u32) & !1).clamp(2.min(h), h);
+    (x + (((w - cw) / 2) & !1), y + (((h - ch) / 2) & !1), cw, ch)
+}
+
+/// The EXIF Orientation of a photo stored as the frame has it, whose
+/// upright picture is the frame turned clockwise by `turn` and then, when
+/// `mirror`, mirrored left-right.
+pub fn exif_orientation(turn: u32, mirror: bool) -> u16 {
+    match (turn % 360, mirror) {
+        (90, false) => 6,
+        (180, false) => 3,
+        (270, false) => 8,
+        (0, true) => 2,
+        (90, true) => 5,
+        (180, true) => 4,
+        (270, true) => 7,
+        _ => 1,
+    }
+}
+
+/// The thumbnail of the upright photo whose pixels are `rect` of the
+/// frame, turned clockwise by `turn` and mirrored when `mirror`.
+pub fn thumbnail_of(
+    raw: &Raw<'_>,
+    rect: (u32, u32, u32, u32),
+    turn: u32,
+    mirror: bool,
+) -> Result<Bgrx> {
+    let px = raw.pixels()?;
+    let (x, y, w, h) = rect;
+    if w == 0 || h == 0 || x + w > raw.width || y + h > raw.height {
+        bail!("crop outside the frame");
+    }
+    // The center square: the same part of the picture before and after
+    // turning it.
+    let side = w.min(h);
+    let (x0, y0) = (x + (w - side) / 2, y + (h - side) / 2);
+    let n = THUMB.min(side);
+    let mut data = Vec::with_capacity((n * n * 4) as usize);
+    for ty in 0..n {
+        for tx in 0..n {
+            let sx = x0 + (tx as u64 * side as u64 / n as u64) as u32;
+            let sy = y0 + (ty as u64 * side as u64 / n as u64) as u32;
+            data.extend_from_slice(&px.bgrx(sx, sy));
+        }
+    }
+    let small = Raw {
+        data: &data,
+        width: n,
+        height: n,
+        stride: n * 4,
+        layout: PixelLayout::Xrgb8888,
+    };
+    let mut img = crop_window_and_rotate(&small, (0, 0, n, n), turn)?;
+    if mirror {
+        self::mirror(&mut img);
+    }
+    Ok(img)
+}
+
+/// Copy `rect` (x, y, w, h, even) of an NV12 frame into `dst` as NV12 with
+/// `stride` bytes a line and the chroma lines after `rows` luma lines;
+/// halved (each pixel the mean of four) when `half`. Returns the size
+/// written, width and height.
+pub fn copy_nv12(
+    raw: &Raw<'_>,
+    rect: (u32, u32, u32, u32),
+    half: bool,
+    dst: &mut [u8],
+    stride: usize,
+    rows: usize,
+) -> Result<(u32, u32)> {
+    use rayon::prelude::*;
+    let PixelLayout::Nv12(_) = raw.layout else {
+        bail!("not an NV12 frame");
+    };
+    let (x, y, w, h) = rect;
+    let (x, y) = (x & !1, y & !1);
+    if w < 2 || h < 2 || x + w > raw.width || y + h > raw.height {
+        bail!("crop outside the frame");
+    }
+    let s = raw.stride as usize;
+    let chroma = s * raw.height as usize;
+    if raw.data.len() < chroma + s * (raw.height as usize).div_ceil(2) {
+        bail!("frame data is shorter than its size says");
+    }
+    let (ow, oh) = if half {
+        ((w / 2) & !1, (h / 2) & !1)
+    } else {
+        (w & !1, h & !1)
+    };
+    let (owu, ohu) = (ow as usize, oh as usize);
+    if ow < 2 || oh < 2 || stride < owu || rows < ohu || dst.len() < stride * (rows + ohu / 2) {
+        bail!("the encoder's buffer is too small");
+    }
+    let (x, y) = (x as usize, y as usize);
+    let src = raw.data;
+    let (luma, rest) = dst.split_at_mut(stride * rows);
+    let avg =
+        |a: u8, b: u8, c: u8, d: u8| ((a as u32 + b as u32 + c as u32 + d as u32 + 2) / 4) as u8;
+    luma[..stride * ohu]
+        .par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(j, row)| {
+            if half {
+                let a = &src[(y + 2 * j) * s + x..];
+                let b = &src[(y + 2 * j + 1) * s + x..];
+                for (i, o) in row[..owu].iter_mut().enumerate() {
+                    *o = avg(a[2 * i], a[2 * i + 1], b[2 * i], b[2 * i + 1]);
+                }
+            } else {
+                let i = (y + j) * s + x;
+                row[..owu].copy_from_slice(&src[i..i + owu]);
+            }
+        });
+    rest[..stride * (ohu / 2)]
+        .par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(j, row)| {
+            if half {
+                let a = &src[chroma + (y / 2 + 2 * j) * s + x..];
+                let b = &src[chroma + (y / 2 + 2 * j + 1) * s + x..];
+                for (i, o) in row[..owu].iter_mut().enumerate() {
+                    // Pairs of Cb, Cr: the same component of four pairs.
+                    let (p, c) = (i / 2 * 4, i % 2);
+                    *o = avg(a[p + c], a[p + 2 + c], b[p + c], b[p + 2 + c]);
+                }
+            } else {
+                let i = chroma + (y / 2 + j) * s + x;
+                row[..owu].copy_from_slice(&src[i..i + owu]);
+            }
+        });
+    Ok((ow, oh))
 }
 
 /// The largest centered part of `img` with `aspect` (width over height).
@@ -586,6 +743,138 @@ mod tests {
     fn short_data_is_an_error_not_a_panic() {
         let d = [0u8; 10];
         assert!(crop_and_rotate(&raw(&d), 1.0, 90).is_err());
+    }
+
+    /// The picture a viewer shows for a stored image and its EXIF
+    /// Orientation, by the tag's definition: where row 0 and column 0 of
+    /// the stored image land.
+    fn shown(img: &Bgrx, orientation: u16) -> Bgrx {
+        let (w, h) = (img.width, img.height);
+        let swap = orientation >= 5;
+        let (ow, oh) = if swap { (h, w) } else { (w, h) };
+        let mut data = vec![0u8; (ow * oh * 4) as usize];
+        for sy in 0..h {
+            for sx in 0..w {
+                let (dx, dy) = match orientation {
+                    2 => (w - 1 - sx, sy),
+                    3 => (w - 1 - sx, h - 1 - sy),
+                    4 => (sx, h - 1 - sy),
+                    // Row 0 on the left, column 0 at the top.
+                    5 => (sy, sx),
+                    // Row 0 on the right, column 0 at the top.
+                    6 => (h - 1 - sy, sx),
+                    // Row 0 on the right, column 0 at the bottom.
+                    7 => (h - 1 - sy, w - 1 - sx),
+                    // Row 0 on the left, column 0 at the bottom.
+                    8 => (sy, w - 1 - sx),
+                    _ => (sx, sy),
+                };
+                let si = ((sy * w + sx) * 4) as usize;
+                let di = ((dy * ow + dx) * 4) as usize;
+                data[di..di + 4].copy_from_slice(&img.data[si..si + 4]);
+            }
+        }
+        Bgrx {
+            width: ow,
+            height: oh,
+            data,
+        }
+    }
+
+    #[test]
+    fn the_exif_orientation_shows_what_turning_the_pixels_would() {
+        let mut d = Vec::new();
+        for y in 0..2u8 {
+            for x in 0..4u8 {
+                d.extend_from_slice(&[x, y, 7, 255]);
+            }
+        }
+        let r = raw(&d);
+        let stored = crop_window_and_rotate(&r, (0, 0, 4, 2), 0).unwrap();
+        for turn in [0, 90, 180, 270] {
+            for m in [false, true] {
+                let mut want = crop_window_and_rotate(&r, (0, 0, 4, 2), turn).unwrap();
+                if m {
+                    mirror(&mut want);
+                }
+                assert_eq!(
+                    shown(&stored, exif_orientation(turn, m)),
+                    want,
+                    "turn {turn} mirror {m}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_aspect_crop_of_unturned_pixels() {
+        // 4:3 upright from a 4000x3000 frame turned a quarter: 3:4 of it.
+        assert_eq!(
+            rect_to_aspect((0, 0, 4000, 3000), Some(4.0 / 3.0), 90),
+            (874, 0, 2250, 3000)
+        );
+        assert_eq!(
+            rect_to_aspect((0, 0, 4000, 3000), Some(16.0 / 9.0), 0),
+            (0, 374, 4000, 2250)
+        );
+        assert_eq!(rect_to_aspect((2, 4, 100, 60), None, 90), (2, 4, 100, 60));
+    }
+
+    #[test]
+    fn copies_and_halves_nv12() {
+        // 8x4 NV12, stride 10: luma x + 10 y, chroma 100 + pair index.
+        let (w, h, s) = (8u32, 4u32, 10usize);
+        let mut d = vec![0u8; s * 6];
+        for y in 0..4 {
+            for x in 0..8 {
+                d[y * s + x] = (x + 10 * y) as u8;
+            }
+        }
+        for y in 0..2 {
+            for x in 0..8 {
+                d[4 * s + y * s + x] = (100 + x + 8 * y) as u8;
+            }
+        }
+        let r = Raw {
+            data: &d,
+            width: w,
+            height: h,
+            stride: s as u32,
+            layout: PixelLayout::Nv12(Default::default()),
+        };
+        let mut out = vec![0u8; 16 * 6];
+        assert_eq!(
+            copy_nv12(&r, (2, 2, 4, 2), false, &mut out, 4, 4).unwrap(),
+            (4, 2)
+        );
+        assert_eq!(&out[..8], &[22, 23, 24, 25, 32, 33, 34, 35]);
+        assert_eq!(&out[16..20], &[110, 111, 112, 113]);
+        let mut out = vec![0u8; 16 * 6];
+        assert_eq!(
+            copy_nv12(&r, (0, 0, 8, 4), true, &mut out, 4, 2).unwrap(),
+            (4, 2)
+        );
+        // Luma: the mean of each 2x2 block.
+        assert_eq!(&out[..4], &[6, 8, 10, 12]);
+        // Chroma: Cb of pairs 0, 1 and of the next row's (100, 102, 108,
+        // 110), Cr of the same (101, 103, 109, 111).
+        assert_eq!(&out[8..12], &[105, 106, 109, 110]);
+        assert!(copy_nv12(&r, (6, 0, 4, 4), false, &mut out, 4, 4).is_err());
+    }
+
+    #[test]
+    fn the_thumbnail_of_unturned_pixels() {
+        let mut d = Vec::new();
+        for y in 0..2u8 {
+            for x in 0..4u8 {
+                d.extend_from_slice(&[x, y, 7, 255]);
+            }
+        }
+        let t = thumbnail_of(&raw(&d), (0, 0, 4, 2), 90, false).unwrap();
+        assert_eq!((t.width, t.height), (2, 2));
+        // The center square, columns 1 and 2, turned: its bottom-left
+        // (x 1, y 1) at the top left.
+        assert_eq!(&t.data[..2], &[1, 1]);
     }
 
     #[test]

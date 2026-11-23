@@ -20,6 +20,16 @@
 #   mode and the HDR chip then stay hidden, and a Night or HDR photo asked
 #   for anyway (settings, command line, script) is a single photo. Left
 #   out, as here, it is true. One key for the device, beside max_zoom.
+# exif_orientation: true to keep a photo's pixels as the camera gives them
+#   and record the turn that shows them upright (with the front camera's
+#   mirror) as the EXIF Orientation, instead of turning the pixels. Left
+#   out, as here, it is false: a viewer that ignores the tag would show the
+#   photo sideways. One key for the device.
+# jpeg_encoder: the name of a V4L2 memory-to-memory JPEG encoder (as
+#   /sys/class/video4linux/*/name has it) to encode photos with; needs
+#   exif_orientation and NV12 frames in JPEG's own color (BT.601, full
+#   range). Photos are encoded on the CPU when it is left out, as here, when
+#   no such device is there, or when it fails.
 # rotation: leave out to use libcamera's Rotation property.
 # base_iso: ISO at analog gain 1, to show and record gain as ISO
 #   (ISO = gain x base_iso). 50 for each sensor, an estimate: no published

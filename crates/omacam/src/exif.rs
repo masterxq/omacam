@@ -1,9 +1,10 @@
 //! A small EXIF writer: the tags a phone photo carries, as an APP1 segment
 //! spliced into the JPEG after its SOI marker.
 //!
-//! The pixels are already turned upright, so Orientation is always 1. No
-//! serial numbers or other device identifiers, and no GPS (location tags
-//! aren't built yet and are off by default).
+//! Orientation is 1 where the pixels are turned upright, else the turn
+//! (and mirror) that shows them upright. No serial numbers or other device
+//! identifiers, and no GPS (location tags aren't built yet and are off by
+//! default).
 
 /// What goes into a photo's EXIF.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -17,6 +18,8 @@ pub struct Info {
     pub offset: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// The EXIF Orientation, 1 to 8; 0 (unset) is written as 1.
+    pub orientation: u16,
     pub exposure_us: Option<i32>,
     /// ISO, roughly: total gain x 100.
     pub iso: Option<u32>,
@@ -226,7 +229,7 @@ fn ifd_len(entries: &[Entry]) -> u32 {
 /// The TIFF structure (header, IFD0, Exif IFD) for `info`.
 pub fn tiff(info: &Info) -> Vec<u8> {
     let mut ifd0 = vec![
-        short(0x0112, 1),
+        short(0x0112, info.orientation.clamp(1, 8)),
         ascii(0x0131, &info.software),
         ascii(0x0132, &info.datetime),
     ];
@@ -383,6 +386,7 @@ mod tests {
             offset: Some("-04:00".into()),
             width: 3072,
             height: 4072,
+            orientation: 1,
             exposure_us: Some(33_214),
             iso: Some(1600),
             f_number: Some(1.85),
@@ -407,6 +411,26 @@ mod tests {
             data: vec![100; 16 * 16 * 4],
         };
         crate::photo::encode_jpeg(&img, 90).unwrap()
+    }
+
+    #[test]
+    fn the_orientation_tag() {
+        let read = |o| {
+            let out = insert(
+                &jpeg(),
+                &Info {
+                    orientation: o,
+                    ..info()
+                },
+            );
+            let exif = ::exif::Reader::new()
+                .read_from_container(&mut std::io::Cursor::new(&out))
+                .expect("EXIF parses");
+            exif.get_field(::exif::Tag::Orientation, ::exif::In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0))
+        };
+        assert_eq!(read(6), Some(6));
+        assert_eq!(read(0), Some(1));
     }
 
     #[test]

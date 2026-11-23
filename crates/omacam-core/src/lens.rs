@@ -147,6 +147,13 @@ struct TableFile {
     /// The app takes Night and HDR bursts of its own (see
     /// [`TableSpec::bursts`]); true when left out.
     bursts: Option<bool>,
+    /// Photos keep the frame's pixels as they are and record the turn
+    /// upright in EXIF (see [`TableSpec::exif_orientation`]).
+    #[serde(default)]
+    exif_orientation: bool,
+    /// The name of a hardware JPEG encoder's V4L2 node (see
+    /// [`TableSpec::jpeg_encoder`]).
+    jpeg_encoder: Option<String>,
     /// The flash LED (see [`crate::flash`]).
     flash: Option<FlashEntry>,
     #[serde(default, rename = "lens")]
@@ -213,6 +220,8 @@ pub enum TableError {
 pub struct TableSpec {
     max_zoom: f64,
     bursts: bool,
+    exif_orientation: bool,
+    jpeg_encoder: Option<String>,
     flash: FlashSpec,
     entries: Vec<LensEntry>,
 }
@@ -309,6 +318,8 @@ impl TableSpec {
         Ok(TableSpec {
             max_zoom,
             bursts: file.bursts.unwrap_or(true),
+            exif_orientation: file.exif_orientation,
+            jpeg_encoder: file.jpeg_encoder.filter(|n| !n.is_empty()),
             flash,
             entries: file.lenses,
         })
@@ -351,6 +362,8 @@ impl TableSpec {
         TableSpec {
             max_zoom: DEFAULT_MAX_ZOOM,
             bursts: true,
+            exif_orientation: false,
+            jpeg_encoder: None,
             flash: FlashSpec::default(),
             entries: Vec::new(),
         }
@@ -363,6 +376,23 @@ impl TableSpec {
     /// work and stay hidden.
     pub fn bursts(&self) -> bool {
         self.bursts
+    }
+
+    /// Whether a photo keeps the frame's pixels as the camera gave them
+    /// and records the turn that makes it upright (and the front camera's
+    /// mirror) as its EXIF Orientation, instead of turning the pixels:
+    /// cheaper, and what a hardware JPEG encoder needs, but a viewer that
+    /// ignores the tag shows the photo sideways. False when left out.
+    pub fn exif_orientation(&self) -> bool {
+        self.exif_orientation
+    }
+
+    /// The name of the V4L2 memory-to-memory JPEG encoder to encode photos
+    /// with (as /sys/class/video4linux/*/name says it), or None to encode
+    /// them on the CPU. Photos fall back to the CPU when no such node is
+    /// there or it fails.
+    pub fn jpeg_encoder(&self) -> Option<&str> {
+        self.jpeg_encoder.as_deref()
     }
 
     /// The flash LED: which one, how bright, and when auto fires.
@@ -623,6 +653,20 @@ mod tests {
         let off = TableSpec::parse("bursts = false\n").unwrap();
         assert!(!off.bursts() && !off.resolve(&[]).bursts());
         assert!(TableSpec::parse("bursts = \"no\"\n").is_err());
+    }
+
+    #[test]
+    fn exif_orientation_and_the_jpeg_encoder_are_off_unless_the_table_says() {
+        for spec in [TableSpec::cheetah(), TableSpec::tegu(), TableSpec::empty()] {
+            assert!(!spec.exif_orientation());
+            assert_eq!(spec.jpeg_encoder(), None);
+        }
+        assert!(TableSpec::lisbon().exif_orientation());
+        let t = TableSpec::parse("exif_orientation = true\njpeg_encoder = \"enc\"\n").unwrap();
+        assert!(t.exif_orientation());
+        assert_eq!(t.jpeg_encoder(), Some("enc"));
+        let none = TableSpec::parse("jpeg_encoder = \"\"\n").unwrap();
+        assert_eq!(none.jpeg_encoder(), None);
     }
 
     #[test]

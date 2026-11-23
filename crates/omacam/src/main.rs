@@ -4,6 +4,7 @@ mod app;
 mod dial;
 mod exif;
 mod flash;
+mod hwjpeg;
 mod icons;
 mod journal;
 mod lensrow;

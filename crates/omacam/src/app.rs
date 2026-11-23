@@ -323,6 +323,15 @@ struct App {
     ///
     /// [`TableSpec::bursts`]: omacam_core::lens::TableSpec::bursts
     bursts: bool,
+    /// Photos record their turn as the EXIF orientation
+    /// ([`TableSpec::exif_orientation`]).
+    ///
+    /// [`TableSpec::exif_orientation`]: omacam_core::lens::TableSpec::exif_orientation
+    exif_orientation: bool,
+    /// The hardware JPEG encoder ([`TableSpec::jpeg_encoder`]).
+    ///
+    /// [`TableSpec::jpeg_encoder`]: omacam_core::lens::TableSpec::jpeg_encoder
+    jpeg_encoder: Option<String>,
     /// GeoClue, while location tags are on.
     locator: RefCell<Option<crate::location::Locator>>,
     /// The flash LED, where the phone has one (`flash.rs`).
@@ -589,7 +598,10 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
     overlay.set_child(Some(&viewfinder));
     let settings_path = cli.settings.clone().unwrap_or_else(Settings::default_path);
     let settings = Settings::load(&settings_path);
-    let bursts = cli.lens_table().bursts();
+    let table = cli.lens_table();
+    let bursts = table.bursts();
+    let exif_orientation = table.exif_orientation();
+    let jpeg_encoder = table.jpeg_encoder().map(str::to_owned);
 
     // Top: the quick settings. Flash, timer, aspect ratio, HDR or 60 fps;
     // the settings gear at the end.
@@ -937,6 +949,8 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         screen: crate::screen::Screen::watch(&WidgetExt::display(&window)),
         has_gyro,
         bursts,
+        exif_orientation,
+        jpeg_encoder,
         locator: RefCell::new(None),
         flash_led,
     });
@@ -1791,6 +1805,8 @@ impl App {
             portrait_aspect: settings.aspect.portrait_ratio(),
             medium: settings.resolution == crate::settings::Resolution::Medium,
             mirror: settings.mirror_front && p.lens.role == Role::Front,
+            exif_orientation: self.exif_orientation,
+            jpeg_encoder: self.jpeg_encoder.clone(),
             exif: exif::Info {
                 make,
                 model,
@@ -3365,6 +3381,12 @@ struct PhotoOptions {
     medium: bool,
     /// Mirror left-right (front camera photos saved as previewed).
     mirror: bool,
+    /// Keep the frame's pixels as they are and record the turn and the
+    /// mirror as the EXIF orientation.
+    exif_orientation: bool,
+    /// The hardware JPEG encoder's V4L2 name, when the pixels stay as they
+    /// are; the CPU encodes when it is None or fails.
+    jpeg_encoder: Option<String>,
     /// Device and time; the rest is filled from the picture.
     exif: exif::Info,
 }
@@ -3392,18 +3414,50 @@ fn encode_and_write(
     let window =
         omacam_core::framing::frame_window(&p.transform, p.frame.size, opts.portrait_aspect);
     let rect = photo::window_rect(raw.width, raw.height, window);
-    let img = photo::crop_window_and_rotate(&raw, rect, opts.turn)?;
-    let mut img = photo::crop_to_aspect(img, opts.aspect);
-    if opts.mirror {
-        photo::mirror(&mut img);
-    }
-    let img = if opts.medium { photo::half(&img) } else { img };
-    let jpeg = photo::encode_jpeg(&img, opts.quality)?;
+    let mut encoder = "software";
+    let (jpeg, width, height, thumb, orientation) = if opts.exif_orientation {
+        // The pixels stay as the frame has them: crop in the frame's
+        // terms, and tell viewers how to turn it.
+        let rect = photo::rect_to_aspect(rect, opts.aspect, opts.turn);
+        let hw = opts.jpeg_encoder.as_deref().and_then(|name| {
+            crate::hwjpeg::encode(name, &raw, rect, opts.medium, opts.quality)
+                .inspect_err(|e| tracing::warn!("{e:#}; encoding on the CPU"))
+                .ok()
+        });
+        let (jpeg, width, height) = match hw {
+            Some(e) => {
+                encoder = "hardware";
+                (e.jpeg, e.width, e.height)
+            }
+            None => {
+                let img = photo::crop_window_and_rotate(&raw, rect, 0)?;
+                let img = if opts.medium { photo::half(&img) } else { img };
+                (
+                    photo::encode_jpeg(&img, opts.quality)?,
+                    img.width,
+                    img.height,
+                )
+            }
+        };
+        let thumb = photo::thumbnail_of(&raw, rect, opts.turn, opts.mirror)?;
+        let orientation = photo::exif_orientation(opts.turn, opts.mirror);
+        (jpeg, width, height, thumb, orientation)
+    } else {
+        let img = photo::crop_window_and_rotate(&raw, rect, opts.turn)?;
+        let mut img = photo::crop_to_aspect(img, opts.aspect);
+        if opts.mirror {
+            photo::mirror(&mut img);
+        }
+        let img = if opts.medium { photo::half(&img) } else { img };
+        let jpeg = photo::encode_jpeg(&img, opts.quality)?;
+        (jpeg, img.width, img.height, photo::thumbnail(&img), 1)
+    };
     let m = &p.frame.meta;
     let gain = m.analog_gain.unwrap_or(1.0) as f64 * m.digital_gain.unwrap_or(1.0) as f64;
     let info = exif::Info {
-        width: img.width,
-        height: img.height,
+        width,
+        height,
+        orientation,
         exposure_us: m.exposure_us,
         iso: m
             .analog_gain
@@ -3429,7 +3483,9 @@ fn encode_and_write(
     tracing::info!(
         lens = %p.lens.name,
         zoom = p.zoom,
-        size = %format!("{}x{}", img.width, img.height),
+        size = %format!("{width}x{height}"),
+        orientation,
+        encoder,
         bytes = jpeg.len(),
         ms = started.elapsed().as_millis() as u64,
         color_gains = ?p.frame.meta.color_gains,
@@ -3437,7 +3493,7 @@ fn encode_and_write(
         gain = ?p.frame.meta.analog_gain,
         "photo encoded"
     );
-    Ok((path, photo::thumbnail(&img)))
+    Ok((path, thumb))
 }
 
 /// The freedesktop camera shutter sound, through libcanberra's player, or
