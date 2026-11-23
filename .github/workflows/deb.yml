@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # The Debian package for arm64, built by debian/build.sh on every push to
-# the lisbon branch and on request (Actions, "Run workflow").
+# the opacam branch and on request (Actions, "Run workflow").
 name: deb
 
 on:
   push:
-    branches: [lisbon]
+    branches: [opacam]
   workflow_dispatch:
 
 permissions:
