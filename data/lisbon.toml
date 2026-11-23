@@ -11,8 +11,12 @@
 # button turns it on, as a magnifier.
 #
 # preview/still: the sensor modes libcamera offers. OV64B40: 2304x1728 and
-#   4624x3472, OV16A1Q: 2304x1728 alone, S5K5E9: 2592x1940 alone (its
-#   preview is the ISP's scaled output of the same frames, half the size),
+#   4624x3472, OV16A1Q: 2304x1728 alone, S5K5E9: 2592x1940 alone (the
+#   previews of both are the ISP's scaled output of the same frames, half
+#   the size, so that photos come from the still stream beside them: a
+#   preview on the ISP's main output of the whole mode would make every
+#   preview frame a still image of the camera's pipeline, without its
+#   temporal noise reduction and with a multi-frame series per frame),
 #   S5K4H7: 3264x2448 (and a binned 1280x720 crop of the center, which the
 #   sizes here don't pick). Each shows the sensor's whole field of view,
 #   hence coverage [1, 1]. The ISP's main output of the S5K4H7 takes 3234 of
@@ -125,7 +129,7 @@ name = "Front"
 id = "/base/soc/i2c@11011000/camera@10" # OmniVision OV16A1Q
 zoom = 1.0
 max_zoom = 4.0
-preview = [2304, 1728]
+preview = [1152, 864]
 still = [2304, 1728]
 coverage = [1.0, 1.0]
 base_iso = 100
