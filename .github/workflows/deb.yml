@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # The Debian package for arm64, built by debian/build.sh on every push to
-# the opacam branch and on request (Actions, "Run workflow").
+# the opacam branch and on request (Actions, "Run workflow"). A build of the
+# opacam branch is published to the APT registry codeberg.org/moblix (suite
+# testing) by the reusable workflow of masterxq/pocket-debs, which also
+# removes the previous version there; builds of other branches only leave
+# the artifact. Needs the secret CODEBERG_TOKEN.
 name: deb
 
 on:
@@ -31,3 +35,12 @@ jobs:
           name: omacam_${{ steps.build.outputs.version }}_arm64
           path: ${{ runner.temp }}/deb/
           if-no-files-found: error
+
+  registry:
+    needs: deb
+    if: ${{ github.ref == 'refs/heads/opacam' }}
+    uses: masterxq/pocket-debs/.github/workflows/registry.yml@main
+    with:
+      artefakte: 'omacam_*'
+    secrets:
+      CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
