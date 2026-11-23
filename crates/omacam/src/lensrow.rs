@@ -1,7 +1,9 @@
 //! The lens row above the mode bar: the zoom field, the lens button
 //! beside it, and the adjust button at the end.
 //!
-//! The zoom field shows the zoom of the lens in use ("1.0×"). A tap on it,
+//! The zoom field shows the zoom against the main camera's view ("1.0×",
+//! the ultrawide's own view "0.5×"; the macro lens's own view is its
+//! 1×). A tap on it,
 //! or a sideways drag across it, opens the zoom dial ([`crate::dial`]) in
 //! its place: drag it for a stepless zoom, or tap one of its marks (the
 //! lens's least and most zoom, and 1×) to go there. The dial closes a
@@ -328,7 +330,8 @@ impl LensRow {
             built.0 = *now;
         }
         self.range.set((zoom, floor, max));
-        // The dial marks the lens's limits and its 1×.
+        // The dial marks the lens's limits and 1× (the main camera's view,
+        // where the lens reaches it).
         let mut stops = vec![floor, unit, max];
         stops.retain(|s| *s >= floor - 1e-6 && *s <= max + 1e-6);
         stops.sort_by(f64::total_cmp);

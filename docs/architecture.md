@@ -251,8 +251,11 @@ picture.
   the main camera at 1x, all automatic): what stays across launches is
   what the gear's sheet sets. Within a run, leaving the app and coming
   back keeps them all; only a tapped point is given up.
-- **Lens row** (`lensrow.rs`): the zoom field, the zoom of the chosen
-  lens relative to its own view (`ViewState::zoom_unit`), "1.0×". A tap
+- **Lens row** (`lensrow.rs`): the zoom field, the zoom relative to the
+  main camera's view whichever lens is chosen (`ViewState::zoom_unit`):
+  "1.0×", the ultrawide's own view its factor, "0.5×", and its 1× where
+  it shows what the main camera shows at 1×. The macro lens, off the
+  ladder, reads relative to its own view. A tap
   on it, or a sideways drag across it, shows the zoom dial (`dial.rs`) in
   its place, a ruler of zoom values under a marker with the lens's limits
   and its 1× marked, a light detent at each and a tap on a mark going

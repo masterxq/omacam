@@ -183,9 +183,10 @@ pub struct ViewState {
     /// The highest zoom a gesture reaches now: the chosen lens's most
     /// while the lens is held ([`Options::hold_lens`]), else `max_zoom`.
     pub zoom_ceiling: f64,
-    /// What the zoom is shown relative to: the chosen lens's own view
-    /// while the lens is held (its zoom reads "1×" there), else the main
-    /// camera's (1).
+    /// What the zoom is shown relative to: the main camera's view (1),
+    /// whichever lens is chosen, so the ultrawide's own view reads its
+    /// factor ("0.5×") and its 1× shows what the main camera shows at 1×.
+    /// The macro lens, off the ladder, is the exception: its own view.
     pub zoom_unit: f64,
     /// The lens that is wanted for the current zoom.
     pub lens_role: Option<Role>,
@@ -538,8 +539,9 @@ impl Controller {
             buttons: self.zoom_buttons(),
             lenses: self.lens_choices(),
             zoom_ceiling: side.map(|s| s.planner.ceiling()).unwrap_or(max_zoom),
+            // The macro lens is off the ladder: its own view is its 1×.
             zoom_unit: side
-                .filter(|s| s.planner.holds_lens())
+                .filter(|_| self.facing == Facing::Back && self.macro_on)
                 .map(|s| self.table.get(s.planned()).zoom)
                 .unwrap_or(1.0),
             lens_role: lens.map(|l| l.role),
@@ -2222,13 +2224,19 @@ mirror = true
         // A zoom of 5 crops the main camera: zooming never switches.
         assert!(commands(&c.set_zoom(5.0, ZoomSource::Gesture, now)).is_empty());
         assert_eq!(c.view().lens_role, Some(Role::Main));
-        // The ultrawide from the menu: its own view, shown as 1x.
+        // The ultrawide from the menu: its own view, shown as its factor
+        // against the main camera, 0.45x.
         let uw = v.lenses[0].lens;
         let (g2, cam, _) = start_of(&c.choose_lens(uw, now));
         assert!(g2 > g && cam == "uw", "{cam}");
         let v = c.view();
         assert!((v.zoom - 0.45).abs() < 1e-9 && v.lenses[0].active);
-        assert!((v.zoom / v.zoom_unit - 1.0).abs() < 1e-9);
+        assert_eq!(v.zoom_unit, 1.0);
+        // Its 1x crops it to the main camera's view, without a switch.
+        assert!(commands(&c.set_zoom(1.0, ZoomSource::Gesture, now)).is_empty());
+        let v = c.view();
+        assert!((v.zoom - 1.0).abs() < 1e-9 && v.lens_role == Some(Role::Ultrawide));
+        c.set_zoom(0.45, ZoomSource::Gesture, now);
         // The telephoto: from its own view up to twice it, its table's.
         c.choose_lens(v.lenses[2].lens, now);
         let v = c.view();

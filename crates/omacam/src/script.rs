@@ -3,8 +3,9 @@
 //!
 //! Steps: `wait SECONDS`, `zoom Z` (as a preset button), `pinch Z` (as a
 //! pinch that ends at Z), `zoom-field` (a tap on the zoom field: the
-//! dial opens), `mark Z` (a tap on the dial's mark Z, relative to the lens's
-//! own view), `dial Z` (the zoom dial, dragged to Z), `camera main|macro|wide|tele`
+//! dial opens), `mark Z` (a tap on the dial's mark Z, as the dial writes
+//! it: relative to the main camera, the macro lens to its own view), `dial
+//! Z` (the zoom dial, dragged to Z), `camera main|macro|wide|tele`
 //! (a lens from the lens menu), `lens-menu` (open it), `flip`, `macro`
 //! (the macro lens from the menu, or back to the main camera),
 //! `shutter`, `tap U V` (a tap on the picture), `settings PAGE` and
@@ -50,7 +51,7 @@ pub enum Step {
     Hdr(bool),
     /// A tap on the zoom field (the dial opens).
     ZoomField,
-    /// A tap on the dial's mark for this zoom, relative to the lens.
+    /// A tap on the dial's mark for this zoom, as the dial writes it.
     Mark(f64),
     /// The zoom dial, as if dragged to this zoom.
     Dial(f64),
