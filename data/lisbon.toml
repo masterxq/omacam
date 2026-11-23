@@ -39,11 +39,15 @@
 #   exposure.
 # f_number, focal lengths: left out until measured.
 # zoom: the ultrawide's field of view relative to the main camera's,
-#   tan(FOV_main / 2) / tan(FOV_ultrawide / 2) on the diagonal: 81 degrees
-#   for the main camera (the stock camera's focal length of 4.74 mm in its
-#   photos' EXIF data, 0.7 um pixels, 9248x6944 of them), 118 degrees for
-#   the ultrawide (the published figure, taken as rectilinear) give 0.51, here
-#   0.5. Derived, not yet measured on our own frames.
+#   measured: a photo of each of the same scene (a wall about 2 m away,
+#   the phone on a stand), the main camera's frame scaled into the
+#   ultrawide's until their edges match best, gives 0.60 (0.604 across
+#   the short side, 0.599 along the long one). The published 118 degrees
+#   of the ultrawide against the main camera's 81 degrees (the stock
+#   camera's focal length of 4.74 mm in its EXIF data, 0.7 um pixels,
+#   9248x6944 of them) would give 0.51 for a rectilinear lens; the
+#   ultrawide's barrel distortion squeezes its edges, so its center, which
+#   its 1x crop shows, is magnified more than that figure says.
 # autofocus: the S5K4H7 and the S5K5E9 have a fixed focus, the S5K5E9 sharp
 #   at a few centimeters.
 # max_zoom: 10, the most of any lens (each lens's own below).
@@ -107,7 +111,7 @@ autofocus = true
 role = "ultrawide"
 name = "Wide"
 id = "/base/soc/i2c@1101a000/camera@2d" # Samsung S5K4H7
-zoom = 0.5
+zoom = 0.6
 max_zoom = 8.0
 preview = [1616, 1224]
 still = [3234, 2448]
