@@ -227,6 +227,9 @@ mod imp {
         pub fade_tick: RefCell<Option<gtk::TickCallbackId>>,
         pub insets: Cell<Insets>,
         pub meter: RefCell<Option<Meter>>,
+        /// The picture turned half round in its place (the layout upside
+        /// down to the phone).
+        pub flipped: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -270,6 +273,7 @@ mod imp {
                 self.placement.get(),
                 &self.decor.borrow(),
                 fading.as_ref().map(|(f, a)| (&f.texture, f.placement, *a)),
+                self.flipped.get(),
             );
         }
     }
@@ -277,7 +281,8 @@ mod imp {
 
 /// Draw `texture` placed as `p` in a `size` area of a screen with
 /// `screen_scale` pixels per unit, with the old camera's last frame
-/// (`fading`: texture, placement, opacity) over it.
+/// (`fading`: texture, placement, opacity) over it; `flipped`, the
+/// picture and its focus mark turned half round in their place.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     snapshot: &gtk::Snapshot,
@@ -288,6 +293,7 @@ pub fn draw(
     p: Placement,
     decor: &Decor,
     fading: Option<(&gdk::Texture, Placement, f32)>,
+    flipped: bool,
 ) {
     let (w, h) = size;
     snapshot.append_color(&gdk::RGBA::BLACK, &graphene::Rect::new(0.0, 0.0, w, h));
@@ -302,13 +308,13 @@ pub fn draw(
     // doesn't reach (the main camera's 16:9 near 1x), the photo still
     // has picture.
     snapshot.append_color(&gdk::RGBA::new(0.07, 0.07, 0.07, 1.0), &rect);
-    draw_frame(snapshot, &rect, shown, screen_scale, tex, p);
+    draw_frame(snapshot, &rect, shown, screen_scale, tex, p, flipped);
     if let Some((old, op, alpha)) = fading {
         // The old frame in its own picture, fitted to the same rectangle.
         let (_, old_picture) = op.sizes((old.width() as f32, old.height() as f32));
         let old_shown = crop_to_aspect(old_picture, decor.aspect);
         snapshot.push_opacity(alpha.clamp(0.0, 1.0) as f64);
-        draw_frame(snapshot, &rect, old_shown, screen_scale, old, op);
+        draw_frame(snapshot, &rect, old_shown, screen_scale, old, op, flipped);
         snapshot.pop();
     }
     if decor.grid > 1 {
@@ -344,7 +350,8 @@ pub fn draw(
         }
     }
     if let Some(ring) = decor.ring {
-        let (ur, vr) = picture_to_shown(ring.u, ring.v, picture, shown);
+        let (u, v) = flip_point(ring.u, ring.v, flipped);
+        let (ur, vr) = picture_to_shown(u, v, picture, shown);
         let (cx, cy) = (
             rect.x() + rect.width() * ur as f32,
             rect.y() + rect.height() * vr as f32,
@@ -392,7 +399,8 @@ fn draw_corners(snapshot: &gtk::Snapshot, center: (f32, f32), half: f32, color: 
 
 /// Draw one frame into `rect`, the fitted `shown` part of its picture:
 /// zoomed about the view's center, mirrored, turned upright, at the size
-/// its coverage of the picture gives it.
+/// its coverage of the picture gives it; `flipped`, all of it turned
+/// half round about the rectangle's middle.
 ///
 /// The frame goes in as a texture scale node with linear filtering, in
 /// units of screen pixels. GTK's renderer draws such a node, when it is
@@ -410,6 +418,7 @@ fn draw_frame(
     screen_scale: f32,
     tex: &gdk::Texture,
     p: Placement,
+    flipped: bool,
 ) {
     let (tw, th) = (tex.width() as f32, tex.height() as f32);
     let (_, picture) = p.sizes((tw, th));
@@ -420,6 +429,9 @@ fn draw_frame(
         rect.x() + rect.width() / 2.0,
         rect.y() + rect.height() / 2.0,
     ));
+    if flipped {
+        snapshot.rotate(180.0);
+    }
     let zoom = p.scale.max(1.0) as f32;
     snapshot.scale(zoom, zoom);
     // The view's center to the middle.
@@ -477,6 +489,17 @@ pub fn crop_to_aspect(upright: (f32, f32), aspect: Option<f64>) -> (f32, f32) {
         (h * a, h)
     } else {
         (w, w / a)
+    }
+}
+
+/// A point of the picture as it is upright to the phone to where it is
+/// drawn: turned half round when `flipped` (the aspect crop is centered,
+/// so this holds for the whole picture and the shown part alike).
+fn flip_point(u: f64, v: f64, flipped: bool) -> (f64, f64) {
+    if flipped {
+        (1.0 - u, 1.0 - v)
+    } else {
+        (u, v)
     }
 }
 
@@ -633,6 +656,20 @@ impl Viewfinder {
         }
     }
 
+    /// Turn the picture half round in its place, or back: for a layout
+    /// that lies upside down to the phone. Points of the picture
+    /// ([`Viewfinder::widget_point`], [`Viewfinder::picture_point`]) stay
+    /// those of the picture upright to the phone.
+    pub fn set_flipped(&self, flipped: bool) {
+        if self.imp().flipped.replace(flipped) != flipped {
+            self.queue_draw();
+        }
+    }
+
+    pub fn flipped(&self) -> bool {
+        self.imp().flipped.get()
+    }
+
     pub fn texture(&self) -> Option<gdk::Texture> {
         self.imp().texture.borrow().clone()
     }
@@ -664,6 +701,7 @@ impl Viewfinder {
             (self.width() as f32, self.height() as f32),
             self.insets(),
         );
+        let (u, v) = flip_point(u, v, self.imp().flipped.get());
         let (su, sv) = picture_to_shown(u, v, picture, shown);
         Some((
             rect.x() + rect.width() * su as f32,
@@ -684,6 +722,7 @@ impl Viewfinder {
             picture,
             self.decor().aspect,
         )
+        .map(|(u, v)| flip_point(u, v, self.imp().flipped.get()))
     }
 
     pub fn clear(&self) {

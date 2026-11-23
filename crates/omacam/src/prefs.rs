@@ -303,6 +303,14 @@ pub fn dialog(
         |s, v| s.tap_ev_slider = v,
     ));
     adv.add(&switch(
+        "Shutter on the left",
+        "In landscape, for the left hand (off: on the right)",
+        s.shutter_left,
+        &state,
+        &on_change,
+        |s, v| s.shutter_left = v,
+    ));
+    adv.add(&switch(
         "Volume keys take photos",
         "While the camera is in front",
         s.volume_shutter,

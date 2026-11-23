@@ -159,7 +159,9 @@ window.turn-180 .turnable, window.turn-180 toast { transform: rotate(180deg); }
 const EV_SHOWN: Duration = Duration::from_secs(4);
 /// How long the slider and the zoom readout stay after the last change.
 const HIDE_AFTER: Duration = Duration::from_millis(1500);
-/// How long the window may lose focus before the cameras are let go.
+/// How long the window may be out of sight (or, where the compositor
+/// doesn't say, out of focus) before the cameras are let go: a look at the
+/// photo just taken and back keeps the stream.
 const UNFOCUSED_RELEASE: Duration = Duration::from_secs(10);
 
 enum Msg {
@@ -267,6 +269,10 @@ struct App {
     hide_source: RefCell<Option<glib::SourceId>>,
     unfocus_source: RefCell<Option<glib::SourceId>>,
     suspended: Cell<bool>,
+    /// The compositor says when the window is out of sight (it has
+    /// suspended it once): then only that lets the cameras go, not a loss
+    /// of focus while the window still shows.
+    reports_suspended: Cell<bool>,
     last_photo: RefCell<Option<PathBuf>>,
     last_error: RefCell<Option<(String, Instant)>>,
     /// The frames of the burst being taken (Night, HDR).
@@ -308,6 +314,8 @@ struct App {
     sensor: RefCell<Option<crate::sensors::Accelerometer>>,
     /// The controls turned for a phone held this way (degrees clockwise).
     controls_turn: Cell<u32>,
+    /// How the shell has turned the screen (Wayland).
+    screen: Option<crate::screen::Screen>,
     /// The phone has a gyroscope stream (videos can be stabilized).
     has_gyro: bool,
     /// The lens table allows Night and HDR bursts ([`TableSpec::bursts`]):
@@ -830,8 +838,9 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
 
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&overlay));
-    // Upright to the phone, whichever way the shell turns the screen.
+    // Portrait, whichever way the shell turns the screen.
     let turned = crate::turned::Turned::new(&toasts);
+    turned.set_shutter_left(settings.shutter_left);
     window.set_content(Some(&turned));
 
     let (tx, rx) = async_channel::unbounded::<Msg>();
@@ -894,6 +903,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         hide_source: RefCell::new(None),
         unfocus_source: RefCell::new(None),
         suspended: Cell::new(false),
+        reports_suspended: Cell::new(false),
         last_photo: RefCell::new(None),
         last_error: RefCell::new(None),
         burst: RefCell::new(Vec::new()),
@@ -924,6 +934,7 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         held: held.clone(),
         sensor: RefCell::new(None),
         controls_turn: Cell::new(0),
+        screen: crate::screen::Screen::watch(&WidgetExt::display(&window)),
         has_gyro,
         bursts,
         locator: RefCell::new(None),
@@ -1001,6 +1012,13 @@ fn build(gtk_app: &adw::Application, cli: Cli) {
         app.turned.connect_turn(move |_| {
             if let Some(a) = a.upgrade() {
                 a.turn_controls();
+            }
+        });
+        // The picture turns with the layout, in the same frame.
+        let a = Rc::downgrade(&app);
+        app.turned.connect_layout(move |layout| {
+            if let Some(a) = a.upgrade() {
+                a.viewfinder.set_flipped(a.turns_for(layout).picture == 180);
             }
         });
     }
@@ -2548,39 +2566,67 @@ impl App {
         let a = Rc::downgrade(self);
         self.window.connect_suspended_notify(move |w| {
             if let Some(a) = a.upgrade() {
-                tracing::info!(suspended = w.is_suspended(), "window state");
-                a.set_front(w.is_active() && !w.is_suspended());
-                a.set_suspended(w.is_suspended());
+                tracing::info!(
+                    suspended = w.is_suspended(),
+                    active = w.is_active(),
+                    "window state"
+                );
+                a.presence_changed();
             }
         });
         let a = Rc::downgrade(self);
         self.window.connect_is_active_notify(move |w| {
             let Some(a) = a.upgrade() else { return };
-            if let Some(id) = a.unfocus_source.borrow_mut().take() {
-                id.remove();
-            }
-            // The flash LED goes out at once out of the front; the
-            // cameras only after a while.
-            a.set_front(w.is_active() && !w.is_suspended());
+            tracing::info!(
+                suspended = w.is_suspended(),
+                active = w.is_active(),
+                "window state"
+            );
+            a.presence_changed();
             if w.is_active() {
-                if !w.is_suspended() {
-                    a.set_suspended(false);
-                }
                 // Back in front (from the photo viewer, say): focus and
                 // metering over the whole picture again, as shown.
                 a.clear_tap();
-            } else {
-                let weak = Rc::downgrade(&a);
-                let id = glib::timeout_add_local_once(UNFOCUSED_RELEASE, move || {
-                    if let Some(a) = weak.upgrade() {
-                        a.unfocus_source.borrow_mut().take();
-                        tracing::info!("unfocused for a while: releasing the cameras");
-                        a.set_suspended(true);
-                    }
-                });
-                *a.unfocus_source.borrow_mut() = Some(id);
             }
         });
+    }
+
+    /// The window came to the front, left it, or went out of sight or
+    /// back. The flash LED goes out at once out of the front; the cameras
+    /// go only after [`UNFOCUSED_RELEASE`] out of sight, and come back as
+    /// soon as the window shows again.
+    ///
+    /// Out of sight is what the compositor says (phoc suspends a window
+    /// covered for 3 s: another app on top, the lock screen); where it
+    /// never does, out of focus stands in. A turn of the screen is
+    /// neither, and keeps the stream.
+    fn presence_changed(self: &Rc<Self>) {
+        let w = &self.window;
+        if w.is_suspended() {
+            self.reports_suspended.set(true);
+        }
+        self.set_front(w.is_active() && !w.is_suspended());
+        let hidden = if self.reports_suspended.get() {
+            w.is_suspended()
+        } else {
+            !w.is_active()
+        };
+        if !hidden {
+            if let Some(id) = self.unfocus_source.borrow_mut().take() {
+                id.remove();
+            }
+            self.set_suspended(false);
+        } else if self.unfocus_source.borrow().is_none() && !self.suspended.get() {
+            let weak = Rc::downgrade(self);
+            let id = glib::timeout_add_local_once(UNFOCUSED_RELEASE, move || {
+                if let Some(a) = weak.upgrade() {
+                    a.unfocus_source.borrow_mut().take();
+                    tracing::info!("out of sight for a while: releasing the cameras");
+                    a.set_suspended(true);
+                }
+            });
+            *self.unfocus_source.borrow_mut() = Some(id);
+        }
     }
 
     /// The window is in front or not (the flash LED is lit only in front).
@@ -2621,6 +2667,9 @@ impl App {
     }
 
     fn tick(self: &Rc<Self>) {
+        if self.screen.as_ref().is_some_and(|s| s.poll()) {
+            self.turn_controls();
+        }
         self.place_picture();
         if let Some(out) = self.with_controller(|c| c.tick(Instant::now())) {
             let focus = self.controller.borrow().as_ref().is_some_and(|c| {
@@ -2655,22 +2704,17 @@ impl App {
     }
 
     /// Turn the controls for how the phone is held (the layout stays
-    /// portrait; each control turns in place).
+    /// portrait; each control turns in place), and the picture half round
+    /// where the layout lies upside down to the phone.
     ///
     /// Icons, lens buttons, chips and toasts turn; the words of the mode
     /// bar stay level, since turned they'd run into the rows above and
     /// below. The banners over the top of the picture (recording time,
     /// AE/AF lock, low light) move to the edge that is up, along it.
     fn turn_controls(&self) {
-        let held = self.held.get().degrees();
-        self.turned.set_held(held);
-        // A landscape window says the phone is sideways even where the
-        // accelerometer can't be had: then the layout's turn stands in.
-        let turn = if held.is_multiple_of(180) && self.turned.turn() != 0 {
-            self.turned.turn()
-        } else {
-            held
-        };
+        let turns = self.turns_for(self.turned.turn());
+        self.viewfinder.set_flipped(turns.picture == 180);
+        let turn = turns.controls;
         // No words on their side: the modes' names only upright, the
         // line of manual values only then too.
         self.mode_bar.set_named(turn == 0);
@@ -2685,6 +2729,19 @@ impl App {
             self.window.add_css_class(&format!("turn-{turn}"));
         }
         self.place_banners();
+    }
+
+    /// How the picture and the controls turn with the layout turned
+    /// `layout` in the window ([`crate::turned::turns`]).
+    fn turns_for(&self, layout: u32) -> crate::turned::Turns {
+        let held = self.held.get().degrees();
+        let screen = self.screen.as_ref().and_then(|s| {
+            s.poll();
+            s.turn()
+        });
+        let turns = crate::turned::turns(layout, screen, held);
+        tracing::debug!(layout, ?screen, held, ?turns, "turns");
+        turns
     }
 
     /// The banners along the edge that is up (their sizes change with
@@ -3127,6 +3184,7 @@ impl App {
                 a.error(&format!("Settings not saved: {e}"));
             }
             a.with_controller(|c| c.set_tap_to_focus(s.tap_to_focus));
+            a.turned.set_shutter_left(s.shutter_left);
             let now = Instant::now();
             let out = a.with_controller(|c| {
                 let mut out = c.set_low_light(s.low_light, now);
@@ -3230,6 +3288,7 @@ impl App {
                 self.viewfinder.placement(),
                 &self.viewfinder.decor(),
                 None,
+                self.viewfinder.flipped(),
             );
             node = snapshot.to_node();
         }

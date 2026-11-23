@@ -195,6 +195,10 @@ pub struct Settings {
     /// A tap shows an exposure slider beside the focus ring for a few
     /// seconds (off: exposure correction is in the manual controls).
     pub tap_ev_slider: bool,
+    /// In landscape the shutter lies at the left edge of the screen, for
+    /// the left hand (off, the default: at the right, either way the phone
+    /// is held).
+    pub shutter_left: bool,
 }
 
 impl Default for Settings {
@@ -220,6 +224,7 @@ impl Default for Settings {
             flash: FlashMode::Auto,
             switch_lenses_by_zoom: false,
             tap_ev_slider: false,
+            shutter_left: false,
         }
     }
 }
@@ -323,6 +328,7 @@ mod tests {
         assert!(s.stabilization);
         assert_eq!(s.flash, FlashMode::Auto);
         assert!(!s.switch_lenses_by_zoom, "the lens changes only by hand");
+        assert!(!s.shutter_left, "the shutter at the right in landscape");
     }
 
     #[test]
@@ -355,6 +361,7 @@ mod tests {
             flash: FlashMode::Auto,
             switch_lenses_by_zoom: true,
             tap_ev_slider: true,
+            shutter_left: true,
         };
         s.save(&p).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();

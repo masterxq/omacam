@@ -12,6 +12,7 @@ mod manual;
 mod modebar;
 mod photo;
 mod prefs;
+mod screen;
 mod script;
 mod sensors;
 mod settings;
