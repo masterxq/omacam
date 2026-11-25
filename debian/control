@@ -33,6 +33,9 @@ Recommends: gstreamer1.0-plugins-ugly,
             pipewire-bin
 Suggests: iio-sensor-proxy,
           geoclue-2.0
+Provides: plasma-camera
+Conflicts: plasma-camera
+Replaces: plasma-camera
 Description: phone camera app on libcamera
  omacam ("Camera") talks to the cameras through libcamera directly, not
  through PipeWire: tap to focus, pinch to zoom, photos from the camera's
@@ -41,3 +44,6 @@ Description: phone camera app on libcamera
  Video needs the x264 or openh264 encoder of GStreamer (x264enc from
  gstreamer1.0-plugins-ugly); the shutter sound plays camera-shutter.oga
  with canberra-gtk-play, pw-play or paplay.
+ .
+ omacam takes the place of plasma-camera, which plasma-mobile-full
+ depends on, so Plasma Mobile has one camera app.
